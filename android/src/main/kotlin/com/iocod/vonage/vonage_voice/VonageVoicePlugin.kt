@@ -114,9 +114,11 @@ class VonageVoicePlugin :
         eventChannel!!.setStreamHandler(this)
 
         // Register LocalBroadcast receiver
-        broadcastReceiver = TVBroadcastReceiver { intent ->
-            handleBroadcastIntent(intent)
-        }
+        broadcastReceiver = TVBroadcastReceiver(object : TVBroadcastReceiver.BroadcastListener {
+            override fun onBroadcastReceived(intent: Intent) {
+                handleBroadcastIntent(intent)
+            }
+        })
         broadcastReceiver!!.register(binding.applicationContext)
     }
 
@@ -131,7 +133,9 @@ class VonageVoicePlugin :
         broadcastReceiver = null
 
         // Clear VoiceClient from holder and release session
-        voiceClient?.deleteSession()
+        voiceClient?.deleteSession { error ->
+            if (error != null) logEvent("deleteSession error: ${error.message}")
+        }
         VonageClientHolder.voiceClient = null
         voiceClient = null
 
@@ -305,7 +309,7 @@ class VonageVoicePlugin :
 
         // Create VoiceClient if not already initialised
         if (voiceClient == null) {
-            voiceClient = VoiceClient.createClient(ctx)
+            voiceClient = VoiceClient(ctx)
             VonageClientHolder.voiceClient = voiceClient
 
             // Register all SDK event listeners once on creation
@@ -904,7 +908,7 @@ class VonageVoicePlugin :
             // ── New FCM token ─────────────────────────────────────────────
             Constants.BROADCAST_NEW_FCM_TOKEN -> {
                 val token = intent.getStringExtra(Constants.EXTRA_FCM_DATA) ?: return
-                voiceClient?.registerDevicePushToken(token) { error ->
+                voiceClient!!.registerDevicePushToken(token) { error, deviceId ->
                     if (error != null) logEvent("FCM token refresh failed: ${error.message}")
                 }
             }

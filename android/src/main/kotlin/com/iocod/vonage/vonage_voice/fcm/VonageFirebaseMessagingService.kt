@@ -86,7 +86,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         if (data.isEmpty()) return
 
         // Check if this FCM message is a Vonage voice push
-        if (!VoiceClient.isPushNotification(data)) return
+        if (!VoiceClient.Companion.isPushNotification(data)) return
 
         // Get VoiceClient instance held by the plugin
         // If the app was killed and restarted by FCM, the client may not

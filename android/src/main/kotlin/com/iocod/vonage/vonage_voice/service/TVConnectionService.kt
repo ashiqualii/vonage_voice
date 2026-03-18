@@ -88,7 +88,7 @@ class TVConnectionService : ConnectionService() {
         return START_NOT_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+    // override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
 
     // ── Intent dispatcher ─────────────────────────────────────────────────
 
@@ -204,7 +204,9 @@ class TVConnectionService : ConnectionService() {
             }
 
             // Create Telecom connection for this outgoing call
-            val connection = TVCallConnection(this, callId, callFrom, callTo)
+            val from: String = invite?.from ?: ""
+            val to: String = invite?.to ?: ""
+            val connection = TVCallConnection(this, callId, from, to)
             activeConnections[callId] = connection
             connection.setCallActive()
 
