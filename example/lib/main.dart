@@ -136,7 +136,6 @@ class _DialerScreenState extends State<DialerScreen> {
       switch (event) {
         // ── Incoming call ───────────────────────────────────────────────
         case CallEvent.incoming:
-        case CallEvent.ringing:
           final activeCall = VonageVoice.instance.call.activeCall;
           if (activeCall != null && mounted) {
             Navigator.of(context).push(
@@ -145,6 +144,12 @@ class _DialerScreenState extends State<DialerScreen> {
               ),
             );
           }
+          break;
+        case CallEvent.ringing:
+          // Outgoing call is ringing on remote side
+          // ActiveCallScreen is already pushed by _makeCall()
+          // so we just update the status — no navigation needed
+          setState(() => _status = 'Ringing...');
           break;
 
         // ── Call connected ──────────────────────────────────────────────
@@ -290,9 +295,9 @@ class _DialerScreenState extends State<DialerScreen> {
             TextField(
               controller: _numberController,
               keyboardType: TextInputType.phone,
+              readOnly: true,
               decoration: const InputDecoration(
-                labelText: 'Phone number or user identity',
-                hintText: '+14155551234',
+                hintText: 'Phone number',
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.phone),
               ),
@@ -621,6 +626,8 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                   ),
                 ),
               ),
+              const SizedBox(height: 8),
+              ElevatedButton(onPressed: () {}, child: Text('remove')),
               const SizedBox(height: 8),
               _DialPad(onDigitPressed: _sendDtmf, darkMode: true),
               const SizedBox(height: 8),
