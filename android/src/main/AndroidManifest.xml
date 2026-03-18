@@ -93,6 +93,17 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name="com.iocod.vonage.vonage_voice.receivers.TVCallActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.iocod.vonage.NOTIFICATION_ANSWER" />
+                <action android:name="com.iocod.vonage.NOTIFICATION_DECLINE" />
+            </intent-filter>
+        </receiver>
+
     </application>
+
+    
 
 </manifest>

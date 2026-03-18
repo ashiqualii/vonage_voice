@@ -59,6 +59,7 @@ class TVCallConnection(
      * We broadcast this so VonageVoicePlugin can call client.hangup(callId).
      */
     override fun onDisconnect() {
+        audioManager.mode = AudioManager.MODE_NORMAL
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroy()
         broadcastEvent(Constants.BROADCAST_CALL_ENDED)
@@ -164,8 +165,6 @@ class TVCallConnection(
      */
     fun setCallActive() {
         setActive()
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
     }
 
     /**
@@ -173,6 +172,7 @@ class TVCallConnection(
      * Called when Vonage SDK fires the hangup callback.
      */
     fun disconnect() {
+        audioManager.mode = AudioManager.MODE_NORMAL
         setDisconnected(DisconnectCause(DisconnectCause.REMOTE))
         destroy()
     }

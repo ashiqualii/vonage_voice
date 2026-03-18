@@ -128,17 +128,26 @@ class TVConnectionService : ConnectionService() {
      */
     private fun handleIncomingCall(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
-        val from = intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: Constants.DEFAULT_UNKNOWN_CALLER
+        val from = intent.getStringExtra(Constants.EXTRA_CALL_FROM)
+                ?: Constants.DEFAULT_UNKNOWN_CALLER
         val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
 
-        // Create invite connection and store in pending map
         val connection = TVCallInviteConnection(this, callId, from, to)
         pendingInvites[callId] = connection
 
-        // Start foreground service so we can keep running in background
-        startCallForegroundService()
+        // ── Use incoming call notification with Answer/Decline ────────────────
+        createNotificationChannel()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                Constants.NOTIFICATION_ID,
+                buildIncomingCallNotification(callId, from),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(Constants.NOTIFICATION_ID,
+                buildIncomingCallNotification(callId, from))
+        }
 
-        // Broadcast to plugin so Flutter receives the "Incoming" event
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
             putExtra(Constants.EXTRA_CALL_ID, callId)
             putExtra(Constants.EXTRA_CALL_FROM, from)
@@ -263,11 +272,27 @@ class TVConnectionService : ConnectionService() {
                 // Set audio mode to voice call — critical for microphone to work
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
                 audioManager.isSpeakerphoneOn = false
-            }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    // API 31+ — use AudioManager directly
+                    audioManager.setCommunicationDevice(
+                        audioManager.availableCommunicationDevices.firstOrNull {
+                            it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                        } ?: return
+                    )
+                }
+    }
 
     private fun releaseAudioFocus() {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.mode = AudioManager.MODE_NORMAL
+
+        audioManager.isSpeakerphoneOn = false
+
+        // API 31+ — release communication device
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.clearCommunicationDevice()
+        }
     }
 
 
@@ -296,6 +321,11 @@ class TVConnectionService : ConnectionService() {
             activeConnections[callId] = connection
             connection.setCallActive()
             requestAudioFocus() 
+
+            // ── Switch notification from incoming → active call ───────────────────
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.notify(Constants.NOTIFICATION_ID, buildActiveCallNotification())
 
             // Broadcast connected event to Flutter
             val broadcast = Intent(Constants.BROADCAST_CALL_CONNECTED).apply {
@@ -351,7 +381,11 @@ class TVConnectionService : ConnectionService() {
 
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
+             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.cancel(Constants.NOTIFICATION_ID)
             stopForeground(true)
+            stopSelf()
         }
     }
 
@@ -490,7 +524,7 @@ class TVConnectionService : ConnectionService() {
     private fun startCallForegroundService() {
         createNotificationChannel()
 
-        val notification = buildCallNotification()
+        val notification = buildActiveCallNotification()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -526,12 +560,83 @@ class TVConnectionService : ConnectionService() {
      * Build a minimal persistent notification for the foreground service.
      * The app's launch intent is used as the tap action.
      */
-    private fun buildCallNotification(): Notification {
+    private fun buildIncomingCallNotification(callId: String, from: String): Notification {
+        createNotificationChannel()
+
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-        val pendingIntent = PendingIntent.getActivity(
+        val contentIntent = PendingIntent.getActivity(
+            this, 0, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // ── Answer action ─────────────────────────────────────────────────────
+        val answerIntent = PendingIntent.getBroadcast(
             this,
-            0,
-            launchIntent,
+            1,
+            Intent(Constants.ACTION_NOTIFICATION_ANSWER).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                setPackage(packageName)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // ── Decline action ────────────────────────────────────────────────────
+        val declineIntent = PendingIntent.getBroadcast(
+            this,
+            2,
+            Intent(Constants.ACTION_NOTIFICATION_DECLINE).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                setPackage(packageName)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, Constants.NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Incoming Call")
+            .setContentText("From: $from")
+            .setSmallIcon(android.R.drawable.ic_menu_call)
+            .setContentIntent(contentIntent)
+            .setOngoing(true)
+            .setSilent(false)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setFullScreenIntent(contentIntent, true) // shows heads-up notification
+            // ── Answer button — green ─────────────────────────────────────────
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    android.R.drawable.ic_menu_call,
+                    "Answer",
+                    answerIntent
+                ).build()
+            )
+            // ── Decline button — red ──────────────────────────────────────────
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    android.R.drawable.ic_delete,
+                    "Decline",
+                    declineIntent
+                ).build()
+            )
+            .build()
+    }
+
+    private fun buildActiveCallNotification(): Notification {
+        createNotificationChannel()
+
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val contentIntent = PendingIntent.getActivity(
+            this, 0, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // ── Hangup action ─────────────────────────────────────────────────────
+        val hangupIntent = PendingIntent.getBroadcast(
+            this,
+            3,
+            Intent(Constants.ACTION_NOTIFICATION_DECLINE).apply {
+                putExtra(Constants.EXTRA_CALL_ID, getActiveCallId() ?: "")
+                setPackage(packageName)
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -539,9 +644,18 @@ class TVConnectionService : ConnectionService() {
             .setContentTitle("Vonage Voice Call")
             .setContentText("Call in progress")
             .setSmallIcon(android.R.drawable.ic_menu_call)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(contentIntent)
             .setOngoing(true)
             .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    android.R.drawable.ic_delete,
+                    "Hang Up",
+                    hangupIntent
+                ).build()
+            )
             .build()
     }
 

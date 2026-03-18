@@ -73,4 +73,7 @@ object Constants {
     const val BROADCAST_BLUETOOTH_STATE        = "com.iocod.vonage.BLUETOOTH_STATE"
     const val BROADCAST_NEW_FCM_TOKEN          = "com.iocod.vonage.NEW_FCM_TOKEN"
     const val BROADCAST_PERMISSION_RESULT      = "com.iocod.vonage.PERMISSION_RESULT"
+
+    const val ACTION_NOTIFICATION_ANSWER  = "com.iocod.vonage.NOTIFICATION_ANSWER"
+    const val ACTION_NOTIFICATION_DECLINE = "com.iocod.vonage.NOTIFICATION_DECLINE"
 }
