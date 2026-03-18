@@ -1,9 +1,15 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:vonage_voice/vonage_voice.dart';
+import 'package:vonage_voice_example/firebase_options.dart';
 import 'package:vonage_voice_example/keys.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const VonageExampleApp());
 }
 
@@ -50,9 +56,13 @@ class _LoginScreenState extends State<LoginScreen> {
       await VonageVoice.instance.requestCallPhonePermission();
       await VonageVoice.instance.requestManageOwnCallsPermission();
 
-      // Register JWT with Vonage — no FCM token for now
+      // Get FCM token for incoming call push notifications
+      final fcmToken = await FirebaseMessaging.instance.getToken();
+
+      // Register JWT with Vonage + FCM token for incoming calls
       final result = await VonageVoice.instance.setTokens(
         accessToken: kTestJwt,
+        deviceToken: fcmToken,
       );
 
       if (result == true) {
@@ -120,6 +130,7 @@ class DialerScreen extends StatefulWidget {
 
 class _DialerScreenState extends State<DialerScreen> {
   final TextEditingController _numberController = TextEditingController();
+  StreamSubscription<CallEvent>? _eventSub;
   bool _calling = false;
   String _status = 'Ready';
 
@@ -132,7 +143,9 @@ class _DialerScreenState extends State<DialerScreen> {
   /// Listen to all call events globally.
   /// Handles incoming calls, call ended, and errors.
   void _listenToCallEvents() {
-    VonageVoice.instance.callEventsListener.listen((CallEvent event) {
+    _eventSub = VonageVoice.instance.callEventsListener.listen((
+      CallEvent event,
+    ) {
       switch (event) {
         // ── Incoming call ───────────────────────────────────────────────
         case CallEvent.incoming:
@@ -220,7 +233,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
     try {
       final result = await VonageVoice.instance.call.place(
-        from: 'vonage_user', // replace with your Vonage user identity
+        from: 'test user',
         to: number,
       );
 
@@ -267,6 +280,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
   @override
   void dispose() {
+    _eventSub?.cancel();
     _numberController.dispose();
     super.dispose();
   }
@@ -481,8 +495,10 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   bool _onHold = false;
   bool _bluetoothOn = false;
   bool _showDialpad = false;
-  String _callStatus = 'Connected';
+  bool _callReady = false;
+  String _callStatus = 'Connecting...';
   final TextEditingController _dtmfController = TextEditingController();
+  StreamSubscription<CallEvent>? _eventSub;
 
   @override
   void initState() {
@@ -492,9 +508,23 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
 
   /// Listen for audio state changes while in the active call screen.
   void _listenToCallEvents() {
-    VonageVoice.instance.callEventsListener.listen((CallEvent event) {
+    _eventSub = VonageVoice.instance.callEventsListener.listen((
+      CallEvent event,
+    ) {
       if (!mounted) return;
       switch (event) {
+        case CallEvent.ringing:
+          setState(() {
+            _callReady = true;
+            _callStatus = 'Ringing...';
+          });
+          break;
+        case CallEvent.connected:
+          setState(() {
+            _callReady = true;
+            _callStatus = 'Connected';
+          });
+          break;
         case CallEvent.callEnded:
           setState(() => _callStatus = 'Call ended');
           Future.delayed(const Duration(seconds: 1), () {
@@ -538,27 +568,39 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   }
 
   Future<void> _toggleMute() async {
-    await VonageVoice.instance.call.toggleMute(!_muted);
-    setState(() => _muted = !_muted);
+    if (!_callReady) return;
+    try {
+      await VonageVoice.instance.call.toggleMute(!_muted);
+    } catch (_) {}
   }
 
   Future<void> _toggleSpeaker() async {
-    await VonageVoice.instance.call.toggleSpeaker(!_onSpeaker);
-    setState(() => _onSpeaker = !_onSpeaker);
+    if (!_callReady) return;
+    try {
+      await VonageVoice.instance.call.toggleSpeaker(!_onSpeaker);
+    } catch (_) {}
   }
 
   Future<void> _toggleHold() async {
-    await VonageVoice.instance.call.holdCall(holdCall: !_onHold);
-    setState(() => _onHold = !_onHold);
+    if (!_callReady) return;
+    try {
+      await VonageVoice.instance.call.holdCall(holdCall: !_onHold);
+    } catch (_) {}
   }
 
   Future<void> _toggleBluetooth() async {
-    await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: !_bluetoothOn);
-    setState(() => _bluetoothOn = !_bluetoothOn);
+    if (!_callReady) return;
+    try {
+      await VonageVoice.instance.call.toggleBluetooth(
+        bluetoothOn: !_bluetoothOn,
+      );
+    } catch (_) {}
   }
 
   Future<void> _hangUp() async {
-    await VonageVoice.instance.call.hangUp();
+    try {
+      await VonageVoice.instance.call.hangUp();
+    } catch (_) {}
   }
 
   Future<void> _sendDtmf(String digit) async {
@@ -568,6 +610,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
 
   @override
   void dispose() {
+    _eventSub?.cancel();
     _dtmfController.dispose();
     super.dispose();
   }
@@ -658,25 +701,25 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                         icon: _muted ? Icons.mic_off : Icons.mic,
                         label: _muted ? 'Unmute' : 'Mute',
                         active: _muted,
-                        onTap: _toggleMute,
+                        onTap: _callReady ? _toggleMute : null,
                       ),
                       _CallControlButton(
                         icon: _onSpeaker ? Icons.volume_up : Icons.volume_down,
                         label: 'Speaker',
                         active: _onSpeaker,
-                        onTap: _toggleSpeaker,
+                        onTap: _callReady ? _toggleSpeaker : null,
                       ),
                       _CallControlButton(
                         icon: Icons.bluetooth_audio,
                         label: 'Bluetooth',
                         active: _bluetoothOn,
-                        onTap: _toggleBluetooth,
+                        onTap: _callReady ? _toggleBluetooth : null,
                       ),
                       _CallControlButton(
                         icon: _onHold ? Icons.play_arrow : Icons.pause,
                         label: _onHold ? 'Resume' : 'Hold',
                         active: _onHold,
-                        onTap: _toggleHold,
+                        onTap: _callReady ? _toggleHold : null,
                       ),
                     ],
                   ),
@@ -799,7 +842,7 @@ class _CallControlButton extends StatelessWidget {
   final IconData icon;
   final String label;
   final bool active;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _CallControlButton({
     required this.icon,
@@ -810,29 +853,33 @@ class _CallControlButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final enabled = onTap != null;
     return GestureDetector(
       onTap: onTap,
-      child: Column(
-        children: [
-          Container(
-            width: 56,
-            height: 56,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: active ? Colors.white : Colors.white12,
+      child: Opacity(
+        opacity: enabled ? 1.0 : 0.4,
+        child: Column(
+          children: [
+            Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: active ? Colors.white : Colors.white12,
+              ),
+              child: Icon(
+                icon,
+                color: active ? Colors.black87 : Colors.white,
+                size: 26,
+              ),
             ),
-            child: Icon(
-              icon,
-              color: active ? Colors.black87 : Colors.white,
-              size: 26,
+            const SizedBox(height: 6),
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white54, fontSize: 11),
             ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            label,
-            style: const TextStyle(color: Colors.white54, fontSize: 11),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

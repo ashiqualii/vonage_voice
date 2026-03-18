@@ -42,14 +42,14 @@ class StorageImpl(context: Context) : Storage {
      *   value = "Alice Johnson"
      */
     override fun addRegisteredClient(id: String, name: String) {
-        prefs.edit().putString(id, name).apply()
+        prefs.edit().putString(Constants.CLIENT_ID_PREFIX + id, name).apply()
     }
 
     override fun getRegisteredClient(id: String): String? =
-        prefs.getString(id, null)
+        prefs.getString(Constants.CLIENT_ID_PREFIX + id, null)
 
     override fun removeRegisteredClient(id: String) {
-        prefs.edit().remove(id).apply()
+        prefs.edit().remove(Constants.CLIENT_ID_PREFIX + id).apply()
     }
 
     // ── Behaviour flags ───────────────────────────────────────────────────

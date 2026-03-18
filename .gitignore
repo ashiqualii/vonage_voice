@@ -31,3 +31,5 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 /build/
 /coverage/
+example/android/app/google-services.json
+example/ios/Runner/GoogleService-Info.plist

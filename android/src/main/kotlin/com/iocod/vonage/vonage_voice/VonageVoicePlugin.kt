@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Build
+import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -706,8 +707,21 @@ class VonageVoicePlugin :
     // ── Telecom / PhoneAccount handlers ───────────────────────────────────
 
     private fun handleHasRegisteredPhoneAccount(result: Result) {
-        val telecomManager = context?.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
-        result.success(telecomManager != null)
+        val ctx = context ?: run {
+            result.success(false)
+            return
+        }
+        val telecomManager = ctx.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        if (telecomManager == null) {
+            result.success(false)
+            return
+        }
+        val componentName = android.content.ComponentName(
+            ctx, TVConnectionService::class.java
+        )
+        val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
+        val account = telecomManager.getPhoneAccount(handle)
+        result.success(account != null)
     }
 
     private fun handleRegisterPhoneAccount(result: Result) {
@@ -718,12 +732,25 @@ class VonageVoicePlugin :
     }
 
     private fun handleIsPhoneAccountEnabled(result: Result) {
-        val telecomManager = context?.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
-        result.success(telecomManager != null)
+        val ctx = context ?: run {
+            result.success(false)
+            return
+        }
+        val telecomManager = ctx.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        if (telecomManager == null) {
+            result.success(false)
+            return
+        }
+        val componentName = android.content.ComponentName(
+            ctx, TVConnectionService::class.java
+        )
+        val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
+        val account = telecomManager.getPhoneAccount(handle)
+        result.success(account?.isEnabled == true)
     }
 
     private fun handleOpenPhoneAccountSettings(result: Result) {
-        val intent = Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+        val intent = Intent(android.telecom.TelecomManager.ACTION_CHANGE_PHONE_ACCOUNTS)
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
         context?.startActivity(intent)
         result.success(true)
@@ -836,12 +863,14 @@ class VonageVoicePlugin :
                 val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
                 val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
                 val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+                val direction = intent.getStringExtra(Constants.EXTRA_CALL_DIRECTION)
+                    ?.let { CallDirection.valueOf(it) } ?: CallDirection.INCOMING
                 activeCallId = callId
                 emitEvent(
                     VNNativeCallEvents.callStateEvent(
                         VNNativeCallEvents.EVENT_CONNECTED,
                         from, to,
-                        CallDirection.INCOMING
+                        direction
                     )
                 )
             }
@@ -908,7 +937,8 @@ class VonageVoicePlugin :
             // ── New FCM token ─────────────────────────────────────────────
             Constants.BROADCAST_NEW_FCM_TOKEN -> {
                 val token = intent.getStringExtra(Constants.EXTRA_FCM_DATA) ?: return
-                voiceClient!!.registerDevicePushToken(token) { error, deviceId ->
+                val client = voiceClient ?: return
+                client.registerDevicePushToken(token) { error, deviceId ->
                     if (error != null) logEvent("FCM token refresh failed: ${error.message}")
                 }
             }
@@ -1001,12 +1031,14 @@ class VonageVoicePlugin :
 
     // ── Utility helpers ───────────────────────────────────────────────────
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /**
      * Emit a pipe-delimited string event to Flutter via the EventChannel.
      * Must be called on the main thread — Flutter channels are not thread-safe.
      */
     private fun emitEvent(event: String) {
-        activity?.runOnUiThread {
+        mainHandler.post {
             eventSink?.success(event)
         }
     }

@@ -7,6 +7,7 @@ import com.google.firebase.messaging.RemoteMessage
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
 import com.vonage.voice.api.VoiceClient
+import org.json.JSONObject
 
 /**
  * VonageFirebaseMessagingService — FCM to Vonage call invite bridge.
@@ -85,8 +86,11 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         val data = remoteMessage.data
         if (data.isEmpty()) return
 
+        // Serialize to JSON string — Vonage SDK expects a JSON string, not Map.toString()
+        val dataJson = JSONObject(data as Map<*, *>).toString()
+
         // Check if this is a Vonage push — UNKNOWN means it's not from Vonage
-        val pushType = VoiceClient.getPushNotificationType(data.toString())
+        val pushType = VoiceClient.getPushNotificationType(dataJson)
         if (pushType == null || pushType.toString() == "UNKNOWN") return
 
         val client = VonageClientHolder.voiceClient ?: run {
@@ -94,7 +98,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
 
-        val callId = client.processPushCallInvite(data.toString())
+        val callId = client.processPushCallInvite(dataJson)
 
         if (callId.isNullOrEmpty()) {
             broadcastError("processPushCallInvite returned null callId")

@@ -49,7 +49,7 @@ import android.media.AudioManager
 class TVConnectionService : ConnectionService() {
 
     private lateinit var broadcastManager: LocalBroadcastManager
-    // private lateinit var voiceClient: VoiceClient
+    private var audioFocusRequest: AudioFocusRequest? = null
 
     companion object {
         /**
@@ -168,6 +168,12 @@ class TVConnectionService : ConnectionService() {
         pendingInvites[callId]?.cancel()
         pendingInvites.remove(callId)
 
+        // Notify Flutter that the invite was cancelled
+        val broadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+        }
+        broadcastManager.sendBroadcast(broadcast)
+
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             stopForeground(true)
         }
@@ -259,6 +265,7 @@ class TVConnectionService : ConnectionService() {
                                 .build()
                         )
                         .build()
+                    audioFocusRequest = focusRequest
                     audioManager.requestAudioFocus(focusRequest)
                 } else {
                     @Suppress("DEPRECATION")
@@ -285,8 +292,16 @@ class TVConnectionService : ConnectionService() {
 
     private fun releaseAudioFocus() {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.mode = AudioManager.MODE_NORMAL
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+
+        audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = false
 
         // API 31+ — release communication device
@@ -332,6 +347,7 @@ class TVConnectionService : ConnectionService() {
                 putExtra(Constants.EXTRA_CALL_ID, callId)
                 putExtra(Constants.EXTRA_CALL_FROM, invite?.from ?: "")
                 putExtra(Constants.EXTRA_CALL_TO, invite?.to ?: "")
+                putExtra(Constants.EXTRA_CALL_DIRECTION, "INCOMING")
             }
             broadcastManager.sendBroadcast(broadcast)
         }
@@ -546,7 +562,7 @@ class TVConnectionService : ConnectionService() {
             val channel = NotificationChannel(
                 Constants.NOTIFICATION_CHANNEL_ID,
                 Constants.NOTIFICATION_CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Shows ongoing Vonage voice call status"
                 setSound(null, null)
@@ -652,7 +668,7 @@ class TVConnectionService : ConnectionService() {
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_delete,
-                    "Hang Up",
+                    "End Call",
                     hangupIntent
                 ).build()
             )

@@ -24,6 +24,7 @@ object Constants {
     const val KEY_DEFAULT_CALLER          = "defaultCaller"
     const val KEY_REJECT_ON_NO_PERMISSIONS = "rejectOnNoPermissions"
     const val KEY_SHOW_NOTIFICATIONS      = "show-notifications"
+    const val CLIENT_ID_PREFIX             = "client_"
 
     // ── Default display values ────────────────────────────────────────────
     const val DEFAULT_UNKNOWN_CALLER = "Unknown"
@@ -57,6 +58,7 @@ object Constants {
     const val EXTRA_MUTE_STATE      = "EXTRA_MUTE_STATE"
     const val EXTRA_HOLD_STATE      = "EXTRA_HOLD_STATE"
     const val EXTRA_FCM_DATA        = "EXTRA_FCM_DATA"
+    const val EXTRA_CALL_DIRECTION   = "EXTRA_CALL_DIRECTION"
 
     // ── LocalBroadcast actions: service → VonageVoicePlugin ──────────────
     const val BROADCAST_CALL_RINGING           = "com.iocod.vonage.CALL_RINGING"

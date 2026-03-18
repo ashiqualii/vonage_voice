@@ -13,6 +13,9 @@ dependencies:
   vonage_voice:
     path: ../
 
+  firebase_core: ^3.12.1
+  firebase_messaging: ^15.2.4
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
