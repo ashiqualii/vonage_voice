@@ -1,0 +1,156 @@
+package com.iocod.vonage.vonage_voice.types
+
+/**
+ * Enum of every method name the Flutter side can invoke over the MethodChannel.
+ *
+ * The [methodName] property must exactly match the string used in Dart:
+ *   _channel.invokeMethod('tokens', {...})
+ *
+ * Usage in VonageVoicePlugin.onMethodCall():
+ *   when (VNMethodChannels.fromMethodName(call.method)) {
+ *       VNMethodChannels.TOKENS -> handleTokens(call, result)
+ *       ...
+ *   }
+ */
+enum class VNMethodChannels(val methodName: String) {
+
+    // ── Session / registration ────────────────────────────────────────────
+
+    /** Register JWT + optional FCM token. Starts the Vonage session. */
+    TOKENS("tokens"),
+
+    /** Unregister FCM push token and end the Vonage session. */
+    UNREGISTER("unregister"),
+
+    /** Refresh an expiring JWT without destroying the session. */
+    REFRESH_SESSION("refreshSession"),
+
+    // ── Core call controls ────────────────────────────────────────────────
+
+    /** Place an outbound call via serverCall(). */
+    MAKE_CALL("makeCall"),
+
+    /** Hang up the active call. */
+    HANG_UP("hangUp"),
+
+    /** Answer a pending incoming call invite. */
+    ANSWER("answer"),
+
+    /** Send DTMF tones on the active call. */
+    SEND_DIGITS("sendDigits"),
+
+    // ── Audio routing ─────────────────────────────────────────────────────
+
+    /** Route audio to / from the speakerphone. */
+    TOGGLE_SPEAKER("toggleSpeaker"),
+
+    /** Returns true if audio is currently routed to the speaker. */
+    IS_ON_SPEAKER("isOnSpeaker"),
+
+    /** Route audio to / from a Bluetooth headset. */
+    TOGGLE_BLUETOOTH("toggleBluetooth"),
+
+    /** Returns true if audio is currently routed via Bluetooth. */
+    IS_BLUETOOTH_ON("isBluetoothOn"),
+
+    // ── Mute ─────────────────────────────────────────────────────────────
+
+    /** Mute or unmute the microphone. */
+    TOGGLE_MUTE("toggleMute"),
+
+    /** Returns true if the microphone is currently muted. */
+    IS_MUTED("isMuted"),
+
+    // ── Hold ─────────────────────────────────────────────────────────────
+
+    /** Place the call on hold or resume it. */
+    HOLD_CALL("holdCall"),
+
+    /** Returns true if the call is currently on hold. */
+    IS_HOLDING("isHolding"),
+
+    // ── Call state queries ────────────────────────────────────────────────
+
+    /** Returns true if there is an active call in progress. */
+    IS_ON_CALL("isOnCall"),
+
+    /** Returns the active call ID string, or null if no call is active. */
+    CALL_SID("call-sid"),
+
+    // ── Caller identity registry ──────────────────────────────────────────
+
+    /** Store a display name for a caller ID. */
+    REGISTER_CLIENT("registerClient"),
+
+    /** Remove a stored caller ID → name mapping. */
+    UNREGISTER_CLIENT("unregisterClient"),
+
+    /** Set the fallback display name shown when the caller is unknown. */
+    DEFAULT_CALLER("defaultCaller"),
+
+    // ── Telecom / PhoneAccount ────────────────────────────────────────────
+
+    /** Returns true if a Telecom PhoneAccount is registered. */
+    HAS_REGISTERED_PHONE_ACCOUNT("hasRegisteredPhoneAccount"),
+
+    /** Register this app as a call-capable account with the Android Telecom system. */
+    REGISTER_PHONE_ACCOUNT("registerPhoneAccount"),
+
+    /** Returns true if the PhoneAccount is enabled by the user in system settings. */
+    IS_PHONE_ACCOUNT_ENABLED("isPhoneAccountEnabled"),
+
+    /** Open the system phone account settings screen. */
+    OPEN_PHONE_ACCOUNT_SETTINGS("openPhoneAccountSettings"),
+
+    // ── Permissions ───────────────────────────────────────────────────────
+
+    HAS_MIC_PERMISSION("hasMicPermission"),
+    REQUEST_MIC_PERMISSION("requestMicPermission"),
+
+    HAS_READ_PHONE_STATE_PERMISSION("hasReadPhoneStatePermission"),
+    REQUEST_READ_PHONE_STATE_PERMISSION("requestReadPhoneStatePermission"),
+
+    HAS_CALL_PHONE_PERMISSION("hasCallPhonePermission"),
+    REQUEST_CALL_PHONE_PERMISSION("requestCallPhonePermission"),
+
+    HAS_READ_PHONE_NUMBERS_PERMISSION("hasReadPhoneNumbersPermission"),
+    REQUEST_READ_PHONE_NUMBERS_PERMISSION("requestReadPhoneNumbersPermission"),
+
+    HAS_MANAGE_OWN_CALLS_PERMISSION("hasManageOwnCallsPermission"),
+    REQUEST_MANAGE_OWN_CALLS_PERMISSION("requestManageOwnCallsPermission"),
+
+    // ── Notification / behaviour settings ────────────────────────────────
+
+    /** Show or hide the ongoing call notification. */
+    SHOW_NOTIFICATIONS("showNotifications"),
+
+    /** Configure whether to auto-reject calls when permissions are missing. */
+    REJECT_CALL_ON_NO_PERMISSIONS("rejectCallOnNoPermissions"),
+
+    /** Returns the current auto-reject setting. */
+    IS_REJECTING_CALL_ON_NO_PERMISSIONS("isRejectingCallOnNoPermissions"),
+
+    // ── Deprecated stubs (kept for drop-in compatibility with Twilio API) ─
+
+    /** No-op — Bluetooth is handled by the native call screen. */
+    HAS_BLUETOOTH_PERMISSION("hasBluetoothPermission"),
+
+    /** No-op — Bluetooth is handled by the native call screen. */
+    REQUEST_BLUETOOTH_PERMISSION("requestBluetoothPermission"),
+
+    /** No-op — ConnectionService replaced custom background UI. */
+    BACKGROUND_CALL_UI("backgroundCallUi"),
+
+    /** No-op — iOS only stub, not used on Android. */
+    UPDATE_CALL_KIT_ICON("updateCallKitIcon");
+
+    companion object {
+        /**
+         * Safely resolve a raw method name string to its enum entry.
+         * Returns null if the method name is not recognised — the plugin
+         * should call result.notImplemented() in that case.
+         */
+        fun fromMethodName(name: String): VNMethodChannels? =
+            entries.firstOrNull { it.methodName == name }
+    }
+}

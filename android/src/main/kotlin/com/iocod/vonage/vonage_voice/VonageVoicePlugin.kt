@@ -1,0 +1,1027 @@
+package com.iocod.vonage.vonage_voice
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.os.Build
+import android.telecom.TelecomManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.iocod.vonage.vonage_voice.constants.Constants
+import com.iocod.vonage.vonage_voice.constants.FlutterErrorCodes
+import com.iocod.vonage.vonage_voice.receivers.TVBroadcastReceiver
+import com.iocod.vonage.vonage_voice.service.TVConnectionService
+import com.iocod.vonage.vonage_voice.service.VonageClientHolder
+import com.iocod.vonage.vonage_voice.storage.Storage
+import com.iocod.vonage.vonage_voice.storage.StorageImpl
+import com.iocod.vonage.vonage_voice.types.CallDirection
+import com.iocod.vonage.vonage_voice.types.VNMethodChannels
+import com.iocod.vonage.vonage_voice.types.VNNativeCallEvents
+import com.vonage.voice.api.VoiceClient
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.MethodChannel.MethodCallHandler
+import io.flutter.plugin.common.MethodChannel.Result
+import io.flutter.plugin.common.PluginRegistry
+
+/**
+ * VonageVoicePlugin — main Flutter plugin entry point.
+ *
+ * Implements:
+ *   [FlutterPlugin]        — Flutter engine attach / detach lifecycle
+ *   [MethodCallHandler]    — handles all 36 MethodChannel commands from Dart
+ *   [EventChannel.StreamHandler] — streams call/audio/permission events to Dart
+ *   [ActivityAware]        — access to Activity for permission requests
+ *   [PluginRegistry.RequestPermissionsResultListener] — handles permission results
+ *
+ * Channel names:
+ *   MethodChannel → "vonage_voice/messages"
+ *   EventChannel  → "vonage_voice/events"
+ *
+ * All events to Flutter are pipe-delimited strings:
+ *   "Ringing|+14155551234|+14158765432|Outgoing"
+ *   "PERMISSION|Microphone|true"
+ */
+class VonageVoicePlugin :
+    FlutterPlugin,
+    MethodCallHandler,
+    EventChannel.StreamHandler,
+    ActivityAware,
+    PluginRegistry.RequestPermissionsResultListener {
+
+    // ── Flutter channels ──────────────────────────────────────────────────
+
+    private var methodChannel: MethodChannel? = null
+    private var eventChannel: EventChannel? = null
+    private var eventSink: EventChannel.EventSink? = null
+
+    // ── Android context ───────────────────────────────────────────────────
+
+    private var context: Context? = null
+    private var activity: Activity? = null
+
+    // ── Core components ───────────────────────────────────────────────────
+
+    private var voiceClient: VoiceClient? = null
+    private var storage: Storage? = null
+    private var broadcastReceiver: TVBroadcastReceiver? = null
+
+    // ── Call state tracking ───────────────────────────────────────────────
+
+    /** callId of the current active or pending call. Null when no call is active. */
+    private var activeCallId: String? = null
+
+    /** Local mute state — Vonage SDK has no getMuteState() so we track it here. */
+    private var isMuted: Boolean = false
+
+    /** Local hold state — tracked here since hold is via Telecom layer. */
+    private var isHolding: Boolean = false
+
+    // ── Permission request tracking ───────────────────────────────────────
+
+    private val permissionResultHandlers = HashMap<Int, (Boolean) -> Unit>()
+
+    companion object {
+        private const val REQUEST_CODE_MIC         = 1001
+        private const val REQUEST_CODE_PHONE_STATE = 1002
+        private const val REQUEST_CODE_CALL_PHONE  = 1003
+        private const val REQUEST_CODE_PHONE_NUMBERS = 1004
+        private const val REQUEST_CODE_MANAGE_CALLS  = 1005
+    }
+
+    // ── FlutterPlugin — engine lifecycle ──────────────────────────────────
+
+    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        context = binding.applicationContext
+        storage = StorageImpl(binding.applicationContext)
+
+        // Register MethodChannel
+        methodChannel = MethodChannel(binding.binaryMessenger, "vonage_voice/messages")
+        methodChannel!!.setMethodCallHandler(this)
+
+        // Register EventChannel
+        eventChannel = EventChannel(binding.binaryMessenger, "vonage_voice/events")
+        eventChannel!!.setStreamHandler(this)
+
+        // Register LocalBroadcast receiver
+        broadcastReceiver = TVBroadcastReceiver { intent ->
+            handleBroadcastIntent(intent)
+        }
+        broadcastReceiver!!.register(binding.applicationContext)
+    }
+
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        methodChannel?.setMethodCallHandler(null)
+        methodChannel = null
+
+        eventChannel?.setStreamHandler(null)
+        eventChannel = null
+
+        broadcastReceiver?.unregister(binding.applicationContext)
+        broadcastReceiver = null
+
+        // Clear VoiceClient from holder and release session
+        voiceClient?.deleteSession()
+        VonageClientHolder.voiceClient = null
+        voiceClient = null
+
+        context = null
+    }
+
+    // ── ActivityAware — activity lifecycle ────────────────────────────────
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        binding.addRequestPermissionsResultListener(this)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        binding.addRequestPermissionsResultListener(this)
+    }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+    }
+
+    // ── EventChannel.StreamHandler ────────────────────────────────────────
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        eventSink = events
+    }
+
+    override fun onCancel(arguments: Any?) {
+        eventSink = null
+    }
+
+    // ── MethodChannel dispatcher ──────────────────────────────────────────
+
+    /**
+     * Main dispatch method — resolves the method name to a [VNMethodChannels]
+     * enum entry and routes to the correct handler.
+     */
+    override fun onMethodCall(call: MethodCall, result: Result) {
+        when (VNMethodChannels.fromMethodName(call.method)) {
+
+            // ── Session / registration ────────────────────────────────────
+            VNMethodChannels.TOKENS -> handleTokens(call, result)
+            VNMethodChannels.UNREGISTER -> handleUnregister(call, result)
+            VNMethodChannels.REFRESH_SESSION -> handleRefreshSession(call, result)
+
+            // ── Core call controls ────────────────────────────────────────
+            VNMethodChannels.MAKE_CALL -> handleMakeCall(call, result)
+            VNMethodChannels.HANG_UP -> handleHangUp(result)
+            VNMethodChannels.ANSWER -> handleAnswer(result)
+            VNMethodChannels.SEND_DIGITS -> handleSendDigits(call, result)
+
+            // ── Audio routing ─────────────────────────────────────────────
+            VNMethodChannels.TOGGLE_SPEAKER -> handleToggleSpeaker(call, result)
+            VNMethodChannels.IS_ON_SPEAKER -> handleIsOnSpeaker(result)
+            VNMethodChannels.TOGGLE_BLUETOOTH -> handleToggleBluetooth(call, result)
+            VNMethodChannels.IS_BLUETOOTH_ON -> handleIsBluetoothOn(result)
+
+            // ── Mute ──────────────────────────────────────────────────────
+            VNMethodChannels.TOGGLE_MUTE -> handleToggleMute(call, result)
+            VNMethodChannels.IS_MUTED -> result.success(isMuted)
+
+            // ── Hold ──────────────────────────────────────────────────────
+            VNMethodChannels.HOLD_CALL -> handleHoldCall(call, result)
+            VNMethodChannels.IS_HOLDING -> result.success(isHolding)
+
+            // ── Call state queries ────────────────────────────────────────
+            VNMethodChannels.IS_ON_CALL -> result.success(TVConnectionService.hasActiveCall())
+            VNMethodChannels.CALL_SID -> result.success(activeCallId)
+
+            // ── Caller identity registry ──────────────────────────────────
+            VNMethodChannels.REGISTER_CLIENT -> handleRegisterClient(call, result)
+            VNMethodChannels.UNREGISTER_CLIENT -> handleUnregisterClient(call, result)
+            VNMethodChannels.DEFAULT_CALLER -> handleDefaultCaller(call, result)
+
+            // ── Telecom / PhoneAccount ────────────────────────────────────
+            VNMethodChannels.HAS_REGISTERED_PHONE_ACCOUNT -> handleHasRegisteredPhoneAccount(result)
+            VNMethodChannels.REGISTER_PHONE_ACCOUNT -> handleRegisterPhoneAccount(result)
+            VNMethodChannels.IS_PHONE_ACCOUNT_ENABLED -> handleIsPhoneAccountEnabled(result)
+            VNMethodChannels.OPEN_PHONE_ACCOUNT_SETTINGS -> handleOpenPhoneAccountSettings(result)
+
+            // ── Permissions ───────────────────────────────────────────────
+            VNMethodChannels.HAS_MIC_PERMISSION ->
+                result.success(hasPermission(Manifest.permission.RECORD_AUDIO))
+            VNMethodChannels.REQUEST_MIC_PERMISSION ->
+                requestPermission(Manifest.permission.RECORD_AUDIO,
+                    VNNativeCallEvents.PERMISSION_MICROPHONE,
+                    REQUEST_CODE_MIC, result)
+
+            VNMethodChannels.HAS_READ_PHONE_STATE_PERMISSION ->
+                result.success(hasPermission(Manifest.permission.READ_PHONE_STATE))
+            VNMethodChannels.REQUEST_READ_PHONE_STATE_PERMISSION ->
+                requestPermission(Manifest.permission.READ_PHONE_STATE,
+                    VNNativeCallEvents.PERMISSION_READ_PHONE_STATE,
+                    REQUEST_CODE_PHONE_STATE, result)
+
+            VNMethodChannels.HAS_CALL_PHONE_PERMISSION ->
+                result.success(hasPermission(Manifest.permission.CALL_PHONE))
+            VNMethodChannels.REQUEST_CALL_PHONE_PERMISSION ->
+                requestPermission(Manifest.permission.CALL_PHONE,
+                    VNNativeCallEvents.PERMISSION_CALL_PHONE,
+                    REQUEST_CODE_CALL_PHONE, result)
+
+            VNMethodChannels.HAS_READ_PHONE_NUMBERS_PERMISSION ->
+                result.success(hasPermission(Manifest.permission.READ_PHONE_NUMBERS))
+            VNMethodChannels.REQUEST_READ_PHONE_NUMBERS_PERMISSION ->
+                requestPermission(Manifest.permission.READ_PHONE_NUMBERS,
+                    VNNativeCallEvents.PERMISSION_READ_PHONE_NUMBERS,
+                    REQUEST_CODE_PHONE_NUMBERS, result)
+
+            VNMethodChannels.HAS_MANAGE_OWN_CALLS_PERMISSION ->
+                result.success(hasPermission(Manifest.permission.MANAGE_OWN_CALLS))
+            VNMethodChannels.REQUEST_MANAGE_OWN_CALLS_PERMISSION ->
+                requestPermission(Manifest.permission.MANAGE_OWN_CALLS,
+                    VNNativeCallEvents.PERMISSION_MANAGE_CALLS,
+                    REQUEST_CODE_MANAGE_CALLS, result)
+
+            // ── Notification / behaviour settings ─────────────────────────
+            VNMethodChannels.SHOW_NOTIFICATIONS -> {
+                val show = call.argument<Boolean>(Constants.PARAM_SHOW) ?: true
+                storage?.setShowNotifications(show)
+                result.success(true)
+            }
+            VNMethodChannels.REJECT_CALL_ON_NO_PERMISSIONS -> {
+                val shouldReject = call.argument<Boolean>(Constants.PARAM_SHOULD_REJECT) ?: false
+                storage?.setRejectCallOnNoPermissions(shouldReject)
+                result.success(true)
+            }
+            VNMethodChannels.IS_REJECTING_CALL_ON_NO_PERMISSIONS ->
+                result.success(storage?.shouldRejectCallOnNoPermissions() ?: false)
+
+            // ── Deprecated stubs — return safe no-op values ───────────────
+            VNMethodChannels.HAS_BLUETOOTH_PERMISSION -> result.success(false)
+            VNMethodChannels.REQUEST_BLUETOOTH_PERMISSION -> result.success(false)
+            VNMethodChannels.BACKGROUND_CALL_UI -> result.success(true)
+            VNMethodChannels.UPDATE_CALL_KIT_ICON -> result.success(true)
+
+            // ── Unknown method ────────────────────────────────────────────
+            null -> result.notImplemented()
+        }
+    }
+
+    // ── Session handlers ──────────────────────────────────────────────────
+
+    /**
+     * tokens() — initialise VoiceClient with JWT and optional FCM token.
+     *
+     * Flutter args:
+     *   jwt         : String  — Vonage JWT (required, comes from your backend)
+     *   deviceToken : String? — FCM token (optional, needed for incoming calls)
+     */
+    private fun handleTokens(call: MethodCall, result: Result) {
+        val jwt = call.argument<String>(Constants.PARAM_JWT)
+        if (jwt.isNullOrEmpty()) {
+            result.error(
+                FlutterErrorCodes.INVALID_PARAMS,
+                "jwt is required",
+                null
+            )
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        // Create VoiceClient if not already initialised
+        if (voiceClient == null) {
+            voiceClient = VoiceClient.createClient(ctx)
+            VonageClientHolder.voiceClient = voiceClient
+
+            // Register all SDK event listeners once on creation
+            registerVoiceClientListeners()
+        }
+
+        // Create session with the JWT from Flutter — never hardcoded
+        voiceClient!!.createSession(jwt) { error, sessionId ->
+            if (error != null) {
+                result.error(
+                    FlutterErrorCodes.SESSION_ERROR,
+                    "createSession failed: ${error.message}",
+                    null
+                )
+                return@createSession
+            }
+
+            // Register FCM push token if provided
+            val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
+            if (!fcmToken.isNullOrEmpty()) {
+                voiceClient!!.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
+                    if (tokenError != null) {
+                        // Non-fatal — session is still valid, just no push for incoming calls
+                        logEvent("FCM token registration failed: ${tokenError.message}")
+                    }
+                }
+            }
+
+            result.success(true)
+        }
+    }
+
+    /**
+     * unregister() — unregister FCM push token and delete the Vonage session.
+     *
+     * Flutter args:
+     *   deviceToken : String? — deviceId returned by registerDevicePushToken
+     */
+    private fun handleUnregister(call: MethodCall, result: Result) {
+        val client = voiceClient ?: run {
+            result.error(FlutterErrorCodes.CLIENT_NOT_INITIALISED, "Call tokens() first", null)
+            return
+        }
+
+        val deviceId = call.argument<String>(Constants.PARAM_FCM_TOKEN)
+        if (!deviceId.isNullOrEmpty()) {
+            client.unregisterDevicePushToken(deviceId) { error ->
+                if (error != null) logEvent("unregisterDevicePushToken failed: ${error.message}")
+            }
+        }
+
+        client.deleteSession { error ->
+            if (error != null) {
+                result.error(
+                    FlutterErrorCodes.SESSION_ERROR,
+                    "deleteSession failed: ${error.message}",
+                    null
+                )
+                return@deleteSession
+            }
+            voiceClient = null
+            VonageClientHolder.voiceClient = null
+            result.success(true)
+        }
+    }
+
+    /**
+     * refreshSession() — refresh an expiring JWT without destroying the session.
+     *
+     * Flutter args:
+     *   jwt : String — new JWT from your backend
+     */
+    private fun handleRefreshSession(call: MethodCall, result: Result) {
+        val jwt = call.argument<String>(Constants.PARAM_JWT)
+        if (jwt.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "jwt is required", null)
+            return
+        }
+
+        val client = voiceClient ?: run {
+            result.error(FlutterErrorCodes.CLIENT_NOT_INITIALISED, "Call tokens() first", null)
+            return
+        }
+
+        client.refreshSession(jwt) { error ->
+            if (error != null) {
+                result.error(
+                    FlutterErrorCodes.SESSION_REFRESH_ERROR,
+                    "refreshSession failed: ${error.message}",
+                    null
+                )
+                return@refreshSession
+            }
+            result.success(true)
+        }
+    }
+
+    // ── Call control handlers ─────────────────────────────────────────────
+
+    /**
+     * makeCall() — place an outbound call via Vonage serverCall().
+     *
+     * Flutter args:
+     *   to   : String            — destination number or user identity
+     *   from : String?           — caller identity (optional)
+     *   ...  : any extra keys    — passed as custom params to serverCall()
+     */
+    private fun handleMakeCall(call: MethodCall, result: Result) {
+        val to = call.argument<String>(Constants.PARAM_TO)
+        if (to.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "to is required", null)
+            return
+        }
+
+        val from = call.argument<String>(Constants.PARAM_FROM) ?: ""
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        // Build intent for TVConnectionService — all params from Flutter
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_PLACE_OUTGOING_CALL
+            putExtra(Constants.EXTRA_CALL_TO, to)
+            putExtra(Constants.EXTRA_CALL_FROM, from)
+
+            // Pass any custom params the Flutter side added
+            @Suppress("UNCHECKED_CAST")
+            val allArgs = call.arguments as? HashMap<String, String>
+            allArgs?.let { putExtra(Constants.EXTRA_OUTGOING_PARAMS, it) }
+        }
+
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    /**
+     * hangUp() — disconnect the active call.
+     */
+    private fun handleHangUp(result: Result) {
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call to hang up", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_HANGUP
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+        }
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    /**
+     * answer() — answer a pending incoming call invite.
+     */
+    private fun handleAnswer(result: Result) {
+        val callId = activeCallId
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No pending call invite to answer", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_ANSWER
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+        }
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    /**
+     * sendDigits() — send DTMF tones on the active call.
+     *
+     * Flutter args:
+     *   digits : String — digit string e.g. "1234" or "*#"
+     */
+    private fun handleSendDigits(call: MethodCall, result: Result) {
+        val digits = call.argument<String>(Constants.PARAM_DIGITS)
+        if (digits.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "digits is required", null)
+            return
+        }
+
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_SEND_DIGITS
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_DIGITS, digits)
+        }
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    // ── Audio routing handlers ────────────────────────────────────────────
+
+    /**
+     * toggleSpeaker() — route audio to / from speakerphone.
+     *
+     * Flutter args:
+     *   speakerIsOn : Boolean
+     */
+    private fun handleToggleSpeaker(call: MethodCall, result: Result) {
+        val speakerOn = call.argument<Boolean>(Constants.PARAM_SPEAKER_IS_ON) ?: false
+
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_TOGGLE_SPEAKER
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_SPEAKER_STATE, speakerOn)
+        }
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    /**
+     * isOnSpeaker() — returns true if audio is routed to the speaker.
+     */
+    private fun handleIsOnSpeaker(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        result.success(audioManager?.isSpeakerphoneOn ?: false)
+    }
+
+    /**
+     * toggleBluetooth() — route audio to / from Bluetooth headset.
+     *
+     * Flutter args:
+     *   bluetoothOn : Boolean
+     */
+    private fun handleToggleBluetooth(call: MethodCall, result: Result) {
+        val bluetoothOn = call.argument<Boolean>(Constants.PARAM_BLUETOOTH_ON) ?: false
+
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_TOGGLE_BLUETOOTH
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_BLUETOOTH_STATE, bluetoothOn)
+        }
+        ctx.startService(intent)
+        result.success(true)
+    }
+
+    /**
+     * isBluetoothOn() — returns true if audio is routed via Bluetooth.
+     */
+    private fun handleIsBluetoothOn(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        result.success(audioManager?.isBluetoothScoOn ?: false)
+    }
+
+    // ── Mute handler ──────────────────────────────────────────────────────
+
+    /**
+     * toggleMute() — mute or unmute the microphone.
+     *
+     * Flutter args:
+     *   muted : Boolean — true to mute, false to unmute
+     */
+    private fun handleToggleMute(call: MethodCall, result: Result) {
+        val muted = call.argument<Boolean>(Constants.PARAM_MUTED) ?: false
+
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_TOGGLE_MUTE
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_MUTE_STATE, muted)
+        }
+        ctx.startService(intent)
+
+        // Update local state immediately so isMuted() returns correct value
+        isMuted = muted
+        result.success(true)
+    }
+
+    // ── Hold handler ──────────────────────────────────────────────────────
+
+    /**
+     * holdCall() — place the call on hold or resume it.
+     *
+     * Flutter args:
+     *   shouldHold : Boolean — true to hold, false to resume
+     */
+    private fun handleHoldCall(call: MethodCall, result: Result) {
+        val shouldHold = call.argument<Boolean>(Constants.PARAM_SHOULD_HOLD) ?: false
+
+        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
+        if (callId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
+            return
+        }
+
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+
+        val intent = Intent(ctx, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_TOGGLE_HOLD
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_HOLD_STATE, shouldHold)
+        }
+        ctx.startService(intent)
+
+        // Update local state immediately
+        isHolding = shouldHold
+        result.success(true)
+    }
+
+    // ── Caller registry handlers ──────────────────────────────────────────
+
+    private fun handleRegisterClient(call: MethodCall, result: Result) {
+        val id = call.argument<String>(Constants.PARAM_CLIENT_ID)
+        val name = call.argument<String>(Constants.PARAM_CLIENT_NAME)
+        if (id.isNullOrEmpty() || name.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "id and name are required", null)
+            return
+        }
+        storage?.addRegisteredClient(id, name)
+        result.success(true)
+    }
+
+    private fun handleUnregisterClient(call: MethodCall, result: Result) {
+        val id = call.argument<String>(Constants.PARAM_CLIENT_ID)
+        if (id.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "id is required", null)
+            return
+        }
+        storage?.removeRegisteredClient(id)
+        result.success(true)
+    }
+
+    private fun handleDefaultCaller(call: MethodCall, result: Result) {
+        val name = call.argument<String>(Constants.PARAM_DEFAULT_CALLER)
+        if (name.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "defaultCaller is required", null)
+            return
+        }
+        storage?.setDefaultCaller(name)
+        result.success(true)
+    }
+
+    // ── Telecom / PhoneAccount handlers ───────────────────────────────────
+
+    private fun handleHasRegisteredPhoneAccount(result: Result) {
+        val telecomManager = context?.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        result.success(telecomManager != null)
+    }
+
+    private fun handleRegisterPhoneAccount(result: Result) {
+        // PhoneAccount registration is handled automatically by the
+        // ConnectionService declaration in AndroidManifest.xml.
+        // This method exists for API compatibility with the Twilio plugin.
+        result.success(true)
+    }
+
+    private fun handleIsPhoneAccountEnabled(result: Result) {
+        val telecomManager = context?.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        result.success(telecomManager != null)
+    }
+
+    private fun handleOpenPhoneAccountSettings(result: Result) {
+        val intent = Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        context?.startActivity(intent)
+        result.success(true)
+    }
+
+    // ── Permission helpers ────────────────────────────────────────────────
+
+    /**
+     * Check if a manifest permission is currently granted.
+     */
+    private fun hasPermission(permission: String): Boolean {
+        val ctx = context ?: return false
+        return ContextCompat.checkSelfPermission(ctx, permission) ==
+                PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Request a runtime permission, emit a PERMISSION event to Flutter
+     * with the result, and call result.success(granted).
+     */
+    private fun requestPermission(
+        manifestPermission: String,
+        permissionLabel: String,
+        requestCode: Int,
+        result: Result
+    ) {
+        val act = activity ?: run {
+            result.error(
+                FlutterErrorCodes.UNAVAILABLE_ERROR,
+                "Activity not available for permission request",
+                null
+            )
+            return
+        }
+
+        if (hasPermission(manifestPermission)) {
+            emitEvent(VNNativeCallEvents.permissionEvent(permissionLabel, true))
+            result.success(true)
+            return
+        }
+
+        // Store result handler — called in onRequestPermissionsResult
+        permissionResultHandlers[requestCode] = { granted ->
+            emitEvent(VNNativeCallEvents.permissionEvent(permissionLabel, granted))
+            result.success(granted)
+        }
+
+        ActivityCompat.requestPermissions(act, arrayOf(manifestPermission), requestCode)
+    }
+
+    /**
+     * Receives the permission request result from the system dialog.
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ): Boolean {
+        val handler = permissionResultHandlers.remove(requestCode) ?: return false
+        val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+        handler(granted)
+        return true
+    }
+
+    // ── LocalBroadcast → EventChannel routing ────────────────────────────
+
+    /**
+     * Routes LocalBroadcast intents from TVConnectionService and
+     * VonageFirebaseMessagingService into pipe-delimited EventChannel strings.
+     *
+     * This is the central event routing method — every call/audio/permission
+     * state change passes through here on its way to Flutter.
+     */
+    private fun handleBroadcastIntent(intent: Intent) {
+        when (intent.action) {
+
+            // ── Incoming call invite ──────────────────────────────────────
+            Constants.BROADCAST_CALL_INVITE -> {
+                val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+                val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
+                val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+                activeCallId = callId
+                emitEvent(VNNativeCallEvents.incomingCallEvent(from, to))
+            }
+
+            // ── Invite cancelled by remote party ──────────────────────────
+            Constants.BROADCAST_CALL_INVITE_CANCELLED -> {
+                activeCallId = null
+                emitEvent(VNNativeCallEvents.EVENT_MISSED_CALL)
+            }
+
+            // ── Call ringing (outbound) ───────────────────────────────────
+            Constants.BROADCAST_CALL_RINGING -> {
+                val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+                val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
+                val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+                activeCallId = callId
+                emitEvent(
+                    VNNativeCallEvents.callStateEvent(
+                        VNNativeCallEvents.EVENT_RINGING,
+                        from, to,
+                        CallDirection.OUTGOING
+                    )
+                )
+            }
+
+            // ── Call connected ────────────────────────────────────────────
+            Constants.BROADCAST_CALL_CONNECTED -> {
+                val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+                val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
+                val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+                activeCallId = callId
+                emitEvent(
+                    VNNativeCallEvents.callStateEvent(
+                        VNNativeCallEvents.EVENT_CONNECTED,
+                        from, to,
+                        CallDirection.INCOMING
+                    )
+                )
+            }
+
+            // ── Call ended ────────────────────────────────────────────────
+            Constants.BROADCAST_CALL_ENDED -> {
+                activeCallId = null
+                isMuted = false
+                isHolding = false
+                emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
+            }
+
+            // ── Reconnecting ──────────────────────────────────────────────
+            Constants.BROADCAST_CALL_RECONNECTING ->
+                emitEvent(VNNativeCallEvents.EVENT_RECONNECTING)
+
+            Constants.BROADCAST_CALL_RECONNECTED ->
+                emitEvent(VNNativeCallEvents.EVENT_RECONNECTED)
+
+            // ── Call error ────────────────────────────────────────────────
+            Constants.BROADCAST_CALL_FAILED -> {
+                val error = intent.getStringExtra("error") ?: "Unknown error"
+                emitEvent(VNNativeCallEvents.callErrorEvent(error))
+            }
+
+            // ── Mute state ────────────────────────────────────────────────
+            Constants.BROADCAST_MUTE_STATE -> {
+                val muted = intent.getBooleanExtra("state", false)
+                isMuted = muted
+                emitEvent(
+                    if (muted) VNNativeCallEvents.EVENT_MUTE
+                    else VNNativeCallEvents.EVENT_UNMUTE
+                )
+            }
+
+            // ── Hold state ────────────────────────────────────────────────
+            Constants.BROADCAST_HOLD_STATE -> {
+                val holding = intent.getBooleanExtra("state", false)
+                isHolding = holding
+                emitEvent(
+                    if (holding) VNNativeCallEvents.EVENT_HOLD
+                    else VNNativeCallEvents.EVENT_UNHOLD
+                )
+            }
+
+            // ── Speaker state ─────────────────────────────────────────────
+            Constants.BROADCAST_SPEAKER_STATE -> {
+                val speakerOn = intent.getBooleanExtra("state", false)
+                emitEvent(
+                    if (speakerOn) VNNativeCallEvents.EVENT_SPEAKER_ON
+                    else VNNativeCallEvents.EVENT_SPEAKER_OFF
+                )
+            }
+
+            // ── Bluetooth state ───────────────────────────────────────────
+            Constants.BROADCAST_BLUETOOTH_STATE -> {
+                val btOn = intent.getBooleanExtra("state", false)
+                emitEvent(
+                    if (btOn) VNNativeCallEvents.EVENT_BT_ON
+                    else VNNativeCallEvents.EVENT_BT_OFF
+                )
+            }
+
+            // ── New FCM token ─────────────────────────────────────────────
+            Constants.BROADCAST_NEW_FCM_TOKEN -> {
+                val token = intent.getStringExtra(Constants.EXTRA_FCM_DATA) ?: return
+                voiceClient?.registerDevicePushToken(token) { error ->
+                    if (error != null) logEvent("FCM token refresh failed: ${error.message}")
+                }
+            }
+        }
+    }
+
+    // ── Vonage SDK listeners ──────────────────────────────────────────────
+
+    /**
+     * Register all Vonage VoiceClient callback listeners.
+     * Called once when the VoiceClient is first created in handleTokens().
+     *
+     * These listeners fire on SDK events (incoming invite, hangup, reconnect)
+     * and route them into LocalBroadcasts so handleBroadcastIntent() can
+     * forward them to Flutter.
+     */
+    private fun registerVoiceClientListeners() {
+        val client = voiceClient ?: return
+        val ctx = context ?: return
+
+        // ── Incoming call invite ──────────────────────────────────────────
+        client.setCallInviteListener { callId, from, channelType ->
+            val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_INCOMING_CALL
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                putExtra(Constants.EXTRA_CALL_FROM, from)
+            }
+            ctx.startService(intent)
+        }
+
+        // ── Incoming invite cancelled by remote ───────────────────────────
+        client.setCallInviteCancelListener { callId, reason ->
+            val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_CANCEL_CALL_INVITE
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            ctx.startService(intent)
+        }
+
+        // ── Call hung up ──────────────────────────────────────────────────
+        client.setOnCallHangupListener { callId, quality, reason ->
+            TVConnectionService.activeConnections[callId]?.disconnect()
+            TVConnectionService.activeConnections.remove(callId)
+
+            val broadcastIntent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+        }
+
+        // ── Media reconnecting ────────────────────────────────────────────
+        client.setOnCallMediaReconnectingListener { callId ->
+            val broadcastIntent = Intent(Constants.BROADCAST_CALL_RECONNECTING).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+        }
+
+        // ── Media reconnected ─────────────────────────────────────────────
+        client.setOnCallMediaReconnectionListener { callId ->
+            val broadcastIntent = Intent(Constants.BROADCAST_CALL_RECONNECTED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+        }
+
+        // ── Media error ───────────────────────────────────────────────────
+        client.setOnCallMediaErrorListener { callId, error ->
+            val broadcastIntent = Intent(Constants.BROADCAST_CALL_FAILED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                putExtra("error", error.message ?: "Media error")
+            }
+            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+        }
+
+        // ── Mute state confirmed by SDK ───────────────────────────────────
+        client.setOnMutedListener { callId, legId, muted ->
+            val broadcastIntent = Intent(Constants.BROADCAST_MUTE_STATE).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                putExtra("state", muted)
+            }
+            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+        }
+
+        // ── Session error ─────────────────────────────────────────────────
+        client.setSessionErrorListener { reason ->
+            emitEvent(VNNativeCallEvents.callErrorEvent("Session error: $reason"))
+        }
+    }
+
+    // ── Utility helpers ───────────────────────────────────────────────────
+
+    /**
+     * Emit a pipe-delimited string event to Flutter via the EventChannel.
+     * Must be called on the main thread — Flutter channels are not thread-safe.
+     */
+    private fun emitEvent(event: String) {
+        activity?.runOnUiThread {
+            eventSink?.success(event)
+        }
+    }
+
+    /**
+     * Log a non-fatal diagnostic event to Flutter.
+     * Useful for debugging session and push registration issues.
+     */
+    private fun logEvent(message: String) {
+        emitEvent(VNNativeCallEvents.callErrorEvent(message))
+    }
+
+    /**
+     * Resolve a caller ID to a display name using the registered client registry.
+     * Falls back to the stored defaultCaller name if no mapping exists.
+     */
+    private fun resolveCallerName(callerId: String): String {
+        if (callerId.isEmpty()) return storage?.getDefaultCaller()
+            ?: Constants.DEFAULT_UNKNOWN_CALLER
+        return storage?.getRegisteredClient(callerId)
+            ?: storage?.getDefaultCaller()
+            ?: callerId
+    }
+}
