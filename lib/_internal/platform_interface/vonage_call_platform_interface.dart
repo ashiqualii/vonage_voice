@@ -121,6 +121,16 @@ abstract class VonageCallPlatform extends SharedPlatformInterface {
   /// Returns true if a Bluetooth audio device is connected and available.
   Future<bool?> isBluetoothAvailable();
 
+  /// Returns true if the device's Bluetooth adapter is enabled.
+  Future<bool?> isBluetoothEnabled();
+
+  /// Shows the native "Turn on Bluetooth?" dialog.
+  /// Returns true if the user enabled Bluetooth, false if they declined.
+  Future<bool?> showBluetoothEnablePrompt();
+
+  /// Opens the system Bluetooth settings screen to pair/connect devices.
+  Future<bool?> openBluetoothSettings();
+
   // ── DTMF ──────────────────────────────────────────────────────────────
 
   /// Sends DTMF tones on the active call.

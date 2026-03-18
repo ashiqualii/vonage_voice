@@ -33,6 +33,8 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.plugin.common.PluginRegistry
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.os.Handler
 import android.os.Looper
 
@@ -59,7 +61,8 @@ class VonageVoicePlugin :
     MethodCallHandler,
     EventChannel.StreamHandler,
     ActivityAware,
-    PluginRegistry.RequestPermissionsResultListener {
+    PluginRegistry.RequestPermissionsResultListener,
+    PluginRegistry.ActivityResultListener {
 
     // ── Flutter channels ──────────────────────────────────────────────────
 
@@ -92,6 +95,7 @@ class VonageVoicePlugin :
     // ── Permission request tracking ───────────────────────────────────────
 
     private val permissionResultHandlers = HashMap<Int, (Boolean) -> Unit>()
+    private var btEnableResult: Result? = null
 
     companion object {
         private const val REQUEST_CODE_MIC         = 1001
@@ -100,6 +104,7 @@ class VonageVoicePlugin :
         private const val REQUEST_CODE_PHONE_NUMBERS = 1004
         private const val REQUEST_CODE_MANAGE_CALLS  = 1005
         private const val REQUEST_CODE_BLUETOOTH     = 1006
+        private const val REQUEST_CODE_BT_ENABLE     = 2001
     }
 
     // ── FlutterPlugin — engine lifecycle ──────────────────────────────────
@@ -150,6 +155,7 @@ class VonageVoicePlugin :
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
         binding.addRequestPermissionsResultListener(this)
+        binding.addActivityResultListener(this)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
@@ -159,6 +165,7 @@ class VonageVoicePlugin :
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         activity = binding.activity
         binding.addRequestPermissionsResultListener(this)
+        binding.addActivityResultListener(this)
     }
 
     override fun onDetachedFromActivity() {
@@ -201,6 +208,9 @@ class VonageVoicePlugin :
             VNMethodChannels.TOGGLE_BLUETOOTH -> handleToggleBluetooth(call, result)
             VNMethodChannels.IS_BLUETOOTH_ON -> handleIsBluetoothOn(result)
             VNMethodChannels.IS_BLUETOOTH_AVAILABLE -> handleIsBluetoothAvailable(result)
+            VNMethodChannels.IS_BLUETOOTH_ENABLED -> handleIsBluetoothEnabled(result)
+            VNMethodChannels.SHOW_BLUETOOTH_ENABLE_PROMPT -> handleShowBluetoothEnablePrompt(result)
+            VNMethodChannels.OPEN_BLUETOOTH_SETTINGS -> handleOpenBluetoothSettings(result)
 
             // ── Mute ──────────────────────────────────────────────────────
             VNMethodChannels.TOGGLE_MUTE -> handleToggleMute(call, result)
@@ -625,6 +635,57 @@ class VonageVoicePlugin :
     }
 
     /**
+     * isBluetoothEnabled() — returns true if the device's Bluetooth adapter is on.
+     */
+    private fun handleIsBluetoothEnabled(result: Result) {
+        val btManager = context?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = btManager?.adapter
+        result.success(adapter?.isEnabled ?: false)
+    }
+
+    /**
+     * showBluetoothEnablePrompt() — shows the native "Turn on Bluetooth?" dialog.
+     * Returns true if the user enabled BT, false if they declined.
+     */
+    private fun handleShowBluetoothEnablePrompt(result: Result) {
+        val act = activity
+        if (act == null) {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "No activity available", null)
+            return
+        }
+        val btManager = act.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = btManager?.adapter
+        if (adapter == null) {
+            result.success(false)
+            return
+        }
+        if (adapter.isEnabled) {
+            result.success(true)
+            return
+        }
+        btEnableResult = result
+        @Suppress("DEPRECATION")
+        val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+        act.startActivityForResult(enableBtIntent, REQUEST_CODE_BT_ENABLE)
+    }
+
+    /**
+     * openBluetoothSettings() — opens the system Bluetooth settings screen
+     * so the user can pair/connect a device.
+     */
+    private fun handleOpenBluetoothSettings(result: Result) {
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+        val intent = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        ctx.startActivity(intent)
+        result.success(true)
+    }
+
+    /**
      * isBluetoothAvailable() — returns true if a Bluetooth audio device
      * is connected and available for routing.
      */
@@ -883,6 +944,19 @@ class VonageVoicePlugin :
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
         handler(granted)
         return true
+    }
+
+    /**
+     * Receives the Bluetooth enable prompt result.
+     */
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode == REQUEST_CODE_BT_ENABLE) {
+            val enabled = resultCode == Activity.RESULT_OK
+            btEnableResult?.success(enabled)
+            btEnableResult = null
+            return true
+        }
+        return false
     }
 
     // ── LocalBroadcast → EventChannel routing ────────────────────────────

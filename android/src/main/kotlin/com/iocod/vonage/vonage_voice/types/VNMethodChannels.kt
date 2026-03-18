@@ -56,6 +56,15 @@ enum class VNMethodChannels(val methodName: String) {
     /** Returns true if a Bluetooth audio device is connected and available. */
     IS_BLUETOOTH_AVAILABLE("isBluetoothAvailable"),
 
+    /** Returns true if the device's Bluetooth adapter is enabled. */
+    IS_BLUETOOTH_ENABLED("isBluetoothEnabled"),
+
+    /** Shows the native "Turn on Bluetooth?" dialog. */
+    SHOW_BLUETOOTH_ENABLE_PROMPT("showBluetoothEnablePrompt"),
+
+    /** Opens Bluetooth settings to pair/connect devices. */
+    OPEN_BLUETOOTH_SETTINGS("openBluetoothSettings"),
+
     // ── Mute ─────────────────────────────────────────────────────────────
 
     /** Mute or unmute the microphone. */

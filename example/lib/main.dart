@@ -494,7 +494,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   bool _onSpeaker = false;
   bool _onHold = false;
   bool _bluetoothOn = false;
-  bool _btAvailable = false;
+  bool btAvailable = false;
   bool _showDialpad = false;
   bool _callReady = false;
   String _callStatus = 'Connecting...';
@@ -513,13 +513,14 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
     final isBt = await VonageVoice.instance.call.isBluetoothOn() ?? false;
     final isSpeaker = await VonageVoice.instance.call.isOnSpeaker() ?? false;
     final isMuted = await VonageVoice.instance.call.isMuted() ?? false;
-    final btAvail = await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
+    final btAvail =
+        await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
     if (!mounted) return;
     setState(() {
       _bluetoothOn = isBt;
       _onSpeaker = isSpeaker;
       _muted = isMuted;
-      _btAvailable = btAvail;
+      btAvailable = btAvail;
     });
   }
 
@@ -574,7 +575,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
         case CallEvent.bluetoothOn:
           setState(() {
             _bluetoothOn = true;
-            _btAvailable = true;
+            btAvailable = true;
             _onSpeaker = false;
           });
           break;
@@ -617,9 +618,40 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   Future<void> _toggleBluetooth() async {
     if (!_callReady) return;
     try {
-      await VonageVoice.instance.call.toggleBluetooth(
-        bluetoothOn: !_bluetoothOn,
-      );
+      // If already on BT, just turn it off
+      if (_bluetoothOn) {
+        await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: false);
+        return;
+      }
+
+      // Check if BT adapter is enabled on the device
+      final btEnabled =
+          await VonageVoice.instance.call.isBluetoothEnabled() ?? false;
+
+      if (!btEnabled) {
+        // Show native "Turn on Bluetooth?" dialog
+        final userEnabled =
+            await VonageVoice.instance.call.showBluetoothEnablePrompt() ??
+            false;
+        if (!userEnabled) return;
+
+        // BT is now enabled — wait briefly for paired devices to auto-connect
+        await Future.delayed(const Duration(seconds: 2));
+      }
+
+      // Check if a BT audio device is connected
+      final btAvail =
+          await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
+
+      if (btAvail) {
+        // Device connected — route audio to it
+        await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: true);
+      } else {
+        // No device connected — open BT settings to pair/connect
+        await VonageVoice.instance.call.openBluetoothSettings();
+      }
+
+      _syncAudioState();
     } catch (_) {}
   }
 
@@ -696,8 +728,8 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                             _bluetoothOn
                                 ? Icons.bluetooth_audio
                                 : _onSpeaker
-                                    ? Icons.volume_up
-                                    : Icons.hearing,
+                                ? Icons.volume_up
+                                : Icons.hearing,
                             color: Colors.white38,
                             size: 14,
                           ),
@@ -706,8 +738,8 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                             _bluetoothOn
                                 ? 'Bluetooth'
                                 : _onSpeaker
-                                    ? 'Speaker'
-                                    : 'Earpiece',
+                                ? 'Speaker'
+                                : 'Earpiece',
                             style: const TextStyle(
                               color: Colors.white38,
                               fontSize: 12,
@@ -769,7 +801,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                         icon: Icons.bluetooth_audio,
                         label: 'Bluetooth',
                         active: _bluetoothOn,
-                        onTap: (_callReady && _btAvailable) ? _toggleBluetooth : null,
+                        onTap: _callReady ? _toggleBluetooth : null,
                       ),
                       _CallControlButton(
                         icon: _onHold ? Icons.play_arrow : Icons.pause,

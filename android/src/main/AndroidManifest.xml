@@ -53,6 +53,10 @@
     <!-- Required on API 31+: connect to Bluetooth audio devices during calls -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Required on API ≤30: access Bluetooth adapter state -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+
     <!-- ══════════════════════════════════════════════════════════════════
          APPLICATION COMPONENTS
          ══════════════════════════════════════════════════════════════════ -->
