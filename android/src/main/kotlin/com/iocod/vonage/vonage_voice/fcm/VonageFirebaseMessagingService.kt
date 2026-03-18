@@ -85,29 +85,21 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         val data = remoteMessage.data
         if (data.isEmpty()) return
 
-        // Check if this FCM message is a Vonage voice push
-        if (!VoiceClient.Companion.isPushNotification(data)) return
+        // Check if this is a Vonage push — UNKNOWN means it's not from Vonage
+        val pushType = VoiceClient.getPushNotificationType(data.toString())
+        if (pushType == null || pushType.toString() == "UNKNOWN") return
 
-        // Get VoiceClient instance held by the plugin
-        // If the app was killed and restarted by FCM, the client may not
-        // be initialised yet — in that case we cannot process the invite
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised — cannot process push invite")
             return
         }
 
-        // Process the push payload — this validates the invite and fires
-        // the callInviteListener that was registered in VonageVoicePlugin
         val callId = client.processPushCallInvite(data.toString())
 
         if (callId.isNullOrEmpty()) {
             broadcastError("processPushCallInvite returned null callId")
             return
         }
-
-        // The actual BROADCAST_CALL_INVITE is sent by the callInviteListener
-        // in VonageVoicePlugin once the SDK confirms the invite is valid.
-        // We do not broadcast here to avoid double-firing.
     }
 
     // ── Broadcast helpers ─────────────────────────────────────────────────

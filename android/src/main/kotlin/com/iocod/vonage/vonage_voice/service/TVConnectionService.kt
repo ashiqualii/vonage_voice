@@ -203,10 +203,13 @@ class TVConnectionService : ConnectionService() {
                 return@serverCall
             }
 
+            if (callId.isNullOrEmpty()) {
+                broadcastError("serverCall returned null callId")
+                return@serverCall
+            }
+
             // Create Telecom connection for this outgoing call
-            val from: String = invite?.from ?: ""
-            val to: String = invite?.to ?: ""
-            val connection = TVCallConnection(this, callId, from, to)
+            val connection = TVCallConnection(this, callId, callFrom, callTo)
             activeConnections[callId] = connection
             connection.setCallActive()
 
