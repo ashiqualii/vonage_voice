@@ -281,12 +281,23 @@ class TVConnectionService : ConnectionService() {
                 audioManager.isSpeakerphoneOn = false
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    // API 31+ — use AudioManager directly
-                    audioManager.setCommunicationDevice(
-                        audioManager.availableCommunicationDevices.firstOrNull {
+                    // API 31+ — prefer Bluetooth if connected, otherwise earpiece
+                    val devices = audioManager.availableCommunicationDevices
+                    val bluetoothDevice = devices.firstOrNull {
+                        it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+                    }
+                    val targetDevice = bluetoothDevice
+                        ?: devices.firstOrNull {
                             it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-                        } ?: return
-                    )
+                        }
+                    targetDevice?.let { audioManager.setCommunicationDevice(it) }
+                } else {
+                    // Pre-API 31 — check if Bluetooth SCO is available and route to it
+                    if (audioManager.isBluetoothScoAvailableOffCall) {
+                        audioManager.startBluetoothSco()
+                        audioManager.isBluetoothScoOn = true
+                    }
                 }
     }
 
@@ -304,9 +315,14 @@ class TVConnectionService : ConnectionService() {
         audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = false
 
-        // API 31+ — release communication device
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.clearCommunicationDevice()
+        } else {
+            // Stop Bluetooth SCO if it was started
+            if (audioManager.isBluetoothScoOn) {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
         }
     }
 
@@ -386,9 +402,11 @@ class TVConnectionService : ConnectionService() {
                     broadcastError("hangup failed: ${error.message}")
                     return@hangup
                 }
+                // Broadcast call ended from here as well — the SDK's
+                // setOnCallHangupListener may not fire for outgoing calls
+                // that were never answered by the remote party.
+                broadcastCallEnded(callId)
             }
-            // Call ended broadcast is fired by the SDK hangup listener
-            // in VonageVoicePlugin, not here — avoid double firing
         }
 
         // Clean up connection

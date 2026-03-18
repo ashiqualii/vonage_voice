@@ -877,6 +877,8 @@ class VonageVoicePlugin :
 
             // ── Call ended ────────────────────────────────────────────────
             Constants.BROADCAST_CALL_ENDED -> {
+                // Guard against duplicate broadcasts (hangup + SDK listener)
+                if (activeCallId == null && !isMuted && !isHolding) return
                 activeCallId = null
                 isMuted = false
                 isHolding = false
@@ -980,13 +982,19 @@ class VonageVoicePlugin :
 
         // ── Call hung up ──────────────────────────────────────────────────
         client.setOnCallHangupListener { callId, quality, reason ->
-            TVConnectionService.activeConnections[callId]?.disconnect()
-            TVConnectionService.activeConnections.remove(callId)
+            // Guard against duplicate CALL_ENDED — handleHangup() in
+            // TVConnectionService already removes the connection and
+            // broadcasts CALL_ENDED when the caller initiates hangup.
+            val connection = TVConnectionService.activeConnections[callId]
+            if (connection != null) {
+                connection.disconnect()
+                TVConnectionService.activeConnections.remove(callId)
 
-            val broadcastIntent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
-                putExtra(Constants.EXTRA_CALL_ID, callId)
+                val broadcastIntent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
             }
-            LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
         }
 
         // ── Media reconnecting ────────────────────────────────────────────
