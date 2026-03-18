@@ -46,7 +46,7 @@ import com.vonage.voice.api.VoiceClient
 class TVConnectionService : ConnectionService() {
 
     private lateinit var broadcastManager: LocalBroadcastManager
-    private lateinit var voiceClient: VoiceClient
+    // private lateinit var voiceClient: VoiceClient
 
     companion object {
         /**
