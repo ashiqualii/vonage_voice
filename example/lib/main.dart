@@ -1,14 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:vonage_voice/vonage_voice.dart';
+import 'package:vonage_voice_example/keys.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const VonageExampleApp());
 }
-
-// ── Static test credentials — replace with your own ──────────────────────
-// JWT is obtained from your Vonage backend / dashboard
-const String kTestJwt = 'YOUR_VONAGE_JWT_HERE';
 
 // ─────────────────────────────────────────────────────────────────────────
 
