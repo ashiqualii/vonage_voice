@@ -67,7 +67,7 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   OnDeviceTokenChanged? deviceTokenChanged;
 
   void setOnDeviceTokenChanged(OnDeviceTokenChanged deviceTokenChanged) {
-    deviceTokenChanged = deviceTokenChanged;
+    this.deviceTokenChanged = deviceTokenChanged;
   }
 
   // ── Session / registration ────────────────────────────────────────────
