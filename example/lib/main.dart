@@ -296,10 +296,21 @@ class _DialerScreenState extends State<DialerScreen> {
               controller: _numberController,
               keyboardType: TextInputType.phone,
               readOnly: true,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 hintText: 'Phone number',
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.phone),
+                suffixIcon: IconButton(
+                  icon: Icon(Icons.backspace_outlined, color: Colors.black54),
+                  onPressed: () {
+                    if (_numberController.text.isNotEmpty) {
+                      setState(() {
+                        _numberController.text = _numberController.text
+                            .substring(0, _numberController.text.length - 1);
+                      });
+                    }
+                  },
+                ),
               ),
             ),
             const SizedBox(height: 16),
@@ -627,7 +638,6 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              ElevatedButton(onPressed: () {}, child: Text('remove')),
               const SizedBox(height: 8),
               _DialPad(onDigitPressed: _sendDtmf, darkMode: true),
               const SizedBox(height: 8),
