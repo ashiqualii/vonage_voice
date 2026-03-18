@@ -1,3 +1,95 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-  package="com.iocod.vonage.vonage_voice">
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         PERMISSIONS
+         ══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Required: capture microphone audio during calls -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Required: integrate with Android Telecom framework -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+
+    <!-- Required: place calls via TelecomManager.placeCall() -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+
+    <!-- Required: detect phone state changes and call handles -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <!-- Required: resolve PhoneAccount handles on API 26+ -->
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
+
+    <!-- Required: run TVConnectionService as a foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Required on API 34+: foreground service with microphone access -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Required: receive FCM push notifications for incoming calls -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Required: post call notifications on API 33+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Required: internet access for Vonage WebRTC media -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Required: check and manage network state for WebRTC -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!-- Required: prevent CPU from sleeping during an active call -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Required: keep screen on during incoming call UI -->
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         APPLICATION COMPONENTS
+         ══════════════════════════════════════════════════════════════════ -->
+
+    <application>
+
+        <!-- ── TVConnectionService ────────────────────────────────────────
+             Extends Android ConnectionService to integrate calls with the
+             Telecom framework — enables native call UI, BT headsets, car kits.
+
+             android:permission ensures only the system Telecom framework
+             can bind to this service, preventing unauthorised access.
+        -->
+        <service
+            android:name="com.iocod.vonage.vonage_voice.service.TVConnectionService"
+            android:exported="true"
+            android:foregroundServiceType="microphone"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+
+        <!-- ── VonageFirebaseMessagingService ────────────────────────────
+             Extends FirebaseMessagingService to receive FCM push messages
+             from the Vonage backend for incoming call delivery.
+
+             Runs even when the app is backgrounded or killed so incoming
+             calls can wake the app up.
+
+             NOTE: This service requires Firebase to be configured:
+               1. Add google-services.json to android/app/
+               2. Connect Vonage app to Firebase in the Vonage dashboard
+             Until then it is registered but receives no messages.
+        -->
+        <service
+            android:name="com.iocod.vonage.vonage_voice.fcm.VonageFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+    </application>
+
 </manifest>
