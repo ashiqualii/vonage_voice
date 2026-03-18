@@ -19,6 +19,9 @@ import com.iocod.vonage.vonage_voice.call.TVCallConnection
 import com.iocod.vonage.vonage_voice.call.TVCallInviteConnection
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.vonage.voice.api.VoiceClient
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 
 /**
  * TVConnectionService — TelecomVoice ConnectionService.
@@ -212,6 +215,7 @@ class TVConnectionService : ConnectionService() {
             val connection = TVCallConnection(this, callId, callFrom, callTo)
             activeConnections[callId] = connection
             connection.setCallActive()
+            requestAudioFocus() 
 
             startCallForegroundService()
 
@@ -234,6 +238,39 @@ class TVConnectionService : ConnectionService() {
      * Intent extras required:
      *   EXTRA_CALL_ID — callId of the invite to answer
      */
+
+     private fun requestAudioFocus() {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .build()
+                    audioManager.requestAudioFocus(focusRequest)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.requestAudioFocus(
+                        null,
+                        AudioManager.STREAM_VOICE_CALL,
+                        AudioManager.AUDIOFOCUS_GAIN
+                    )
+                }
+
+                // Set audio mode to voice call — critical for microphone to work
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                audioManager.isSpeakerphoneOn = false
+            }
+
+    private fun releaseAudioFocus() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.mode = AudioManager.MODE_NORMAL
+    }
+
+
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
@@ -258,6 +295,7 @@ class TVConnectionService : ConnectionService() {
             )
             activeConnections[callId] = connection
             connection.setCallActive()
+            requestAudioFocus() 
 
             // Broadcast connected event to Flutter
             val broadcast = Intent(Constants.BROADCAST_CALL_CONNECTED).apply {
@@ -312,6 +350,7 @@ class TVConnectionService : ConnectionService() {
         activeConnections.remove(callId)
 
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
+            releaseAudioFocus()
             stopForeground(true)
         }
     }

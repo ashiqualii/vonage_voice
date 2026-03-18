@@ -47,6 +47,9 @@
     <!-- Required: keep screen on during incoming call UI -->
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
 
+    <!-- Required: Modify Audio Settings during incoming call -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <!-- ══════════════════════════════════════════════════════════════════
          APPLICATION COMPONENTS
          ══════════════════════════════════════════════════════════════════ -->
