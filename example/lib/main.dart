@@ -504,6 +504,20 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   void initState() {
     super.initState();
     _listenToCallEvents();
+    _syncAudioState();
+  }
+
+  /// Query the actual audio routing state from the native layer.
+  Future<void> _syncAudioState() async {
+    final isBt = await VonageVoice.instance.call.isBluetoothOn() ?? false;
+    final isSpeaker = await VonageVoice.instance.call.isOnSpeaker() ?? false;
+    final isMuted = await VonageVoice.instance.call.isMuted() ?? false;
+    if (!mounted) return;
+    setState(() {
+      _bluetoothOn = isBt;
+      _onSpeaker = isSpeaker;
+      _muted = isMuted;
+    });
   }
 
   /// Listen for audio state changes while in the active call screen.
@@ -514,12 +528,14 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
       if (!mounted) return;
       switch (event) {
         case CallEvent.ringing:
+          _syncAudioState();
           setState(() {
             _callReady = true;
             _callStatus = 'Ringing...';
           });
           break;
         case CallEvent.connected:
+          _syncAudioState();
           setState(() {
             _callReady = true;
             _callStatus = 'Connected';
@@ -538,7 +554,10 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
           setState(() => _muted = false);
           break;
         case CallEvent.speakerOn:
-          setState(() => _onSpeaker = true);
+          setState(() {
+            _onSpeaker = true;
+            _bluetoothOn = false;
+          });
           break;
         case CallEvent.speakerOff:
           setState(() => _onSpeaker = false);
@@ -550,7 +569,10 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
           setState(() => _onHold = false);
           break;
         case CallEvent.bluetoothOn:
-          setState(() => _bluetoothOn = true);
+          setState(() {
+            _bluetoothOn = true;
+            _onSpeaker = false;
+          });
           break;
         case CallEvent.bluetoothOff:
           setState(() => _bluetoothOn = false);
@@ -658,6 +680,36 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                       child: Text(
                         'On Hold',
                         style: TextStyle(color: Colors.orange, fontSize: 14),
+                      ),
+                    ),
+                  if (_callReady)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            _bluetoothOn
+                                ? Icons.bluetooth_audio
+                                : _onSpeaker
+                                    ? Icons.volume_up
+                                    : Icons.hearing,
+                            color: Colors.white38,
+                            size: 14,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            _bluetoothOn
+                                ? 'Bluetooth'
+                                : _onSpeaker
+                                    ? 'Speaker'
+                                    : 'Earpiece',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                 ],
