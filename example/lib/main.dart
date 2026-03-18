@@ -494,6 +494,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   bool _onSpeaker = false;
   bool _onHold = false;
   bool _bluetoothOn = false;
+  bool _btAvailable = false;
   bool _showDialpad = false;
   bool _callReady = false;
   String _callStatus = 'Connecting...';
@@ -512,11 +513,13 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
     final isBt = await VonageVoice.instance.call.isBluetoothOn() ?? false;
     final isSpeaker = await VonageVoice.instance.call.isOnSpeaker() ?? false;
     final isMuted = await VonageVoice.instance.call.isMuted() ?? false;
+    final btAvail = await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
     if (!mounted) return;
     setState(() {
       _bluetoothOn = isBt;
       _onSpeaker = isSpeaker;
       _muted = isMuted;
+      _btAvailable = btAvail;
     });
   }
 
@@ -571,11 +574,12 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
         case CallEvent.bluetoothOn:
           setState(() {
             _bluetoothOn = true;
+            _btAvailable = true;
             _onSpeaker = false;
           });
           break;
         case CallEvent.bluetoothOff:
-          setState(() => _bluetoothOn = false);
+          _syncAudioState();
           break;
         case CallEvent.reconnecting:
           setState(() => _callStatus = 'Reconnecting...');
@@ -765,7 +769,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                         icon: Icons.bluetooth_audio,
                         label: 'Bluetooth',
                         active: _bluetoothOn,
-                        onTap: _callReady ? _toggleBluetooth : null,
+                        onTap: (_callReady && _btAvailable) ? _toggleBluetooth : null,
                       ),
                       _CallControlButton(
                         icon: _onHold ? Icons.play_arrow : Icons.pause,

@@ -157,6 +157,12 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     return _channel.invokeMethod('isBluetoothOn', <String, dynamic>{});
   }
 
+  /// Returns true if a Bluetooth audio device is connected and available.
+  @override
+  Future<bool?> isBluetoothAvailable() {
+    return _channel.invokeMethod('isBluetoothAvailable', <String, dynamic>{});
+  }
+
   // ── DTMF ──────────────────────────────────────────────────────────────
 
   /// Sends DTMF tones on the active call.

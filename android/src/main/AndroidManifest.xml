@@ -50,6 +50,9 @@
     <!-- Required: Modify Audio Settings during incoming call -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
+    <!-- Required on API 31+: connect to Bluetooth audio devices during calls -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
     <!-- ══════════════════════════════════════════════════════════════════
          APPLICATION COMPONENTS
          ══════════════════════════════════════════════════════════════════ -->

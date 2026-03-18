@@ -20,8 +20,12 @@ import com.iocod.vonage.vonage_voice.call.TVCallInviteConnection
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.vonage.voice.api.VoiceClient
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 
 /**
  * TVConnectionService — TelecomVoice ConnectionService.
@@ -50,6 +54,8 @@ class TVConnectionService : ConnectionService() {
 
     private lateinit var broadcastManager: LocalBroadcastManager
     private var audioFocusRequest: AudioFocusRequest? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private var scoReceiver: BroadcastReceiver? = null
 
     companion object {
         /**
@@ -292,16 +298,32 @@ class TVConnectionService : ConnectionService() {
                             it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
                         }
                     targetDevice?.let { audioManager.setCommunicationDevice(it) }
+
+                    // Broadcast BT state so Flutter UI updates immediately
+                    if (bluetoothDevice != null) {
+                        val btBroadcast = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                            putExtra("state", true)
+                        }
+                        broadcastManager.sendBroadcast(btBroadcast)
+                    }
                 } else {
-                    // Pre-API 31 — check if Bluetooth SCO is available and route to it
-                    if (audioManager.isBluetoothScoAvailableOffCall) {
+                    // Pre-API 31 — only route to BT if a device is actually connected
+                    val btOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    val hasBtDevice = btOutputs.any {
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    }
+                    if (hasBtDevice && audioManager.isBluetoothScoAvailableOffCall) {
                         audioManager.startBluetoothSco()
                         audioManager.isBluetoothScoOn = true
+                        // Actual BT connected state is confirmed via SCO state listener
                     }
                 }
+
+                registerBluetoothMonitor()
     }
 
     private fun releaseAudioFocus() {
+        unregisterBluetoothMonitor()
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -326,6 +348,145 @@ class TVConnectionService : ConnectionService() {
         }
     }
 
+
+    // ── Bluetooth device monitoring ──────────────────────────────────────
+
+    /**
+     * Registers an AudioDeviceCallback to detect Bluetooth device
+     * connections and disconnections during an active call.
+     *
+     * - When a BT device connects: auto-route audio to it (like native phone app)
+     * - When a BT device disconnects: fall back to earpiece and notify Flutter
+     */
+    private fun registerBluetoothMonitor() {
+        if (audioDeviceCallback != null) return
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                if (activeConnections.isEmpty()) return
+
+                val btAdded = addedDevices.any { isBluetoothAudioDevice(it.type) }
+                if (!btAdded) return
+
+                // Check if already on BT — skip if so (deduplicate with onCallAudioStateChanged)
+                val conn = activeConnections.values.firstOrNull()
+                if (conn?.isBluetoothOn == true) return
+
+                // Auto-route to BT like the native phone app
+                audioManager.isSpeakerphoneOn = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val devices = audioManager.availableCommunicationDevices
+                    val btDevice = devices.firstOrNull { isBluetoothAudioDevice(it.type) }
+                    btDevice?.let { audioManager.setCommunicationDevice(it) }
+                } else {
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                }
+
+                // Update connection state
+                conn?.let {
+                    it.isBluetoothOn = true
+                    if (it.isSpeakerOn) {
+                        it.isSpeakerOn = false
+                    }
+                }
+
+                val broadcast = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                    putExtra("state", true)
+                }
+                broadcastManager.sendBroadcast(broadcast)
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                if (activeConnections.isEmpty()) return
+
+                val btRemoved = removedDevices.any { isBluetoothAudioDevice(it.type) }
+                if (!btRemoved) return
+
+                // Check if already off BT — skip if so (deduplicate)
+                val conn = activeConnections.values.firstOrNull()
+                if (conn?.isBluetoothOn == false) return
+
+                // Fall back to earpiece
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val devices = audioManager.availableCommunicationDevices
+                    val earpiece = devices.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                    }
+                    earpiece?.let { audioManager.setCommunicationDevice(it) }
+                } else {
+                    audioManager.stopBluetoothSco()
+                    audioManager.isBluetoothScoOn = false
+                }
+
+                // Update connection state
+                conn?.let { it.isBluetoothOn = false }
+
+                val broadcast = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                    putExtra("state", false)
+                }
+                broadcastManager.sendBroadcast(broadcast)
+            }
+        }
+
+        audioDeviceCallback = callback
+        audioManager.registerAudioDeviceCallback(callback, null)
+
+        // Pre-API 31: listen for SCO audio state changes to confirm BT link
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && scoReceiver == null) {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    if (intent.action != AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED) return
+                    val state = intent.getIntExtra(
+                        AudioManager.EXTRA_SCO_AUDIO_STATE,
+                        AudioManager.SCO_AUDIO_STATE_DISCONNECTED
+                    )
+                    val conn = activeConnections.values.firstOrNull() ?: return
+                    when (state) {
+                        AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                            if (!conn.isBluetoothOn) {
+                                conn.isBluetoothOn = true
+                                val bc = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                                    putExtra("state", true)
+                                }
+                                broadcastManager.sendBroadcast(bc)
+                            }
+                        }
+                        AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
+                            if (conn.isBluetoothOn) {
+                                conn.isBluetoothOn = false
+                                val bc = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                                    putExtra("state", false)
+                                }
+                                broadcastManager.sendBroadcast(bc)
+                            }
+                        }
+                    }
+                }
+            }
+            scoReceiver = receiver
+            val filter = IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
+            registerReceiver(receiver, filter)
+        }
+    }
+
+    private fun unregisterBluetoothMonitor() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioDeviceCallback?.let { audioManager.unregisterAudioDeviceCallback(it) }
+        audioDeviceCallback = null
+
+        scoReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        scoReceiver = null
+    }
+
+    private fun isBluetoothAudioDevice(type: Int): Boolean {
+        return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+               (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                type == AudioDeviceInfo.TYPE_BLE_HEADSET)
+    }
 
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return

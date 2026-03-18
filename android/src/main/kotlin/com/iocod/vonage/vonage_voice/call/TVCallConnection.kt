@@ -1,6 +1,7 @@
 package com.iocod.vonage.vonage_voice.call
 
 import android.content.Context
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import android.telecom.CallAudioState
@@ -47,22 +48,23 @@ class TVCallConnection(
         private set
 
     var isSpeakerOn: Boolean = false
-        private set
+        internal set
 
     var isBluetoothOn: Boolean = false
-        private set
+        internal set
 
     // ── Connection lifecycle callbacks (called by Android Telecom) ────────
 
     /**
      * Called when the system (or user via headset button) requests a disconnect.
-     * We broadcast this so VonageVoicePlugin can call client.hangup(callId).
+     * We broadcast SYSTEM_DISCONNECT so VonageVoicePlugin can call client.hangup(callId)
+     * to properly tear down the server-side call leg.
      */
     override fun onDisconnect() {
         audioManager.mode = AudioManager.MODE_NORMAL
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroy()
-        broadcastEvent(Constants.BROADCAST_CALL_ENDED)
+        broadcastEvent(Constants.BROADCAST_SYSTEM_DISCONNECT)
     }
 
     /**
@@ -137,8 +139,20 @@ class TVCallConnection(
 
     /**
      * Route audio to speakerphone or back to earpiece.
+     * Turning speaker on will disable Bluetooth routing.
      */
     fun setSpeaker(speakerOn: Boolean) {
+        if (speakerOn && isBluetoothOn) {
+            // Stop BT first so audio routes cleanly to speaker
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            } else {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+            isBluetoothOn = false
+            broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, false)
+        }
         isSpeakerOn = speakerOn
         audioManager.isSpeakerphoneOn = speakerOn
         broadcastStateEvent(Constants.BROADCAST_SPEAKER_STATE, speakerOn)
@@ -146,17 +160,62 @@ class TVCallConnection(
 
     /**
      * Route audio to Bluetooth SCO headset or back to earpiece.
+     * Turning Bluetooth on will disable the speakerphone.
+     * Uses setCommunicationDevice() on API 31+ for reliable routing.
      */
     fun setBluetooth(bluetoothOn: Boolean) {
-        isBluetoothOn = bluetoothOn
-        if (bluetoothOn) {
-            audioManager.startBluetoothSco()
-            audioManager.isBluetoothScoOn = true
-        } else {
-            audioManager.stopBluetoothSco()
-            audioManager.isBluetoothScoOn = false
+        if (bluetoothOn && isSpeakerOn) {
+            audioManager.isSpeakerphoneOn = false
+            isSpeakerOn = false
+            broadcastStateEvent(Constants.BROADCAST_SPEAKER_STATE, false)
         }
-        broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, bluetoothOn)
+        isBluetoothOn = bluetoothOn
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val devices = audioManager.availableCommunicationDevices
+            if (bluetoothOn) {
+                val btDevice = devices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                if (btDevice != null) {
+                    audioManager.setCommunicationDevice(btDevice)
+                } else {
+                    isBluetoothOn = false
+                }
+            } else {
+                val earpiece = devices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                }
+                earpiece?.let { audioManager.setCommunicationDevice(it) }
+            }
+        } else {
+            if (bluetoothOn) {
+                // Only start SCO if a BT audio device is actually connected
+                if (hasConnectedBluetoothDevice()) {
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                } else {
+                    isBluetoothOn = false
+                }
+            } else {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+        }
+        broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, isBluetoothOn)
+    }
+
+    /**
+     * Check if a Bluetooth audio output device is actually connected.
+     * Uses getDevices() to detect real hardware, not just HW capability.
+     */
+    private fun hasConnectedBluetoothDevice(): Boolean {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        return devices.any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+             it.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
+        }
     }
 
     /**

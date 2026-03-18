@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import android.telecom.PhoneAccountHandle
@@ -98,6 +99,7 @@ class VonageVoicePlugin :
         private const val REQUEST_CODE_CALL_PHONE  = 1003
         private const val REQUEST_CODE_PHONE_NUMBERS = 1004
         private const val REQUEST_CODE_MANAGE_CALLS  = 1005
+        private const val REQUEST_CODE_BLUETOOTH     = 1006
     }
 
     // ── FlutterPlugin — engine lifecycle ──────────────────────────────────
@@ -198,6 +200,7 @@ class VonageVoicePlugin :
             VNMethodChannels.IS_ON_SPEAKER -> handleIsOnSpeaker(result)
             VNMethodChannels.TOGGLE_BLUETOOTH -> handleToggleBluetooth(call, result)
             VNMethodChannels.IS_BLUETOOTH_ON -> handleIsBluetoothOn(result)
+            VNMethodChannels.IS_BLUETOOTH_AVAILABLE -> handleIsBluetoothAvailable(result)
 
             // ── Mute ──────────────────────────────────────────────────────
             VNMethodChannels.TOGGLE_MUTE -> handleToggleMute(call, result)
@@ -272,9 +275,23 @@ class VonageVoicePlugin :
             VNMethodChannels.IS_REJECTING_CALL_ON_NO_PERMISSIONS ->
                 result.success(storage?.shouldRejectCallOnNoPermissions() ?: false)
 
-            // ── Deprecated stubs — return safe no-op values ───────────────
-            VNMethodChannels.HAS_BLUETOOTH_PERMISSION -> result.success(false)
-            VNMethodChannels.REQUEST_BLUETOOTH_PERMISSION -> result.success(false)
+            // ── Bluetooth permission (API 31+) ──────────────────────────
+            VNMethodChannels.HAS_BLUETOOTH_PERMISSION -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    result.success(hasPermission(Manifest.permission.BLUETOOTH_CONNECT))
+                } else {
+                    result.success(true) // not needed pre-API 31
+                }
+            }
+            VNMethodChannels.REQUEST_BLUETOOTH_PERMISSION -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    requestPermission(Manifest.permission.BLUETOOTH_CONNECT,
+                        VNNativeCallEvents.PERMISSION_BLUETOOTH_CONNECT,
+                        REQUEST_CODE_BLUETOOTH, result)
+                } else {
+                    result.success(true)
+                }
+            }
             VNMethodChannels.BACKGROUND_CALL_UI -> result.success(true)
             VNMethodChannels.UPDATE_CALL_KIT_ICON -> result.success(true)
 
@@ -560,10 +577,22 @@ class VonageVoicePlugin :
 
     /**
      * isOnSpeaker() — returns true if audio is routed to the speaker.
+     * Uses communicationDevice check on API 31+ for accuracy.
      */
     private fun handleIsOnSpeaker(result: Result) {
         val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        result.success(audioManager?.isSpeakerphoneOn ?: false)
+        if (audioManager == null) {
+            result.success(false)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val device = audioManager.communicationDevice
+            val isSpeaker = device != null &&
+                device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            result.success(isSpeaker || audioManager.isSpeakerphoneOn)
+        } else {
+            result.success(audioManager.isSpeakerphoneOn)
+        }
     }
 
     /**
@@ -596,11 +625,51 @@ class VonageVoicePlugin :
     }
 
     /**
+     * isBluetoothAvailable() — returns true if a Bluetooth audio device
+     * is connected and available for routing.
+     */
+    private fun handleIsBluetoothAvailable(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            result.success(false)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val devices = audioManager.availableCommunicationDevices
+            val hasBt = devices.any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            }
+            result.success(hasBt)
+        } else {
+            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val hasBt = devices.any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            }
+            result.success(hasBt)
+        }
+    }
+
+    /**
      * isBluetoothOn() — returns true if audio is routed via Bluetooth.
+     * Uses communicationDevice on API 31+ for accurate detection.
      */
     private fun handleIsBluetoothOn(result: Result) {
         val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        result.success(audioManager?.isBluetoothScoOn ?: false)
+        if (audioManager == null) {
+            result.success(false)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val device = audioManager.communicationDevice
+            val isBt = device != null && (
+                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            )
+            result.success(isBt)
+        } else {
+            result.success(audioManager.isBluetoothScoOn)
+        }
     }
 
     // ── Mute handler ──────────────────────────────────────────────────────
@@ -934,6 +1003,23 @@ class VonageVoicePlugin :
                     if (btOn) VNNativeCallEvents.EVENT_BT_ON
                     else VNNativeCallEvents.EVENT_BT_OFF
                 )
+            }
+
+            // ── System-initiated disconnect (BT headset button, car kit) ──
+            Constants.BROADCAST_SYSTEM_DISCONNECT -> {
+                val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+                val client = voiceClient
+                if (client != null) {
+                    client.hangup(callId) { error ->
+                        if (error != null) logEvent("system disconnect hangup failed: ${error.message}")
+                    }
+                }
+                // Clean up connection from service
+                TVConnectionService.activeConnections.remove(callId)
+                activeCallId = null
+                isMuted = false
+                isHolding = false
+                emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
             }
 
             // ── New FCM token ─────────────────────────────────────────────

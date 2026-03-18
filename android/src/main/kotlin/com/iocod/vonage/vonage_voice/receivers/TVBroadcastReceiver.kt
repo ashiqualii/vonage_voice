@@ -81,6 +81,7 @@ class TVBroadcastReceiver(
             addAction(Constants.BROADCAST_HOLD_STATE)
             addAction(Constants.BROADCAST_SPEAKER_STATE)
             addAction(Constants.BROADCAST_BLUETOOTH_STATE)
+            addAction(Constants.BROADCAST_SYSTEM_DISCONNECT)
 
             // ── FCM token refresh ─────────────────────────────────────────
             addAction(Constants.BROADCAST_NEW_FCM_TOKEN)

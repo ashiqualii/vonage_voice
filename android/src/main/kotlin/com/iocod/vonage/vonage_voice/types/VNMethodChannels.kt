@@ -53,6 +53,9 @@ enum class VNMethodChannels(val methodName: String) {
     /** Returns true if audio is currently routed via Bluetooth. */
     IS_BLUETOOTH_ON("isBluetoothOn"),
 
+    /** Returns true if a Bluetooth audio device is connected and available. */
+    IS_BLUETOOTH_AVAILABLE("isBluetoothAvailable"),
+
     // ── Mute ─────────────────────────────────────────────────────────────
 
     /** Mute or unmute the microphone. */
@@ -130,12 +133,12 @@ enum class VNMethodChannels(val methodName: String) {
     /** Returns the current auto-reject setting. */
     IS_REJECTING_CALL_ON_NO_PERMISSIONS("isRejectingCallOnNoPermissions"),
 
-    // ── Deprecated stubs (kept for drop-in compatibility with Twilio API) ─
+    // ── Bluetooth permission (API 31+) ─────────────────────────────────
 
-    /** No-op — Bluetooth is handled by the native call screen. */
+    /** Returns true if BLUETOOTH_CONNECT permission is granted (API 31+). */
     HAS_BLUETOOTH_PERMISSION("hasBluetoothPermission"),
 
-    /** No-op — Bluetooth is handled by the native call screen. */
+    /** Request BLUETOOTH_CONNECT runtime permission (API 31+). */
     REQUEST_BLUETOOTH_PERMISSION("requestBluetoothPermission"),
 
     /** No-op — ConnectionService replaced custom background UI. */
