@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -7,9 +8,29 @@ import 'package:vonage_voice/vonage_voice.dart';
 import 'package:vonage_voice_example/firebase_options.dart';
 import 'package:vonage_voice_example/keys.dart';
 
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // This runs in a separate isolate when app is killed/backgrounded.
+  // Forward push data to the native Vonage SDK so it can process
+  // incoming call invites even when VonageFirebaseMessagingService
+  // did not receive the FCM message.
+  log('FCM background message received: ${message.data}');
+  if (message.data.isNotEmpty) {
+    try {
+      await VonageVoice.instance.processVonagePush(message.data);
+    } catch (e) {
+      log('processVonagePush (background) error: $e');
+    }
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // ── Register background message handler ───────────────────────────────
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
   runApp(const VonageExampleApp());
 }
 
@@ -55,9 +76,12 @@ class _LoginScreenState extends State<LoginScreen> {
       await VonageVoice.instance.requestReadPhoneStatePermission();
       await VonageVoice.instance.requestCallPhonePermission();
       await VonageVoice.instance.requestManageOwnCallsPermission();
+      await VonageVoice.instance.requestNotificationPermission();
 
       // Get FCM token for incoming call push notifications
       final fcmToken = await FirebaseMessaging.instance.getToken();
+
+      log('fcm token: $fcmToken');
 
       // Register JWT with Vonage + FCM token for incoming calls
       final result = await VonageVoice.instance.setTokens(
@@ -82,6 +106,12 @@ class _LoginScreenState extends State<LoginScreen> {
     } finally {
       setState(() => _loading = false);
     }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _login();
   }
 
   @override
@@ -131,34 +161,82 @@ class DialerScreen extends StatefulWidget {
 class _DialerScreenState extends State<DialerScreen> {
   final TextEditingController _numberController = TextEditingController();
   StreamSubscription<CallEvent>? _eventSub;
+  StreamSubscription<RemoteMessage>? _fcmForegroundSub;
   bool _calling = false;
+  bool _onCallScreen = false;
   String _status = 'Ready';
 
   @override
   void initState() {
     super.initState();
     _listenToCallEvents();
+    _listenToFcmForeground();
+  }
+
+  /// Forward foreground FCM messages to the native Vonage SDK.
+  void _listenToFcmForeground() {
+    _fcmForegroundSub = FirebaseMessaging.onMessage.listen((
+      RemoteMessage message,
+    ) {
+      log('FCM foreground message: ${message.data}');
+      if (message.data.isNotEmpty) {
+        VonageVoice.instance.processVonagePush(message.data);
+      }
+    });
   }
 
   /// Listen to all call events globally.
   /// Handles incoming calls, call ended, and errors.
+  /// When a call screen is showing, skip navigation events to avoid
+  /// conflicting with the ActiveCallScreen's own listener.
   void _listenToCallEvents() {
     _eventSub = VonageVoice.instance.callEventsListener.listen((
       CallEvent event,
     ) {
+      log('Call event: $event');
+
+      // Skip navigation events while a call screen is active —
+      // ActiveCallScreen handles its own connected/callEnded events.
+      if (_onCallScreen) {
+        switch (event) {
+          case CallEvent.callEnded:
+          case CallEvent.missedCall:
+          case CallEvent.declined:
+            // These pop back to dialer — handle below
+            break;
+          default:
+            return;
+        }
+      }
+
       switch (event) {
         // ── Incoming call ───────────────────────────────────────────────
         case CallEvent.incoming:
-          final activeCall = VonageVoice.instance.call.activeCall;
-          if (activeCall != null && mounted) {
-            Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => IncomingCallScreen(activeCall: activeCall),
-              ),
-            );
-          }
+          log('📞 CallEvent.incoming received');
+          setState(() => _status = 'incoming...');
+
+          Future.delayed(const Duration(milliseconds: 100)).then((_) {
+            if (!mounted) return;
+
+            final activeCall = VonageVoice.instance.call.activeCall;
+            log('📞 activeCall: ${activeCall?.from} → ${activeCall?.to}');
+
+            if (activeCall != null) {
+              log('✅ Navigating to IncomingCallScreen');
+              _onCallScreen = true;
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => IncomingCallScreen(activeCall: activeCall),
+                ),
+              );
+            } else {
+              log('❌ activeCall is NULL — cannot navigate');
+              setState(() => _status = 'Error: activeCall not set');
+            }
+          });
           break;
         case CallEvent.ringing:
+          log('📞 CallEvent.ringing — outgoing call is ringing');
           // Outgoing call is ringing on remote side
           // ActiveCallScreen is already pushed by _makeCall()
           // so we just update the status — no navigation needed
@@ -167,19 +245,25 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Call connected ──────────────────────────────────────────────
         case CallEvent.connected:
+          log('📞 CallEvent.connected');
           final activeCall = VonageVoice.instance.call.activeCall;
           if (activeCall != null && mounted) {
+            log('✅ Replacing with ActiveCallScreen');
+            _onCallScreen = true;
             // Replace incoming screen with active call screen
             Navigator.of(context).pushReplacement(
               MaterialPageRoute(
                 builder: (_) => ActiveCallScreen(activeCall: activeCall),
               ),
             );
+          } else {
+            log('❌ activeCall is NULL on connected event');
           }
           break;
 
         // ── Call ended ──────────────────────────────────────────────────
         case CallEvent.callEnded:
+          _onCallScreen = false;
           setState(() {
             _calling = false;
             _status = 'Call ended';
@@ -192,6 +276,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Missed call ─────────────────────────────────────────────────
         case CallEvent.missedCall:
+          _onCallScreen = false;
           setState(() => _status = 'Missed call');
           if (mounted) {
             Navigator.of(context).popUntil((route) => route.isFirst);
@@ -200,6 +285,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Declined ───────────────────────────────────────────────────
         case CallEvent.declined:
+          _onCallScreen = false;
           setState(() {
             _calling = false;
             _status = 'Call declined';
@@ -247,6 +333,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
       // Navigate to active call screen
       if (mounted) {
+        _onCallScreen = true;
         Navigator.of(context).push(
           MaterialPageRoute(
             builder: (_) => ActiveCallScreen(
@@ -281,6 +368,7 @@ class _DialerScreenState extends State<DialerScreen> {
   @override
   void dispose() {
     _eventSub?.cancel();
+    _fcmForegroundSub?.cancel();
     _numberController.dispose();
     super.dispose();
   }
@@ -373,7 +461,12 @@ class IncomingCallScreen extends StatelessWidget {
 
   Future<void> _answer(BuildContext context) async {
     await VonageVoice.instance.call.answer();
-    // ActiveCallScreen is pushed by the connected event listener in DialerScreen
+    if (!context.mounted) return;
+    // Navigate to active call screen immediately — same pattern as outgoing calls
+    final call = VonageVoice.instance.call.activeCall ?? activeCall;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => ActiveCallScreen(activeCall: call)),
+    );
   }
 
   Future<void> _reject(BuildContext context) async {

@@ -167,6 +167,16 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   @Deprecated('custom call UI not used anymore, has no effect')
   Future<bool?> requestBluetoothPermissions();
 
+  // ── Notification permission ───────────────────────────────────────
+
+  /// Returns true if POST_NOTIFICATIONS permission is granted.
+  /// Always returns true on Android < 13 (API 33).
+  Future<bool> hasNotificationPermission();
+
+  /// Requests POST_NOTIFICATIONS runtime permission (Android 13+).
+  /// Returns true immediately on older Android versions.
+  Future<bool?> requestNotificationPermission();
+
   // ── Call rejection behaviour ──────────────────────────────────────────
 
   /// Auto-reject incoming calls when required permissions are missing.
@@ -198,6 +208,17 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
 
   /// Set the fallback display name for callers with no registered mapping.
   Future<bool?> setDefaultCallerName(String callerName);
+
+  /// Forward an FCM push payload to the native Vonage SDK.
+  ///
+  /// Call this from [FirebaseMessaging.onMessage] and
+  /// [FirebaseMessaging.onBackgroundMessage] so the Vonage SDK can
+  /// process incoming call push notifications even when Flutter's
+  /// firebase_messaging plugin intercepts the FCM message first.
+  ///
+  /// [data] — the `RemoteMessage.data` map from Firebase.
+  /// Returns the call ID if the push was a Vonage call invite, else null.
+  Future<String?> processVonagePush(Map<String, dynamic> data);
 
   // ── Deprecated stubs ──────────────────────────────────────────────────
 

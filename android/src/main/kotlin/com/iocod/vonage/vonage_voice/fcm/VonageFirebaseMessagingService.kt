@@ -1,10 +1,12 @@
 package com.iocod.vonage.vonage_voice.fcm
 
 import android.content.Intent
+import android.os.Build 
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import com.iocod.vonage.vonage_voice.constants.Constants
+import com.iocod.vonage.vonage_voice.service.TVConnectionService  
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
 import com.vonage.voice.api.VoiceClient
 import org.json.JSONObject
@@ -45,6 +47,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
     override fun onCreate() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
+        println("VonageFirebaseMessagingService created")
     }
 
     // ── FCM token lifecycle ───────────────────────────────────────────────
@@ -82,27 +85,134 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
      */
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
         super.onMessageReceived(remoteMessage)
+        android.util.Log.d("VonageFCM", "=== onMessageReceived CALLED ===")
 
         val data = remoteMessage.data
-        if (data.isEmpty()) return
-
-        // Serialize to JSON string — Vonage SDK expects a JSON string, not Map.toString()
-        val dataJson = JSONObject(data as Map<*, *>).toString()
-
-        // Check if this is a Vonage push — UNKNOWN means it's not from Vonage
-        val pushType = VoiceClient.getPushNotificationType(dataJson)
-        if (pushType == null || pushType.toString() == "UNKNOWN") return
-
-        val client = VonageClientHolder.voiceClient ?: run {
-            broadcastError("VoiceClient not initialised — cannot process push invite")
+        if (data.isEmpty()) {
+            android.util.Log.d("VonageFCM", "Empty data — ignoring")
             return
         }
 
-        val callId = client.processPushCallInvite(dataJson)
-
-        if (callId.isNullOrEmpty()) {
-            broadcastError("processPushCallInvite returned null callId")
+        // Vonage pushes always contain a "nexmo" key.
+        val nexmoRaw = data["nexmo"]
+        if (nexmoRaw.isNullOrEmpty()) {
+            android.util.Log.d("VonageFCM", "No 'nexmo' key — not a Vonage push, ignored")
             return
+        }
+        android.util.Log.d("VonageFCM", "Vonage push detected (has 'nexmo' key)")
+
+        // The Vonage SDK's internal extractJsonFromPushData expects the data
+        // in Kotlin Map.toString() format: {nexmo={"type":...}}
+        // It does substringAfter("nexmo=").dropLast(1) to extract the JSON.
+        // So we pass remoteMessage.data.toString() directly — NOT JSON.
+        val dataString = data.toString()
+        android.util.Log.d("VonageFCM", "Data string for SDK (first 200 chars): ${dataString.take(200)}")
+
+        // Extract caller display info from the push payload.
+        val callerDisplay = extractCallerDisplay(nexmoRaw)
+        android.util.Log.d("VonageFCM", "Caller display extracted: $callerDisplay")
+
+        // Store the display name so both FCM-service and plugin paths can use it.
+        if (!callerDisplay.isNullOrEmpty()) {
+            VonageClientHolder.pendingCallerDisplay = callerDisplay
+        }
+
+        // ── Create VoiceClient if app was killed ──────────────────────────
+        var client = VonageClientHolder.voiceClient
+        val clientWasNull = client == null
+        if (client == null) {
+            android.util.Log.w("VonageFCM", "VoiceClient null — creating for background")
+            client = VoiceClient(applicationContext)
+            VonageClientHolder.voiceClient = client
+        }
+
+        // Only register the listener when we just created the client (app was killed).
+        // When the plugin is alive it has already set its own listener in
+        // registerVoiceClientListeners() — overwriting it here would break
+        // the foreground incoming call path.
+        if (clientWasNull) {
+            client.setCallInviteListener { callId, from, channelType ->
+                android.util.Log.d("VonageFCM", "🔔 setCallInviteListener FIRED — callId: $callId from: $from")
+                // Prefer the display name extracted from the push payload.
+                val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
+                VonageClientHolder.pendingCallerDisplay = null
+                val intent = Intent(applicationContext, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_INCOMING_CALL
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                    putExtra(Constants.EXTRA_CALL_FROM, displayFrom)
+                    putExtra(Constants.EXTRA_CALL_TO, "")
+                }
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        android.util.Log.d("VonageFCM", "Starting foreground service for incoming call")
+                        applicationContext.startForegroundService(intent)
+                    } else {
+                        applicationContext.startService(intent)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("VonageFCM", "Error starting service: ${e.message}")
+                }
+            }
+        }
+
+        android.util.Log.d("VonageFCM", "Calling processPushCallInvite...")
+        try {
+            val callId = client.processPushCallInvite(dataString)
+            android.util.Log.d("VonageFCM", "processPushCallInvite returned: $callId")
+            // A null/empty callId is NORMAL — the SDK processes the push
+            // asynchronously and fires setCallInviteListener when ready.
+            // Null just means "no synchronous callId available", not failure.
+            if (!callId.isNullOrEmpty()) {
+                android.util.Log.d("VonageFCM", "✅ Incoming call processed with callId: $callId")
+            } else {
+                android.util.Log.d("VonageFCM", "ℹ️ processPushCallInvite returned null — waiting for setCallInviteListener callback")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("VonageFCM", "❌ processPushCallInvite threw: ${e.message}")
+        }
+    }
+
+    // ── Push payload helpers ────────────────────────────────────────────────
+
+    /**
+     * Build data string in Kotlin Map.toString() format from an FCM data map.
+     *
+     * The Vonage SDK's internal `extractJsonFromPushData` expects:
+     *   `{nexmo={"type":"member:invited",...}}`
+     * It does `substringAfter("nexmo=").dropLast(1)` to extract the JSON.
+     *
+     * When called from the native `onMessageReceived`, we can use
+     * `remoteMessage.data.toString()` directly. This helper exists for
+     * the Dart fallback path where the data arrives as a re-constructed map.
+     */
+    @Suppress("unused")
+    private fun buildNestedJson(data: Map<String, String>): String {
+        return data.toString()
+    }
+
+    /**
+     * Extract the caller display name from the Vonage push payload.
+     *
+     * Priority:
+     *   1. push_info.from_user.display_name  (app-to-app calls)
+     *   2. body.channel.from.number          (PSTN calls)
+     */
+    private fun extractCallerDisplay(nexmoRaw: String): String? {
+        return try {
+            val json = JSONObject(nexmoRaw)
+            // App-to-app: push_info.from_user.display_name
+            val fromUser = json.optJSONObject("push_info")
+                ?.optJSONObject("from_user")
+            val displayName = fromUser?.optString("display_name", null)
+            if (!displayName.isNullOrEmpty()) return displayName
+
+            // PSTN: body.channel.from.number
+            json.optJSONObject("body")
+                ?.optJSONObject("channel")
+                ?.optJSONObject("from")
+                ?.optString("number", null)
+        } catch (_: Exception) {
+            null
         }
     }
 

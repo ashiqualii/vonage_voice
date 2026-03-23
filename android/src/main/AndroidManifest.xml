@@ -47,18 +47,26 @@
     <!-- Required: keep screen on during incoming call UI -->
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
 
-    <!-- Required: Modify Audio Settings during incoming call -->
+    <!-- Required: show full-screen incoming call UI over lock screen -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- Required: vibrate during incoming call notification -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Required: control audio routing (earpiece, speaker, Bluetooth) -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- Required on API 31+: connect to Bluetooth audio devices during calls -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- Required on API ≤30: access Bluetooth adapter state -->
-    <uses-permission android:name="android.permission.BLUETOOTH"
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
 
     <!-- ══════════════════════════════════════════════════════════════════
          APPLICATION COMPONENTS
+         All services and receivers must live inside <application>
          ══════════════════════════════════════════════════════════════════ -->
 
     <application>
@@ -80,26 +88,14 @@
             </intent-filter>
         </service>
 
-        <!-- ── VonageFirebaseMessagingService ────────────────────────────
-             Extends FirebaseMessagingService to receive FCM push messages
-             from the Vonage backend for incoming call delivery.
-
-             Runs even when the app is backgrounded or killed so incoming
-             calls can wake the app up.
-
-             NOTE: This service requires Firebase to be configured:
-               1. Add google-services.json to android/app/
-               2. Connect Vonage app to Firebase in the Vonage dashboard
-             Until then it is registered but receives no messages.
-        -->
         <service
             android:name="com.iocod.vonage.vonage_voice.fcm.VonageFirebaseMessagingService"
             android:exported="false">
-            <intent-filter>
+            <intent-filter android:priority="10">
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
-
+        
         <receiver
             android:name="com.iocod.vonage.vonage_voice.receivers.TVCallActionReceiver"
             android:exported="false">
@@ -110,7 +106,5 @@
         </receiver>
 
     </application>
-
-    
 
 </manifest>

@@ -110,6 +110,7 @@ object VNNativeCallEvents {
     const val PERMISSION_READ_PHONE_NUMBERS = "Read Phone Numbers"
     const val PERMISSION_MANAGE_CALLS       = "Manage Calls"
     const val PERMISSION_BLUETOOTH_CONNECT  = "Bluetooth Connect"
+    const val PERMISSION_NOTIFICATIONS      = "Notifications"
 
     // ── Helper builders ───────────────────────────────────────────────────
 

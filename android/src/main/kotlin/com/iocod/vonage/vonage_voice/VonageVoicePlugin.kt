@@ -104,6 +104,7 @@ class VonageVoicePlugin :
         private const val REQUEST_CODE_PHONE_NUMBERS = 1004
         private const val REQUEST_CODE_MANAGE_CALLS  = 1005
         private const val REQUEST_CODE_BLUETOOTH     = 1006
+        private const val REQUEST_CODE_NOTIFICATIONS  = 1007
         private const val REQUEST_CODE_BT_ENABLE     = 2001
     }
 
@@ -176,10 +177,67 @@ class VonageVoicePlugin :
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
+        android.util.Log.e("VonagePlugin", "✅ onListen CALLED — EventSink attached, scheduling reEmitPendingCallState")
+        // Retry with increasing delays to handle slow cold-starts.
+        // The first attempt fires quickly for the foreground case;
+        // later attempts catch slower background-launch scenarios.
+        val delays = longArrayOf(100, 500, 1500)
+        for (delay in delays) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (eventSink != null) {
+                    reEmitPendingCallState()
+                }
+            }, delay)
+        }
     }
 
     override fun onCancel(arguments: Any?) {
         eventSink = null
+    }
+
+    /**
+     * Re-emits the current call state to Flutter when the EventChannel
+     * listener is (re-)attached. Handles two cases:
+     *
+     * 1. Pending incoming invite — app was backgrounded when FCM push
+     *    arrived and the original "Incoming|..." event was lost.
+     * 2. Active connected call — user answered from the notification
+     *    while the app was backgrounded and the "Connected|..." event
+     *    was never delivered to Flutter.
+     *
+     * This method is called multiple times with increasing delays.
+     * The [pendingCallReEmitted] flag prevents duplicate emissions.
+     */
+    private var pendingCallReEmitted = false
+
+    private fun reEmitPendingCallState() {
+        if (pendingCallReEmitted) return
+
+        // Case 1: pending incoming invite — show ringing screen
+        val pendingEntry = TVConnectionService.pendingInvites.entries.firstOrNull()
+        if (pendingEntry != null) {
+            val invite = pendingEntry.value
+            val from = resolveCallerName(invite.from)
+            activeCallId = pendingEntry.key
+            pendingCallReEmitted = true
+            emitEvent(VNNativeCallEvents.incomingCallEvent(from, invite.to))
+            return
+        }
+
+        // Case 2: already-answered call — show active call screen
+        val activeEntry = TVConnectionService.activeConnections.entries.firstOrNull()
+        if (activeEntry != null) {
+            val conn = activeEntry.value
+            activeCallId = activeEntry.key
+            pendingCallReEmitted = true
+            emitEvent(
+                VNNativeCallEvents.callStateEvent(
+                    VNNativeCallEvents.EVENT_CONNECTED,
+                    conn.from, conn.to,
+                    CallDirection.INCOMING
+                )
+            )
+        }
     }
 
     // ── MethodChannel dispatcher ──────────────────────────────────────────
@@ -305,6 +363,27 @@ class VonageVoicePlugin :
             VNMethodChannels.BACKGROUND_CALL_UI -> result.success(true)
             VNMethodChannels.UPDATE_CALL_KIT_ICON -> result.success(true)
 
+            // ── Push processing (Dart-side FCM forwarding) ────────────
+            VNMethodChannels.PROCESS_PUSH -> handleProcessPush(call, result)
+
+            // ── Notification permission (API 33+) ──────────────────────
+            VNMethodChannels.HAS_NOTIFICATION_PERMISSION -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    result.success(hasPermission(Manifest.permission.POST_NOTIFICATIONS))
+                } else {
+                    result.success(true) // not needed pre-API 33
+                }
+            }
+            VNMethodChannels.REQUEST_NOTIFICATION_PERMISSION -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    requestPermission(Manifest.permission.POST_NOTIFICATIONS,
+                        VNNativeCallEvents.PERMISSION_NOTIFICATIONS,
+                        REQUEST_CODE_NOTIFICATIONS, result)
+                } else {
+                    result.success(true)
+                }
+            }
+
             // ── Unknown method ────────────────────────────────────────────
             null -> result.notImplemented()
         }
@@ -347,6 +426,7 @@ class VonageVoicePlugin :
         // Create session with the JWT from Flutter — never hardcoded
         voiceClient!!.createSession(jwt) { error, sessionId ->
             if (error != null) {
+                android.util.Log.e("VonagePlugin", "createSession failed: ${error.message}")
                 result.error(
                     FlutterErrorCodes.SESSION_ERROR,
                     "createSession failed: ${error.message}",
@@ -354,6 +434,8 @@ class VonageVoicePlugin :
                 )
                 return@createSession
             }
+            android.util.Log.e("VonagePlugin", "✅ Session created: $sessionId")
+            android.util.Log.e("VonagePlugin", "✅ Listeners being registered now")
 
             // Register FCM push token if provided
             val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
@@ -367,6 +449,65 @@ class VonageVoicePlugin :
             }
 
             result.success(true)
+        }
+    }
+
+    /**
+     * processVonagePush() — forward an FCM push payload from Dart.
+     *
+     * When Flutter's firebase_messaging plugin intercepts the FCM message
+     * before VonageFirebaseMessagingService, the Dart side can call this
+     * method to feed the push data to VoiceClient.processPushCallInvite().
+     *
+     * Flutter args:
+     *   data : Map<String, String> — the RemoteMessage.data map
+     */
+    private fun handleProcessPush(call: MethodCall, result: Result) {
+        @Suppress("UNCHECKED_CAST")
+        val data = call.argument<Map<String, String>>("data")
+        if (data.isNullOrEmpty()) {
+            result.success(null)
+            return
+        }
+
+        // Vonage pushes always contain a "nexmo" key.
+        if (!data.containsKey("nexmo")) {
+            android.util.Log.d("VonagePlugin", "processVonagePush: no 'nexmo' key — not a Vonage push")
+            result.success(null)
+            return
+        }
+
+        // The Vonage SDK's internal extractJsonFromPushData expects the data
+        // in Kotlin Map.toString() format: {nexmo={"type":...}}
+        // It does substringAfter("nexmo=").dropLast(1) to extract the JSON.
+        val dataString = data.toString()
+        android.util.Log.d("VonagePlugin", "processVonagePush data for SDK (first 200 chars): ${dataString.take(200)}")
+
+        // Extract caller display name from the push data and store it
+        // so the setCallInviteListener callback can use it.
+        val nexmoRaw = data["nexmo"]
+        if (!nexmoRaw.isNullOrEmpty()) {
+            val callerDisplay = extractCallerDisplay(nexmoRaw)
+            if (!callerDisplay.isNullOrEmpty()) {
+                VonageClientHolder.pendingCallerDisplay = callerDisplay
+            }
+        }
+
+        val client = voiceClient
+        if (client == null) {
+            android.util.Log.w("VonagePlugin", "processVonagePush: VoiceClient is null")
+            result.error(FlutterErrorCodes.CLIENT_NOT_INITIALISED, "Call tokens() first", null)
+            return
+        }
+
+        try {
+            val callId = client.processPushCallInvite(dataString)
+            android.util.Log.d("VonagePlugin", "processVonagePush callId=$callId")
+            // Null callId is normal — SDK fires setCallInviteListener asynchronously.
+            result.success(callId)
+        } catch (e: Exception) {
+            android.util.Log.e("VonagePlugin", "processVonagePush error: ${e.message}")
+            result.success(null)
         }
     }
 
@@ -977,12 +1118,19 @@ class VonageVoicePlugin :
                 val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
                 val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
                 activeCallId = callId
-                emitEvent(VNNativeCallEvents.incomingCallEvent(from, to))
+                val event = VNNativeCallEvents.incomingCallEvent(from, to)
+                android.util.Log.e("VonagePlugin", "📞 BROADCAST_CALL_INVITE received — callId: $callId from: $from to: $to")
+                android.util.Log.e("VonagePlugin", "📞 Emitting event: $event")
+                android.util.Log.e("VonagePlugin", "📞 eventSink is ${if (eventSink == null) "❌ NULL" else "✅ SET"}")
+                emitEvent(event)
+                android.util.Log.e("VonagePlugin", "📞 Event emitted successfully")
             }
 
             // ── Invite cancelled by remote party ──────────────────────────
             Constants.BROADCAST_CALL_INVITE_CANCELLED -> {
+                if (activeCallId == null) return  // guard against duplicate cancel broadcasts
                 activeCallId = null
+                pendingCallReEmitted = false
                 emitEvent(VNNativeCallEvents.EVENT_MISSED_CALL)
             }
 
@@ -1025,6 +1173,7 @@ class VonageVoicePlugin :
                 activeCallId = null
                 isMuted = false
                 isHolding = false
+                pendingCallReEmitted = false
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
             }
 
@@ -1118,17 +1267,30 @@ class VonageVoicePlugin :
      * forward them to Flutter.
      */
     private fun registerVoiceClientListeners() {
-        val client = voiceClient ?: return
+        android.util.Log.e("VonagePlugin", "✅ registerVoiceClientListeners called")
+        val client = voiceClient ?: run {
+            android.util.Log.e("VonagePlugin", "❌ voiceClient is null in registerVoiceClientListeners")
+            return
+        }
         val ctx = context ?: return
 
         // ── Incoming call invite ──────────────────────────────────────────
         client.setCallInviteListener { callId, from, channelType ->
+            // Prefer the display name extracted from the push payload
+            // (set by handleProcessPush or VonageFirebaseMessagingService).
+            val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
+            VonageClientHolder.pendingCallerDisplay = null
+            android.util.Log.e("VonagePlugin", "🔴 INCOMING CALL — callId: $callId from: $from display: $displayFrom")
             val intent = Intent(ctx, TVConnectionService::class.java).apply {
                 action = Constants.ACTION_INCOMING_CALL
                 putExtra(Constants.EXTRA_CALL_ID, callId)
-                putExtra(Constants.EXTRA_CALL_FROM, from)
+                putExtra(Constants.EXTRA_CALL_FROM, displayFrom)
+                putExtra(Constants.EXTRA_CALL_TO, "")
             }
-            ctx.startService(intent)
+            // Must use startForegroundService — the SDK callback fires
+            // asynchronously and on Android 10+ the FCM background
+            // execution window may have expired by this point.
+            ContextCompat.startForegroundService(ctx, intent)
         }
 
         // ── Incoming invite cancelled by remote ───────────────────────────
@@ -1137,7 +1299,10 @@ class VonageVoicePlugin :
                 action = Constants.ACTION_CANCEL_CALL_INVITE
                 putExtra(Constants.EXTRA_CALL_ID, callId)
             }
-            ctx.startService(intent)
+            // Service is already in foreground from the invite, so
+            // startService is fine here. But use startForegroundService
+            // as a safety net in case the invite was never delivered.
+            ContextCompat.startForegroundService(ctx, intent)
         }
 
         // ── Call hung up ──────────────────────────────────────────────────
@@ -1207,7 +1372,12 @@ class VonageVoicePlugin :
      */
     private fun emitEvent(event: String) {
         mainHandler.post {
-            eventSink?.success(event)
+            if (eventSink == null) {
+                android.util.Log.e("VonagePlugin", "⚠️  emitEvent called but eventSink is NULL — event lost: $event")
+            } else {
+                android.util.Log.e("VonagePlugin", "✅ emitEvent → sending to Flutter: $event")
+                eventSink?.success(event)
+            }
         }
     }
 
@@ -1226,8 +1396,35 @@ class VonageVoicePlugin :
     private fun resolveCallerName(callerId: String): String {
         if (callerId.isEmpty()) return storage?.getDefaultCaller()
             ?: Constants.DEFAULT_UNKNOWN_CALLER
+        // Prefer registered client name, then fall back to the raw callerId
+        // (phone number / user identity) rather than the default caller name.
         return storage?.getRegisteredClient(callerId)
-            ?: storage?.getDefaultCaller()
             ?: callerId
+    }
+
+    // ── Push-data helpers ───────────────────────────────────────────────
+
+    /**
+     * Extract the caller display name from the Vonage push payload.
+     *
+     * Priority:
+     *   1. push_info.from_user.display_name  (app-to-app calls)
+     *   2. body.channel.from.number          (PSTN calls)
+     */
+    private fun extractCallerDisplay(nexmoRaw: String): String? {
+        return try {
+            val json = org.json.JSONObject(nexmoRaw)
+            val fromUser = json.optJSONObject("push_info")
+                ?.optJSONObject("from_user")
+            val displayName = fromUser?.optString("display_name", null)
+            if (!displayName.isNullOrEmpty()) return displayName
+
+            json.optJSONObject("body")
+                ?.optJSONObject("channel")
+                ?.optJSONObject("from")
+                ?.optString("number", null)
+        } catch (_: Exception) {
+            null
+        }
     }
 }

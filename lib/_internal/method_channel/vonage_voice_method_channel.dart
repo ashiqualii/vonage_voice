@@ -40,9 +40,10 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
   /// before being emitted to listeners.
   @override
   Stream<CallEvent> get callEventsListener {
-    _callEventsListener ??= _eventChannel.receiveBroadcastStream().map(
-      (dynamic event) => parseCallEvent(event),
-    );
+    _callEventsListener ??= _eventChannel
+        .receiveBroadcastStream()
+        .map((dynamic event) => parseCallEvent(event))
+        .asBroadcastStream();
     return _callEventsListener!;
   }
 
@@ -234,6 +235,26 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
   @override
   Future<bool?> requestBluetoothPermissions() => Future.value(false);
 
+  // ── Notification permission ───────────────────────────────────────
+
+  @override
+  Future<bool> hasNotificationPermission() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel
+        .invokeMethod<bool?>('hasNotificationPermission', {})
+        .then<bool>((bool? value) => value ?? false);
+  }
+
+  @override
+  Future<bool?> requestNotificationPermission() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel.invokeMethod('requestNotificationPermission', {});
+  }
+
   // ── Call rejection behaviour ──────────────────────────────────────────
 
   @override
@@ -290,6 +311,14 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     return _channel.invokeMethod('defaultCaller', <String, dynamic>{
       "defaultCaller": callerName,
     });
+  }
+
+  @override
+  Future<String?> processVonagePush(Map<String, dynamic> data) {
+    return _channel.invokeMethod<String?>(
+      'processVonagePush',
+      <String, dynamic>{"data": data},
+    );
   }
 
   @Deprecated('custom call UI not used anymore, has no effect')
@@ -350,62 +379,77 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
 
     // ── Connected ─────────────────────────────────────────────────────
     if (state.startsWith("Connected|")) {
-      call.activeCall = _createCallFromState(state, initiated: true);
-      printDebug(
-        'Connected — From: ${call.activeCall!.from}, '
-        'To: ${call.activeCall!.to}, '
-        'Direction: ${call.activeCall!.callDirection}',
-      );
+      final parsed = _createCallFromState(state, initiated: true);
+      if (parsed != null) {
+        call.activeCall = parsed;
+        printDebug(
+          'Connected — From: ${parsed.from}, '
+          'To: ${parsed.to}, '
+          'Direction: ${parsed.callDirection}',
+        );
+      }
       return CallEvent.connected;
     }
 
     // ── Incoming call invite ──────────────────────────────────────────
     if (state.startsWith("Incoming|")) {
-      call.activeCall = _createCallFromState(
+      final parsed = _createCallFromState(
         state,
         callDirection: CallDirection.incoming,
       );
-      printDebug(
-        'Incoming — From: ${call.activeCall!.from}, '
-        'To: ${call.activeCall!.to}',
-      );
+      if (parsed != null) {
+        call.activeCall = parsed;
+        printDebug(
+          'Incoming — From: ${parsed.from}, '
+          'To: ${parsed.to}',
+        );
+      }
       return CallEvent.incoming;
     }
 
     // ── Ringing (outbound) ────────────────────────────────────────────
     if (state.startsWith("Ringing|")) {
-      call.activeCall = _createCallFromState(state);
-      printDebug(
-        'Ringing — From: ${call.activeCall!.from}, '
-        'To: ${call.activeCall!.to}, '
-        'Direction: ${call.activeCall!.callDirection}',
-      );
+      final parsed = _createCallFromState(state);
+      if (parsed != null) {
+        call.activeCall = parsed;
+        printDebug(
+          'Ringing — From: ${parsed.from}, '
+          'To: ${parsed.to}, '
+          'Direction: ${parsed.callDirection}',
+        );
+      }
       return CallEvent.ringing;
     }
 
     // ── Answer ────────────────────────────────────────────────────────
     if (state.startsWith("Answer")) {
-      call.activeCall = _createCallFromState(
+      final parsed = _createCallFromState(
         state,
         callDirection: CallDirection.incoming,
       );
-      printDebug(
-        'Answer — From: ${call.activeCall!.from}, '
-        'To: ${call.activeCall!.to}',
-      );
+      if (parsed != null) {
+        call.activeCall = parsed;
+        printDebug(
+          'Answer — From: ${parsed.from}, '
+          'To: ${parsed.to}',
+        );
+      }
       return CallEvent.answer;
     }
 
     // ── Returning call ────────────────────────────────────────────────
     if (state.startsWith("ReturningCall")) {
-      call.activeCall = _createCallFromState(
+      final parsed = _createCallFromState(
         state,
         callDirection: CallDirection.outgoing,
       );
-      printDebug(
-        'Returning Call — From: ${call.activeCall!.from}, '
-        'To: ${call.activeCall!.to}',
-      );
+      if (parsed != null) {
+        call.activeCall = parsed;
+        printDebug(
+          'Returning Call — From: ${parsed.from}, '
+          'To: ${parsed.to}',
+        );
+      }
       return CallEvent.returningCall;
     }
 
@@ -461,15 +505,21 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
 ///
 /// [callDirection] overrides the direction parsed from the string.
 /// [initiated] sets the call start timestamp when true.
-ActiveCall _createCallFromState(
+ActiveCall? _createCallFromState(
   String state, {
   CallDirection? callDirection,
   bool initiated = false,
 }) {
   final tokens = state.split('|');
+
+  // Need at least 3 segments: EventType|from|to
+  if (tokens.length < 3) {
+    return null;
+  }
+
   final direction =
       callDirection ??
-      ("incoming" == tokens[3].toLowerCase()
+      (tokens.length > 3 && "incoming" == tokens[3].toLowerCase()
           ? CallDirection.incoming
           : CallDirection.outgoing);
 

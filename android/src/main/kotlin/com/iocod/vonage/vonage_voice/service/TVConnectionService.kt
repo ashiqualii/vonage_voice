@@ -89,12 +89,49 @@ class TVConnectionService : ConnectionService() {
     }
 
     /**
-     * Entry point for all actions sent from VonageVoicePlugin via startService(Intent).
-     * Each action maps to a specific call operation.
+     * Entry point for all actions sent from VonageVoicePlugin via
+     * startService() or startForegroundService(Intent).
+     *
+     * When started via startForegroundService(), Android requires
+     * startForeground() to be called within 5 seconds. We ensure
+     * this by immediately promoting to foreground for any action
+     * that arrives while the service is not yet in foreground.
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Ensure we satisfy the startForeground contract for every
+        // startForegroundService() call. If the service is already in
+        // foreground (from handleIncomingCall), this is a no-op update.
+        ensureForeground()
         intent?.let { handleIntent(it) }
         return START_NOT_STICKY
+    }
+
+    /**
+     * Ensures the service is promoted to foreground.
+     * Called early in onStartCommand to prevent the 5-second ANR
+     * when the service is started via startForegroundService().
+     */
+    private fun ensureForeground() {
+        createNotificationChannel()
+        val notification = if (pendingInvites.isNotEmpty()) {
+            val entry = pendingInvites.entries.first()
+            buildIncomingCallNotification(entry.key, entry.value.from)
+        } else if (activeConnections.isNotEmpty()) {
+            buildActiveCallNotification()
+        } else {
+            // Minimal fallback notification — will be replaced or dismissed
+            // immediately by the handler that follows.
+            buildActiveCallNotification()
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                Constants.NOTIFICATION_ID,
+                notification,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(Constants.NOTIFICATION_ID, notification)
+        }
     }
 
     // override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
@@ -171,17 +208,18 @@ class TVConnectionService : ConnectionService() {
      */
     private fun handleCancelCallInvite(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+
+        // cancel() internally broadcasts BROADCAST_CALL_INVITE_CANCELLED
+        // so we must not broadcast again to avoid duplicate Missed Call events
         pendingInvites[callId]?.cancel()
         pendingInvites.remove(callId)
 
-        // Notify Flutter that the invite was cancelled
-        val broadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
-            putExtra(Constants.EXTRA_CALL_ID, callId)
-        }
-        broadcastManager.sendBroadcast(broadcast)
-
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.cancel(Constants.NOTIFICATION_ID)
             stopForeground(true)
+            stopSelf()
         }
     }
 
@@ -882,4 +920,6 @@ class TVConnectionService : ConnectionService() {
  */
 object VonageClientHolder {
     var voiceClient: VoiceClient? = null
+    /** Caller display name extracted from the last FCM push payload. */
+    var pendingCallerDisplay: String? = null
 }

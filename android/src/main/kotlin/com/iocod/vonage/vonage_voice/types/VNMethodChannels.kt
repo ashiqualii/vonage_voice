@@ -150,11 +150,20 @@ enum class VNMethodChannels(val methodName: String) {
     /** Request BLUETOOTH_CONNECT runtime permission (API 31+). */
     REQUEST_BLUETOOTH_PERMISSION("requestBluetoothPermission"),
 
+    /** Returns true if POST_NOTIFICATIONS permission is granted (API 33+). */
+    HAS_NOTIFICATION_PERMISSION("hasNotificationPermission"),
+
+    /** Request POST_NOTIFICATIONS runtime permission (API 33+). */
+    REQUEST_NOTIFICATION_PERMISSION("requestNotificationPermission"),
+
     /** No-op — ConnectionService replaced custom background UI. */
     BACKGROUND_CALL_UI("backgroundCallUi"),
 
     /** No-op — iOS only stub, not used on Android. */
-    UPDATE_CALL_KIT_ICON("updateCallKitIcon");
+    UPDATE_CALL_KIT_ICON("updateCallKitIcon"),
+
+    /** Forward an FCM push payload to VoiceClient.processPushCallInvite(). */
+    PROCESS_PUSH("processVonagePush");
 
     companion object {
         /**

@@ -3,6 +3,7 @@ package com.iocod.vonage.vonage_voice.receivers
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
 
@@ -18,6 +19,8 @@ class TVCallActionReceiver : BroadcastReceiver() {
             }
             putExtra(Constants.EXTRA_CALL_ID, callId)
         }
-        context.startService(serviceIntent)
+        // Must use startForegroundService — on Android 10+ the
+        // notification tap runs in a background context.
+        ContextCompat.startForegroundService(context, serviceIntent)
     }
 }
