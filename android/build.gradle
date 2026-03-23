@@ -58,6 +58,9 @@ android {
         // Kept as your existing project — API 24
         // Note: Vonage SDK works from API 24 onwards
         minSdk = 24
+
+        // Automatically include ProGuard rules in consumer (app) builds
+        consumerProguardFiles("proguard-rules.pro")
     }
 
     dependencies {
