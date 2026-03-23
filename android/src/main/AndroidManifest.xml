@@ -27,6 +27,10 @@
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
+    <!-- Required on API 34+: foreground service handling phone calls -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+
     <!-- Required: receive FCM push notifications for incoming calls -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
@@ -64,6 +68,19 @@
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
 
+    <!-- Required: show overlay UI over other apps and lock screen -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Required: show incoming call notification on lock screen (Android 11 and below) -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Required: bring activity to front via bringActivityToFront and REORDER_TO_FRONT flag -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+
+    <!-- Required: request battery optimization exemption so OEMs like Vivo
+         don't kill the app when backgrounded — needed for incoming call push delivery -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- ══════════════════════════════════════════════════════════════════
          APPLICATION COMPONENTS
          All services and receivers must live inside <application>
@@ -71,17 +88,58 @@
 
     <application>
 
+        <!-- ── IncomingCallActivity ───────────────────────────────────────
+             Full-screen native Activity for incoming call UI.
+             Launched by the notification's fullScreenIntent when the device
+             is locked / screen off. Shows over the lock screen with native
+             answer/decline buttons, ringtone, and vibration.
+
+             singleInstance + taskAffinity="" ensures it runs in its own task
+             and doesn't stack on top of the Flutter MainActivity.
+             noHistory=true so it doesn't appear in recents.
+             showOnLockScreen/showWhenLocked/turnScreenOn are manifest hints
+             that work alongside the programmatic flags in the Activity.
+        -->
+        <activity
+            android:name="com.iocod.vonage.vonage_voice.IncomingCallActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:showOnLockScreen="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.VonageIncomingCall" />
+
+        <!-- ── AnswerCallTrampolineActivity ───────────────────────────────
+             Invisible (transparent) Activity used to answer calls from the
+             notification's "Answer" button. On Android 12+ (API 31),
+             background activity start restrictions prevent launching
+             MainActivity from a service/receiver. This trampoline is launched
+             via PendingIntent.getActivity, sends ACTION_ANSWER to the service,
+             launches MainActivity from its Activity context, then finishes.
+        -->
+        <activity
+            android:name="com.iocod.vonage.vonage_voice.AnswerCallTrampolineActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.VonageTransparent" />
+
         <!-- ── TVConnectionService ────────────────────────────────────────
              Extends Android ConnectionService to integrate calls with the
              Telecom framework — enables native call UI, BT headsets, car kits.
 
              android:permission ensures only the system Telecom framework
              can bind to this service, preventing unauthorised access.
+             foregroundServiceType includes phoneCall for API 34+ compliance.
         -->
         <service
             android:name="com.iocod.vonage.vonage_voice.service.TVConnectionService"
             android:exported="true"
-            android:foregroundServiceType="microphone"
+            android:foregroundServiceType="microphone|phoneCall"
             android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
             <intent-filter>
                 <action android:name="android.telecom.ConnectionService" />
@@ -95,13 +153,31 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
-        
+
         <receiver
             android:name="com.iocod.vonage.vonage_voice.receivers.TVCallActionReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.iocod.vonage.NOTIFICATION_ANSWER" />
                 <action android:name="com.iocod.vonage.NOTIFICATION_DECLINE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ── BootCompletedReceiver ──────────────────────────────────────
+             Fires after device reboot to ensure the app process is alive
+             for FCM delivery. directBootAware=true ensures it fires even
+             before the user unlocks (LOCKED_BOOT_COMPLETED).
+             Also handles vendor-specific quickboot actions (Vivo, Xiaomi, HTC).
+        -->
+        <receiver
+            android:name="com.iocod.vonage.vonage_voice.receivers.BootCompletedReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 

@@ -220,6 +220,41 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// Returns the call ID if the push was a Vonage call invite, else null.
   Future<String?> processVonagePush(Map<String, dynamic> data);
 
+  // ── Battery / power optimization ──────────────────────────────────────
+
+  /// Returns true if the app is subject to battery optimization.
+  ///
+  /// On OEMs like Vivo, Xiaomi, and OPPO, battery optimization kills
+  /// the app process aggressively, preventing FCM from delivering
+  /// incoming call push notifications.
+  ///
+  /// If this returns true, call [requestBatteryOptimizationExemption] to
+  /// ask the user to exempt the app.
+  Future<bool> isBatteryOptimized();
+
+  /// Opens the system dialog to exempt the app from battery optimization.
+  ///
+  /// This is ESSENTIAL on Vivo, Xiaomi, OPPO, and other Chinese OEMs.
+  /// Without this exemption, incoming calls will not work when the app
+  /// is backgrounded or killed.
+  Future<bool?> requestBatteryOptimizationExemption();
+
+  // ── Full-screen intent permission (API 34+) ──────────────────────────
+
+  /// Returns true if the app can show full-screen incoming call UI.
+  ///
+  /// On Android 14+ (API 34+), USE_FULL_SCREEN_INTENT is a special
+  /// permission that must be granted manually. Without it, the incoming
+  /// call notification will not show as a full-screen intent on the
+  /// lock screen.
+  ///
+  /// Always returns true on Android < 14.
+  Future<bool> canUseFullScreenIntent();
+
+  /// Opens system settings where the user can grant USE_FULL_SCREEN_INTENT.
+  /// Only meaningful on Android 14+.
+  Future<bool?> openFullScreenIntentSettings();
+
   // ── Deprecated stubs ──────────────────────────────────────────────────
 
   /// Deprecated — ConnectionService replaced custom background UI.

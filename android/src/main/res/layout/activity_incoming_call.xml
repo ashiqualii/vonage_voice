@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF1B1B2F"
+    android:keepScreenOn="true">
+
+    <!-- Caller info section (centered vertically, slightly above middle) -->
+    <LinearLayout
+        android:id="@+id/caller_info_container"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:layout_marginBottom="80dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <!-- Caller avatar placeholder (circle icon) -->
+        <ImageView
+            android:id="@+id/caller_avatar"
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:layout_marginBottom="24dp"
+            android:contentDescription="Caller avatar"
+            android:src="@android:drawable/ic_menu_myplaces"
+            android:background="@android:drawable/dialog_holo_light_frame"
+            android:scaleType="centerInside"
+            android:padding="16dp" />
+
+        <TextView
+            android:id="@+id/caller_name"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="Unknown"
+            android:textColor="#FFFFFFFF"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:gravity="center" />
+
+        <TextView
+            android:id="@+id/caller_number"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text=""
+            android:textColor="#B3FFFFFF"
+            android:textSize="16sp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:gravity="center" />
+
+        <TextView
+            android:id="@+id/call_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Incoming Call…"
+            android:textColor="#80FFFFFF"
+            android:textSize="14sp"
+            android:gravity="center" />
+
+    </LinearLayout>
+
+    <!-- Answer / Decline buttons at bottom -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="64dp"
+        android:gravity="center"
+        android:orientation="horizontal">
+
+        <!-- Decline button (red) -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <ImageButton
+                android:id="@+id/btn_decline"
+                android:layout_width="64dp"
+                android:layout_height="64dp"
+                android:background="@drawable/bg_decline_button"
+                android:contentDescription="Decline call"
+                android:src="@android:drawable/ic_menu_close_clear_cancel"
+                android:scaleType="centerInside"
+                android:padding="16dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Decline"
+                android:textColor="#FFFFFFFF"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+        <!-- Answer button (green) -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <ImageButton
+                android:id="@+id/btn_answer"
+                android:layout_width="64dp"
+                android:layout_height="64dp"
+                android:background="@drawable/bg_answer_button"
+                android:contentDescription="Answer call"
+                android:src="@android:drawable/ic_menu_call"
+                android:scaleType="centerInside"
+                android:padding="16dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Answer"
+                android:textColor="#FFFFFFFF"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+</RelativeLayout>

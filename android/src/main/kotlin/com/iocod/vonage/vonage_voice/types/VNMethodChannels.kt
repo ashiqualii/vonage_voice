@@ -163,7 +163,23 @@ enum class VNMethodChannels(val methodName: String) {
     UPDATE_CALL_KIT_ICON("updateCallKitIcon"),
 
     /** Forward an FCM push payload to VoiceClient.processPushCallInvite(). */
-    PROCESS_PUSH("processVonagePush");
+    PROCESS_PUSH("processVonagePush"),
+
+    // ── Battery / power optimization ──────────────────────────────────────
+
+    /** Returns true if the app is exempt from battery optimization. */
+    IS_BATTERY_OPTIMIZED("isBatteryOptimized"),
+
+    /** Opens the system intent to request battery optimization exemption. */
+    REQUEST_BATTERY_OPTIMIZATION_EXEMPTION("requestBatteryOptimizationExemption"),
+
+    // ── Full-screen intent permission (API 34+) ──────────────────────────
+
+    /** Returns true if USE_FULL_SCREEN_INTENT is granted. */
+    CAN_USE_FULL_SCREEN_INTENT("canUseFullScreenIntent"),
+
+    /** Opens system settings for USE_FULL_SCREEN_INTENT permission. */
+    OPEN_FULL_SCREEN_INTENT_SETTINGS("openFullScreenIntentSettings");
 
     companion object {
         /**

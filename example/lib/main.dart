@@ -78,6 +78,24 @@ class _LoginScreenState extends State<LoginScreen> {
       await VonageVoice.instance.requestManageOwnCallsPermission();
       await VonageVoice.instance.requestNotificationPermission();
 
+      // ── Battery optimization exemption (critical for Vivo/Xiaomi/OPPO) ──
+      // Without this, the OEM kills the app and FCM cannot deliver incoming
+      // call pushes when the app is backgrounded or killed.
+      final isBatteryOptimized =
+          await VonageVoice.instance.isBatteryOptimized();
+      if (isBatteryOptimized) {
+        await VonageVoice.instance.requestBatteryOptimizationExemption();
+      }
+
+      // ── Full-screen intent permission (Android 14+ / API 34+) ──────────
+      // Without this, the incoming call notification will not show as a
+      // full-screen intent on the lock screen.
+      final canFullScreen =
+          await VonageVoice.instance.canUseFullScreenIntent();
+      if (!canFullScreen) {
+        await VonageVoice.instance.openFullScreenIntentSettings();
+      }
+
       // Get FCM token for incoming call push notifications
       final fcmToken = await FirebaseMessaging.instance.getToken();
 
@@ -248,10 +266,10 @@ class _DialerScreenState extends State<DialerScreen> {
           log('📞 CallEvent.connected');
           final activeCall = VonageVoice.instance.call.activeCall;
           if (activeCall != null && mounted) {
-            log('✅ Replacing with ActiveCallScreen');
+            log('✅ Navigating to ActiveCallScreen');
             _onCallScreen = true;
-            // Replace incoming screen with active call screen
-            Navigator.of(context).pushReplacement(
+            // Push active call screen (don't replace — DialerScreen stays in stack)
+            Navigator.of(context).push(
               MaterialPageRoute(
                 builder: (_) => ActiveCallScreen(activeCall: activeCall),
               ),

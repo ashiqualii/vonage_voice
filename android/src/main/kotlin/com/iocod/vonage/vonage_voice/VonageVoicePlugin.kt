@@ -129,6 +129,11 @@ class VonageVoicePlugin :
             }
         })
         broadcastReceiver!!.register(binding.applicationContext)
+
+        // Reset reEmit flag on each engine attach so cold-starts
+        // (app killed → FCM → user taps notification → engine starts)
+        // will re-emit the pending call state to Flutter.
+        pendingCallReEmitted = null
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -180,8 +185,9 @@ class VonageVoicePlugin :
         android.util.Log.e("VonagePlugin", "✅ onListen CALLED — EventSink attached, scheduling reEmitPendingCallState")
         // Retry with increasing delays to handle slow cold-starts.
         // The first attempt fires quickly for the foreground case;
-        // later attempts catch slower background-launch scenarios.
-        val delays = longArrayOf(100, 500, 1500)
+        // later attempts catch slower background-launch scenarios
+        // (e.g. answer callback hasn't completed yet at 100ms).
+        val delays = longArrayOf(100, 500, 1500, 3000)
         for (delay in delays) {
             Handler(Looper.getMainLooper()).postDelayed({
                 if (eventSink != null) {
@@ -206,30 +212,24 @@ class VonageVoicePlugin :
      *    was never delivered to Flutter.
      *
      * This method is called multiple times with increasing delays.
-     * The [pendingCallReEmitted] flag prevents duplicate emissions.
+     * [pendingCallReEmitted] tracks what was last emitted so we
+     * can upgrade from "incoming" to "connected" if the answer
+     * callback completes between retries.
      */
-    private var pendingCallReEmitted = false
+    private var pendingCallReEmitted: String? = null
 
     private fun reEmitPendingCallState() {
-        if (pendingCallReEmitted) return
-
-        // Case 1: pending incoming invite — show ringing screen
-        val pendingEntry = TVConnectionService.pendingInvites.entries.firstOrNull()
-        if (pendingEntry != null) {
-            val invite = pendingEntry.value
-            val from = resolveCallerName(invite.from)
-            activeCallId = pendingEntry.key
-            pendingCallReEmitted = true
-            emitEvent(VNNativeCallEvents.incomingCallEvent(from, invite.to))
-            return
-        }
-
-        // Case 2: already-answered call — show active call screen
+        // Case 2 first: already-answered call — show active call screen
+        // Check this BEFORE pending invites because handleAnswer() moves
+        // the call from pendingInvites → activeConnections when answer succeeds.
         val activeEntry = TVConnectionService.activeConnections.entries.firstOrNull()
         if (activeEntry != null) {
+            // Only emit if we haven't already emitted "connected" for this call
+            if (pendingCallReEmitted == "connected_${activeEntry.key}") return
             val conn = activeEntry.value
             activeCallId = activeEntry.key
-            pendingCallReEmitted = true
+            pendingCallReEmitted = "connected_${activeEntry.key}"
+            android.util.Log.d("VonagePlugin", "reEmit: Connected — callId=${activeEntry.key}")
             emitEvent(
                 VNNativeCallEvents.callStateEvent(
                     VNNativeCallEvents.EVENT_CONNECTED,
@@ -237,6 +237,22 @@ class VonageVoicePlugin :
                     CallDirection.INCOMING
                 )
             )
+            return
+        }
+
+        // Case 1: pending incoming invite — show ringing screen
+        val pendingEntry = TVConnectionService.pendingInvites.entries.firstOrNull()
+        if (pendingEntry != null) {
+            // Don't re-emit incoming if we already emitted it AND there's no
+            // active connection yet (answer still in progress — let the next retry handle it)
+            if (pendingCallReEmitted == "incoming_${pendingEntry.key}") return
+            val invite = pendingEntry.value
+            val from = resolveCallerName(invite.from)
+            activeCallId = pendingEntry.key
+            pendingCallReEmitted = "incoming_${pendingEntry.key}"
+            android.util.Log.d("VonagePlugin", "reEmit: Incoming — callId=${pendingEntry.key}")
+            emitEvent(VNNativeCallEvents.incomingCallEvent(from, invite.to))
+            return
         }
     }
 
@@ -366,6 +382,14 @@ class VonageVoicePlugin :
             // ── Push processing (Dart-side FCM forwarding) ────────────
             VNMethodChannels.PROCESS_PUSH -> handleProcessPush(call, result)
 
+            // ── Battery / power optimization ──────────────────────────────
+            VNMethodChannels.IS_BATTERY_OPTIMIZED -> handleIsBatteryOptimized(result)
+            VNMethodChannels.REQUEST_BATTERY_OPTIMIZATION_EXEMPTION -> handleRequestBatteryOptimizationExemption(result)
+
+            // ── Full-screen intent permission (API 34+) ──────────────────
+            VNMethodChannels.CAN_USE_FULL_SCREEN_INTENT -> handleCanUseFullScreenIntent(result)
+            VNMethodChannels.OPEN_FULL_SCREEN_INTENT_SETTINGS -> handleOpenFullScreenIntentSettings(result)
+
             // ── Notification permission (API 33+) ──────────────────────
             VNMethodChannels.HAS_NOTIFICATION_PERMISSION -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -414,10 +438,18 @@ class VonageVoicePlugin :
             return
         }
 
-        // Create VoiceClient if not already initialised
+        // Create VoiceClient if not already initialised.
+        // Reuse the client created by VonageFirebaseMessagingService if the
+        // app was killed and restarted via an incoming call push — this
+        // preserves the call invite data on that client instance.
         if (voiceClient == null) {
-            voiceClient = VoiceClient(ctx)
-            VonageClientHolder.voiceClient = voiceClient
+            val existingClient = VonageClientHolder.voiceClient
+            if (existingClient != null) {
+                voiceClient = existingClient
+            } else {
+                voiceClient = VoiceClient(ctx)
+                VonageClientHolder.voiceClient = voiceClient
+            }
 
             // Register all SDK event listeners once on creation
             registerVoiceClientListeners()
@@ -436,6 +468,11 @@ class VonageVoicePlugin :
             }
             android.util.Log.e("VonagePlugin", "✅ Session created: $sessionId")
             android.util.Log.e("VonagePlugin", "✅ Listeners being registered now")
+
+            // Persist JWT so VonageFirebaseMessagingService can restore
+            // the session when the app process was killed by the OS.
+            VonageClientHolder.storeJwt(ctx, jwt)
+            VonageClientHolder.isSessionReady = true
 
             // Register FCM push token if provided
             val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
@@ -493,10 +530,12 @@ class VonageVoicePlugin :
             }
         }
 
-        val client = voiceClient
+        val client = voiceClient ?: VonageClientHolder.voiceClient
         if (client == null) {
-            android.util.Log.w("VonagePlugin", "processVonagePush: VoiceClient is null")
-            result.error(FlutterErrorCodes.CLIENT_NOT_INITIALISED, "Call tokens() first", null)
+            // VoiceClient not available — the native VonageFirebaseMessagingService
+            // handles push processing independently, so this is not fatal.
+            android.util.Log.w("VonagePlugin", "processVonagePush: VoiceClient is null — native FCM service handles it")
+            result.success(null)
             return
         }
 
@@ -541,6 +580,8 @@ class VonageVoicePlugin :
             }
             voiceClient = null
             VonageClientHolder.voiceClient = null
+            VonageClientHolder.isSessionReady = false
+            context?.let { VonageClientHolder.clearStoredJwt(it) }
             result.success(true)
         }
     }
@@ -572,6 +613,8 @@ class VonageVoicePlugin :
                 )
                 return@refreshSession
             }
+            // Update stored JWT so background session restore uses the fresh token
+            context?.let { VonageClientHolder.storeJwt(it, jwt) }
             result.success(true)
         }
     }
@@ -1100,6 +1143,110 @@ class VonageVoicePlugin :
         return false
     }
 
+    // ── Battery optimization handlers ────────────────────────────────────
+
+    /**
+     * Returns true if the app is NOT exempt from battery optimization.
+     * On Vivo, Xiaomi, OPPO, etc. this means the OS may kill the app and
+     * prevent FCM data messages from waking it for incoming calls.
+     */
+    private fun handleIsBatteryOptimized(result: Result) {
+        val ctx = context ?: run {
+            result.success(true) // assume optimized if no context
+            return
+        }
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (pm == null) {
+            result.success(false)
+            return
+        }
+        // isIgnoringBatteryOptimizations returns TRUE if the app is exempt.
+        // We invert: "is battery optimized" = NOT exempt = can be killed.
+        result.success(!pm.isIgnoringBatteryOptimizations(ctx.packageName))
+    }
+
+    /**
+     * Opens the system dialog to request battery optimization exemption.
+     * This uses ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS which shows a
+     * system dialog (not a scary permission prompt) asking the user to allow
+     * the app to run in the background.
+     *
+     * On OEMs like Vivo this is ESSENTIAL — without it the app process is
+     * killed aggressively and incoming call pushes are never delivered.
+     */
+    private fun handleRequestBatteryOptimizationExemption(result: Result) {
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (pm != null && pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
+            // Already exempt
+            result.success(true)
+            return
+        }
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = android.net.Uri.parse("package:${ctx.packageName}")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(intent)
+            result.success(true)
+        } catch (e: Exception) {
+            android.util.Log.e("VonagePlugin", "Failed to open battery optimization settings: ${e.message}")
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Cannot open battery settings: ${e.message}", null)
+        }
+    }
+
+    // ── Full-screen intent permission handlers ────────────────────────────
+
+    /**
+     * Returns true if the app can use full-screen intents.
+     * On API 34+, USE_FULL_SCREEN_INTENT is a special permission that must be
+     * granted manually for non-default-dialer apps. Without it, the incoming
+     * call notification's fullScreenIntent is silently ignored — no heads-up
+     * notification appears on the lock screen.
+     */
+    private fun handleCanUseFullScreenIntent(result: Result) {
+        if (Build.VERSION.SDK_INT < 34) {
+            // Pre-API 34: USE_FULL_SCREEN_INTENT is auto-granted
+            result.success(true)
+            return
+        }
+        val ctx = context ?: run {
+            result.success(false)
+            return
+        }
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+        result.success(nm?.canUseFullScreenIntent() ?: false)
+    }
+
+    /**
+     * Opens system settings where the user can grant USE_FULL_SCREEN_INTENT.
+     * Only meaningful on API 34+.
+     */
+    private fun handleOpenFullScreenIntentSettings(result: Result) {
+        if (Build.VERSION.SDK_INT < 34) {
+            result.success(true) // not needed
+            return
+        }
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
+                data = android.net.Uri.parse("package:${ctx.packageName}")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(intent)
+            result.success(true)
+        } catch (e: Exception) {
+            android.util.Log.e("VonagePlugin", "Failed to open full-screen intent settings: ${e.message}")
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Cannot open settings: ${e.message}", null)
+        }
+    }
+
     // ── LocalBroadcast → EventChannel routing ────────────────────────────
 
     /**
@@ -1130,7 +1277,7 @@ class VonageVoicePlugin :
             Constants.BROADCAST_CALL_INVITE_CANCELLED -> {
                 if (activeCallId == null) return  // guard against duplicate cancel broadcasts
                 activeCallId = null
-                pendingCallReEmitted = false
+                pendingCallReEmitted = null
                 emitEvent(VNNativeCallEvents.EVENT_MISSED_CALL)
             }
 
@@ -1173,7 +1320,7 @@ class VonageVoicePlugin :
                 activeCallId = null
                 isMuted = false
                 isHolding = false
-                pendingCallReEmitted = false
+                pendingCallReEmitted = null
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
             }
 

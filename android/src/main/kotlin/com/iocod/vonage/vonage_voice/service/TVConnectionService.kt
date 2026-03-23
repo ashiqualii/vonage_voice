@@ -18,12 +18,15 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.iocod.vonage.vonage_voice.call.TVCallConnection
 import com.iocod.vonage.vonage_voice.call.TVCallInviteConnection
 import com.iocod.vonage.vonage_voice.constants.Constants
+import com.iocod.vonage.vonage_voice.IncomingCallActivity
+import com.iocod.vonage.vonage_voice.AnswerCallTrampolineActivity
 import com.vonage.voice.api.VoiceClient
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.PowerManager
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
 
@@ -56,6 +59,7 @@ class TVConnectionService : ConnectionService() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var scoReceiver: BroadcastReceiver? = null
+    private var incomingCallWakeLock: PowerManager.WakeLock? = null
 
     companion object {
         /**
@@ -101,7 +105,7 @@ class TVConnectionService : ConnectionService() {
         // Ensure we satisfy the startForeground contract for every
         // startForegroundService() call. If the service is already in
         // foreground (from handleIncomingCall), this is a no-op update.
-        ensureForeground()
+        ensureForeground(intent?.action)
         intent?.let { handleIntent(it) }
         return START_NOT_STICKY
     }
@@ -110,27 +114,52 @@ class TVConnectionService : ConnectionService() {
      * Ensures the service is promoted to foreground.
      * Called early in onStartCommand to prevent the 5-second ANR
      * when the service is started via startForegroundService().
+     *
+     * [intentAction] is used to determine the notification type BEFORE
+     * the intent is fully processed. This ensures the very first
+     * startForeground() call uses the HIGH importance incoming call
+     * channel when appropriate, so the notification is always visible
+     * on devices that "sticky" the first channel importance.
      */
-    private fun ensureForeground() {
+    private fun ensureForeground(intentAction: String? = null) {
         createNotificationChannel()
+        createIncomingCallNotificationChannel()
+
+        val isIncomingAction = intentAction == Constants.ACTION_INCOMING_CALL
+                || intentAction == Constants.ACTION_ANSWER
+
         val notification = if (pendingInvites.isNotEmpty()) {
             val entry = pendingInvites.entries.first()
             buildIncomingCallNotification(entry.key, entry.value.from)
+        } else if (isIncomingAction) {
+            // Incoming call intent is about to be processed — use a
+            // placeholder incoming call notification on the HIGH channel
+            // so the system shows it immediately as heads-up.
+            buildIncomingCallNotification("", "Incoming Call...")
         } else if (activeConnections.isNotEmpty()) {
             buildActiveCallNotification()
         } else {
-            // Minimal fallback notification — will be replaced or dismissed
-            // immediately by the handler that follows.
             buildActiveCallNotification()
         }
+
+        // For incoming calls, use PHONE_CALL type (doesn't require RECORD_AUDIO).
+        // For active calls, use MICROPHONE type (already have permission by then).
+        val serviceType = if (isIncomingAction || pendingInvites.isNotEmpty()) {
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+        } else {
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                Constants.NOTIFICATION_ID,
-                notification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
+            startForeground(Constants.NOTIFICATION_ID, notification, serviceType)
         } else {
             startForeground(Constants.NOTIFICATION_ID, notification)
+        }
+
+        // Acquire FULL_WAKE_LOCK for incoming calls to physically turn the screen on.
+        // Without this, the fullScreenIntent may not fire on some devices.
+        if (isIncomingAction && incomingCallWakeLock == null) {
+            acquireIncomingCallWakeLock()
         }
     }
 
@@ -179,16 +208,23 @@ class TVConnectionService : ConnectionService() {
         pendingInvites[callId] = connection
 
         // ── Use incoming call notification with Answer/Decline ────────────────
-        createNotificationChannel()
+        createIncomingCallNotificationChannel()
+        // Use PHONE_CALL type — RECORD_AUDIO is not yet granted before the user answers.
+        // MICROPHONE type requires RECORD_AUDIO permission and will crash on API 34+.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 Constants.NOTIFICATION_ID,
                 buildIncomingCallNotification(callId, from),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
             )
         } else {
             startForeground(Constants.NOTIFICATION_ID,
                 buildIncomingCallNotification(callId, from))
+        }
+
+        // Acquire wake lock to ensure the screen turns on for incoming call
+        if (incomingCallWakeLock == null) {
+            acquireIncomingCallWakeLock()
         }
 
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
@@ -208,6 +244,9 @@ class TVConnectionService : ConnectionService() {
      */
     private fun handleCancelCallInvite(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+
+        // Release the incoming call wake lock — call is being cancelled
+        releaseIncomingCallWakeLock()
 
         // cancel() internally broadcasts BROADCAST_CALL_INVITE_CANCELLED
         // so we must not broadcast again to avoid duplicate Missed Call events
@@ -529,14 +568,38 @@ class TVConnectionService : ConnectionService() {
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Release the incoming call wake lock — call is being answered
+        releaseIncomingCallWakeLock()
+
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
             return
         }
 
+        doAnswer(client, callId, retriesLeft = 2)
+    }
+
+    /**
+     * Attempt to answer the call. If it fails (e.g. session not yet
+     * restored after app-kill), retry up to [retriesLeft] times with
+     * a 1.5-second delay. This covers the race between
+     * VonageFirebaseMessagingService.createSession() and the user
+     * tapping Answer very quickly.
+     */
+    private fun doAnswer(client: VoiceClient, callId: String, retriesLeft: Int) {
         client.answer(callId) { error ->
             if (error != null) {
-                broadcastError("answer failed: ${error.message}")
+                android.util.Log.e("TVConnectionService",
+                    "answer failed (retries=$retriesLeft): ${error.message}")
+                if (retriesLeft > 0) {
+                    android.util.Log.d("TVConnectionService",
+                        "Retrying answer in 1500ms...")
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        doAnswer(client, callId, retriesLeft - 1)
+                    }, 1500)
+                } else {
+                    broadcastError("answer failed: ${error.message}")
+                }
                 return@answer
             }
 
@@ -580,6 +643,9 @@ class TVConnectionService : ConnectionService() {
     private fun handleHangup(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Release the incoming call wake lock — call is being declined/ended
+        releaseIncomingCallWakeLock()
+
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
             return
@@ -587,12 +653,13 @@ class TVConnectionService : ConnectionService() {
 
         // Check if this is a pending invite (reject) or active call (hangup)
         if (pendingInvites.containsKey(callId)) {
+            // Remove from pendingInvites immediately so cleanup runs correctly
+            pendingInvites.remove(callId)
             client.reject(callId) { error ->
                 if (error != null) {
                     broadcastError("reject failed: ${error.message}")
                     return@reject
                 }
-                pendingInvites.remove(callId)
                 broadcastCallEnded(callId)
             }
         } else {
@@ -601,9 +668,6 @@ class TVConnectionService : ConnectionService() {
                     broadcastError("hangup failed: ${error.message}")
                     return@hangup
                 }
-                // Broadcast call ended from here as well — the SDK's
-                // setOnCallHangupListener may not fire for outgoing calls
-                // that were never answered by the remote party.
                 broadcastCallEnded(callId)
             }
         }
@@ -612,9 +676,10 @@ class TVConnectionService : ConnectionService() {
         activeConnections[callId]?.disconnect()
         activeConnections.remove(callId)
 
+        // Always cancel the notification and stop the service when no calls remain
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
-             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
                     as NotificationManager
             notificationManager.cancel(Constants.NOTIFICATION_ID)
             stopForeground(true)
@@ -771,7 +836,7 @@ class TVConnectionService : ConnectionService() {
     }
 
     /**
-     * Create the notification channel required on API 26+.
+     * Create the notification channel for active/ongoing calls.
      * Safe to call multiple times — system ignores duplicate registrations.
      */
     private fun createNotificationChannel() {
@@ -779,10 +844,33 @@ class TVConnectionService : ConnectionService() {
             val channel = NotificationChannel(
                 Constants.NOTIFICATION_CHANNEL_ID,
                 Constants.NOTIFICATION_CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_HIGH
+                NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Shows ongoing Vonage voice call status"
                 setSound(null, null)
+            }
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    /**
+     * Create a high-importance notification channel for incoming calls.
+     * This channel must use IMPORTANCE_HIGH so that:
+     *   - fullScreenIntent fires on lock screen / when app is not visible
+     *   - heads-up notification appears when app is in foreground
+     * Safe to call multiple times — system ignores duplicate registrations.
+     */
+    private fun createIncomingCallNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                Constants.INCOMING_CALL_CHANNEL_ID,
+                Constants.INCOMING_CALL_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Incoming Vonage voice call alerts"
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                setBypassDnd(true)
             }
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
@@ -794,60 +882,74 @@ class TVConnectionService : ConnectionService() {
      * The app's launch intent is used as the tap action.
      */
     private fun buildIncomingCallNotification(callId: String, from: String): Notification {
-        createNotificationChannel()
+        createIncomingCallNotificationChannel()
 
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-        val contentIntent = PendingIntent.getActivity(
-            this, 0, launchIntent,
+        // ── fullScreenIntent → IncomingCallActivity (native, works without Flutter) ──
+        val fullScreenIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            (callId.hashCode() and 0x7FFFFFFF) % 10000 + 1000,
+            fullScreenIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // ── Answer action ─────────────────────────────────────────────────────
-        val answerIntent = PendingIntent.getBroadcast(
+        // ── Answer action → AnswerCallTrampolineActivity (bypasses background start restriction) ──
+        val answerTrampolineIntent = Intent(applicationContext, AnswerCallTrampolineActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(AnswerCallTrampolineActivity.EXTRA_CALL_ID, callId)
+            putExtra(AnswerCallTrampolineActivity.EXTRA_CALLER_NAME, from)
+        }
+        val answerPendingIntent = PendingIntent.getActivity(
             this,
-            1,
-            Intent(Constants.ACTION_NOTIFICATION_ANSWER).apply {
-                putExtra(Constants.EXTRA_CALL_ID, callId)
-                setPackage(packageName)
-            },
+            (callId.hashCode() and 0x7FFFFFFF) % 10000 + 2000,
+            answerTrampolineIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         // ── Decline action ────────────────────────────────────────────────────
-        val declineIntent = PendingIntent.getBroadcast(
-            this,
-            2,
-            Intent(Constants.ACTION_NOTIFICATION_DECLINE).apply {
-                putExtra(Constants.EXTRA_CALL_ID, callId)
-                setPackage(packageName)
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val declineServiceIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_HANGUP
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+        }
+        val declinePendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this,
+                (callId.hashCode() and 0x7FFFFFFF) % 10000 + 3000,
+                declineServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            PendingIntent.getService(
+                this,
+                (callId.hashCode() and 0x7FFFFFFF) % 10000 + 3000,
+                declineServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
 
-        return NotificationCompat.Builder(this, Constants.NOTIFICATION_CHANNEL_ID)
+        return NotificationCompat.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID)
             .setContentTitle("Incoming Call")
             .setContentText("From: $from")
             .setSmallIcon(android.R.drawable.ic_menu_call)
-            .setContentIntent(contentIntent)
+            .setContentIntent(fullScreenPendingIntent)
+            .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
             .setSilent(false)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
-            .setFullScreenIntent(contentIntent, true) // shows heads-up notification
-            // ── Answer button — green ─────────────────────────────────────────
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_menu_call,
                     "Answer",
-                    answerIntent
+                    answerPendingIntent
                 ).build()
             )
-            // ── Decline button — red ──────────────────────────────────────────
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_delete,
                     "Decline",
-                    declineIntent
+                    declinePendingIntent
                 ).build()
             )
             .build()
@@ -892,6 +994,40 @@ class TVConnectionService : ConnectionService() {
             .build()
     }
 
+    // ── Incoming call wake lock ──────────────────────────────────────────
+
+    /**
+     * Acquire a FULL_WAKE_LOCK to physically turn the screen on for incoming calls.
+     * This ensures the fullScreenIntent fires and IncomingCallActivity is visible
+     * even when the device is locked and screen is off.
+     */
+    @Suppress("DEPRECATION")
+    private fun acquireIncomingCallWakeLock() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            incomingCallWakeLock = powerManager.newWakeLock(
+                PowerManager.FULL_WAKE_LOCK or
+                PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                PowerManager.ON_AFTER_RELEASE,
+                "VonageVoice:IncomingCallScreenWakeLock"
+            ).apply {
+                acquire(60_000L) // 60 seconds for incoming call
+            }
+            android.util.Log.d("TVConnectionService", "Incoming call FULL_WAKE_LOCK acquired")
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Failed to acquire incoming call wake lock: ${e.message}")
+        }
+    }
+
+    private fun releaseIncomingCallWakeLock() {
+        try {
+            incomingCallWakeLock?.let { if (it.isHeld) it.release() }
+            incomingCallWakeLock = null
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Failed to release incoming call wake lock: ${e.message}")
+        }
+    }
+
     // ── Broadcast helpers ─────────────────────────────────────────────────
 
     private fun broadcastCallEnded(callId: String) {
@@ -922,4 +1058,34 @@ object VonageClientHolder {
     var voiceClient: VoiceClient? = null
     /** Caller display name extracted from the last FCM push payload. */
     var pendingCallerDisplay: String? = null
+
+    /** True once createSession() has succeeded on the current VoiceClient. */
+    @Volatile
+    var isSessionReady: Boolean = false
+
+    private const val PREFS_NAME = "vonage_voice_prefs"
+    private const val KEY_JWT = "vonage_jwt"
+
+    /** Persist the JWT so VonageFirebaseMessagingService can restore the session
+     *  when the app process was killed. */
+    fun storeJwt(context: android.content.Context, jwt: String) {
+        context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_JWT, jwt)
+            .apply()
+    }
+
+    /** Read the stored JWT (may be null if user never logged in). */
+    fun getStoredJwt(context: android.content.Context): String? {
+        return context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .getString(KEY_JWT, null)
+    }
+
+    /** Clear the stored JWT on logout / unregister. */
+    fun clearStoredJwt(context: android.content.Context) {
+        context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_JWT)
+            .apply()
+    }
 }

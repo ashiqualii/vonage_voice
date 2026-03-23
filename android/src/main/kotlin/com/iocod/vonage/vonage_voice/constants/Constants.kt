@@ -33,6 +33,8 @@ object Constants {
     const val NOTIFICATION_ID           = 101
     const val NOTIFICATION_CHANNEL_ID   = "vonage_voice_channel"
     const val NOTIFICATION_CHANNEL_NAME = "Vonage Voice Calls"
+    const val INCOMING_CALL_CHANNEL_ID   = "vonage_incoming_call_channel"
+    const val INCOMING_CALL_CHANNEL_NAME = "Vonage Incoming Calls"
 
     // ── Intent actions: Flutter → TVConnectionService ─────────────────────
     const val ACTION_INCOMING_CALL      = "com.iocod.vonage.ACTION_INCOMING_CALL"

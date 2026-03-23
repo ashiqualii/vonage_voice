@@ -321,6 +321,46 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     );
   }
 
+  // ── Battery / power optimization ──────────────────────────────────────
+
+  @override
+  Future<bool> isBatteryOptimized() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(false);
+    }
+    return _channel
+        .invokeMethod<bool?>('isBatteryOptimized', {})
+        .then<bool>((bool? value) => value ?? true);
+  }
+
+  @override
+  Future<bool?> requestBatteryOptimizationExemption() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel.invokeMethod('requestBatteryOptimizationExemption', {});
+  }
+
+  // ── Full-screen intent permission ─────────────────────────────────────
+
+  @override
+  Future<bool> canUseFullScreenIntent() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel
+        .invokeMethod<bool?>('canUseFullScreenIntent', {})
+        .then<bool>((bool? value) => value ?? false);
+  }
+
+  @override
+  Future<bool?> openFullScreenIntentSettings() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel.invokeMethod('openFullScreenIntentSettings', {});
+  }
+
   @Deprecated('custom call UI not used anymore, has no effect')
   @override
   Future<bool?> showBackgroundCallUI() => Future.value(true);
