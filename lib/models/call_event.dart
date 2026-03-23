@@ -1,4 +1,4 @@
-part of vonage_voice;
+part of '../vonage_voice.dart';
 
 /// Represents all possible call events emitted over the EventChannel.
 ///

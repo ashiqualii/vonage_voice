@@ -51,7 +51,7 @@ abstract class SharedPlatformInterface extends PlatformInterface {
 
   // ── Constructor ───────────────────────────────────────────────────────
 
-  SharedPlatformInterface({required Object token}) : super(token: token);
+  SharedPlatformInterface({required super.token});
 
   static final Object _token = Object();
 

@@ -11,5 +11,5 @@ import '../platform_interface/shared_platform_interface.dart';
 /// This class exists purely to satisfy the [PlatformInterface] token
 /// requirement — it holds no logic of its own.
 class MethodChannelSharedPlatform extends SharedPlatformInterface {
-  MethodChannelSharedPlatform({required Object token}) : super(token: token);
+  MethodChannelSharedPlatform({required super.token});
 }

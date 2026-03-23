@@ -1,4 +1,4 @@
-part of vonage_voice;
+part of '../vonage_voice.dart';
 
 /// Represents the direction of a voice call.
 enum CallDirection {
