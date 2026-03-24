@@ -97,6 +97,9 @@ class VonageVoicePlugin :
     private val permissionResultHandlers = HashMap<Int, (Boolean) -> Unit>()
     private var btEnableResult: Result? = null
 
+    /** Pending re-emit runnables — cancelled in onCancel() to prevent stale emissions. */
+    private val pendingReEmitRunnables = mutableListOf<Runnable>()
+
     companion object {
         private const val REQUEST_CODE_MIC         = 1001
         private const val REQUEST_CODE_PHONE_STATE = 1002
@@ -182,23 +185,40 @@ class VonageVoicePlugin :
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
-        android.util.Log.e("VonagePlugin", "✅ onListen CALLED — EventSink attached, scheduling reEmitPendingCallState")
+        android.util.Log.d("VonagePlugin", "onListen — EventSink attached, scheduling reEmitPendingCallState")
+
+        // Cancel any leftover runnables from a previous subscription
+        cancelPendingReEmitRunnables()
+
         // Retry with increasing delays to handle slow cold-starts.
         // The first attempt fires quickly for the foreground case;
         // later attempts catch slower background-launch scenarios
         // (e.g. answer callback hasn't completed yet at 100ms).
         val delays = longArrayOf(100, 500, 1500, 3000)
+        val handler = Handler(Looper.getMainLooper())
         for (delay in delays) {
-            Handler(Looper.getMainLooper()).postDelayed({
+            val runnable = Runnable {
                 if (eventSink != null) {
                     reEmitPendingCallState()
                 }
-            }, delay)
+            }
+            pendingReEmitRunnables.add(runnable)
+            handler.postDelayed(runnable, delay)
         }
     }
 
     override fun onCancel(arguments: Any?) {
+        cancelPendingReEmitRunnables()
         eventSink = null
+    }
+
+    /** Cancel all pending re-emit runnables to prevent stale emissions. */
+    private fun cancelPendingReEmitRunnables() {
+        val handler = Handler(Looper.getMainLooper())
+        for (runnable in pendingReEmitRunnables) {
+            handler.removeCallbacks(runnable)
+        }
+        pendingReEmitRunnables.clear()
     }
 
     /**
@@ -229,7 +249,7 @@ class VonageVoicePlugin :
             val conn = activeEntry.value
             activeCallId = activeEntry.key
             pendingCallReEmitted = "connected_${activeEntry.key}"
-            android.util.Log.d("VonagePlugin", "reEmit: Connected — callId=${activeEntry.key}")
+            android.util.Log.d("VonagePlugin", "reEmit: Connected -- callId=${activeEntry.key}")
             emitEvent(
                 VNNativeCallEvents.callStateEvent(
                     VNNativeCallEvents.EVENT_CONNECTED,
@@ -250,7 +270,7 @@ class VonageVoicePlugin :
             val from = resolveCallerName(invite.from)
             activeCallId = pendingEntry.key
             pendingCallReEmitted = "incoming_${pendingEntry.key}"
-            android.util.Log.d("VonagePlugin", "reEmit: Incoming — callId=${pendingEntry.key}")
+            android.util.Log.d("VonagePlugin", "reEmit: Incoming -- callId=${pendingEntry.key}")
             emitEvent(VNNativeCallEvents.incomingCallEvent(from, invite.to))
             return
         }
@@ -455,6 +475,30 @@ class VonageVoicePlugin :
             registerVoiceClientListeners()
         }
 
+        // If the FCM handler already restored the session (app was killed →
+        // incoming call push → VonageFirebaseMessagingService.createSession()),
+        // DO NOT call createSession() again — it would invalidate the pending
+        // call invite and cause "No invite found" when answering.
+        if (VonageClientHolder.isSessionReady) {
+            android.util.Log.d("VonagePlugin", "Session already active (restored by FCM) -- skipping createSession")
+
+            // Still persist the fresh JWT for future use
+            VonageClientHolder.storeJwt(ctx, jwt)
+
+            // Still register FCM token if provided
+            val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
+            if (!fcmToken.isNullOrEmpty()) {
+                voiceClient!!.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
+                    if (tokenError != null) {
+                        logEvent("FCM token registration failed: ${tokenError.message}")
+                    }
+                }
+            }
+
+            result.success(true)
+            return
+        }
+
         // Create session with the JWT from Flutter — never hardcoded
         voiceClient!!.createSession(jwt) { error, sessionId ->
             if (error != null) {
@@ -466,8 +510,7 @@ class VonageVoicePlugin :
                 )
                 return@createSession
             }
-            android.util.Log.e("VonagePlugin", "✅ Session created: $sessionId")
-            android.util.Log.e("VonagePlugin", "✅ Listeners being registered now")
+            android.util.Log.i("VonagePlugin", "Session created: $sessionId")
 
             // Persist JWT so VonageFirebaseMessagingService can restore
             // the session when the app process was killed by the OS.
@@ -1266,11 +1309,8 @@ class VonageVoicePlugin :
                 val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
                 activeCallId = callId
                 val event = VNNativeCallEvents.incomingCallEvent(from, to)
-                android.util.Log.e("VonagePlugin", "📞 BROADCAST_CALL_INVITE received — callId: $callId from: $from to: $to")
-                android.util.Log.e("VonagePlugin", "📞 Emitting event: $event")
-                android.util.Log.e("VonagePlugin", "📞 eventSink is ${if (eventSink == null) "❌ NULL" else "✅ SET"}")
+                android.util.Log.d("VonagePlugin", "BROADCAST_CALL_INVITE -- callId: $callId, from: $from, to: $to")
                 emitEvent(event)
-                android.util.Log.e("VonagePlugin", "📞 Event emitted successfully")
             }
 
             // ── Invite cancelled by remote party ──────────────────────────
@@ -1414,9 +1454,9 @@ class VonageVoicePlugin :
      * forward them to Flutter.
      */
     private fun registerVoiceClientListeners() {
-        android.util.Log.e("VonagePlugin", "✅ registerVoiceClientListeners called")
+        android.util.Log.d("VonagePlugin", "registerVoiceClientListeners called")
         val client = voiceClient ?: run {
-            android.util.Log.e("VonagePlugin", "❌ voiceClient is null in registerVoiceClientListeners")
+            android.util.Log.w("VonagePlugin", "voiceClient is null in registerVoiceClientListeners")
             return
         }
         val ctx = context ?: return
@@ -1427,7 +1467,7 @@ class VonageVoicePlugin :
             // (set by handleProcessPush or VonageFirebaseMessagingService).
             val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
             VonageClientHolder.pendingCallerDisplay = null
-            android.util.Log.e("VonagePlugin", "🔴 INCOMING CALL — callId: $callId from: $from display: $displayFrom")
+            android.util.Log.d("VonagePlugin", "INCOMING CALL -- callId: $callId, from: $from, display: $displayFrom")
             val intent = Intent(ctx, TVConnectionService::class.java).apply {
                 action = Constants.ACTION_INCOMING_CALL
                 putExtra(Constants.EXTRA_CALL_ID, callId)
@@ -1520,9 +1560,9 @@ class VonageVoicePlugin :
     private fun emitEvent(event: String) {
         mainHandler.post {
             if (eventSink == null) {
-                android.util.Log.e("VonagePlugin", "⚠️  emitEvent called but eventSink is NULL — event lost: $event")
+                android.util.Log.w("VonagePlugin", "emitEvent: eventSink is NULL -- event lost: $event")
             } else {
-                android.util.Log.e("VonagePlugin", "✅ emitEvent → sending to Flutter: $event")
+                android.util.Log.d("VonagePlugin", "emitEvent: $event")
                 eventSink?.success(event)
             }
         }

@@ -49,7 +49,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
     override fun onCreate() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
-        println("VonageFirebaseMessagingService created")
+        android.util.Log.d("VonageFCM", "VonageFirebaseMessagingService created")
     }
 
     // ── FCM token lifecycle ───────────────────────────────────────────────
@@ -160,7 +160,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         var client = VonageClientHolder.voiceClient
         val clientWasNull = client == null
         if (client == null) {
-            android.util.Log.w("VonageFCM", "VoiceClient null — creating for background")
+            android.util.Log.w("VonageFCM", "VoiceClient null -- creating for background")
             client = VoiceClient(applicationContext)
             VonageClientHolder.voiceClient = client
             VonageClientHolder.isSessionReady = false
@@ -176,12 +176,12 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         // the foreground incoming call path.
         if (clientWasNull) {
             client.setCallInviteListener { callId, from, channelType ->
-                android.util.Log.d("VonageFCM", "🔔 setCallInviteListener FIRED — callId: $callId from: $from")
+                android.util.Log.d("VonageFCM", "setCallInviteListener FIRED -- callId: $callId, from: $from")
 
                 // If we already handled the invite via processPushCallInvite's
                 // returned callId, skip the listener to avoid duplicates.
                 if (!inviteHandledDirectly.compareAndSet(false, true)) {
-                    android.util.Log.d("VonageFCM", "Invite already handled directly — skipping listener")
+                    android.util.Log.d("VonageFCM", "Invite already handled directly -- skipping listener")
                     releaseProcessingWakeLock(wakeLock)
                     return@setCallInviteListener
                 }
@@ -216,39 +216,66 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             // ── Restore session from stored JWT ──────────────────────────
             // When the app was killed, the VoiceClient has no session.
             // Without a session, client.answer() will fail when the user
-            // taps Answer. We restore the session NOW so it is ready
-            // before the user answers (typically 2–10 seconds later).
+            // taps Answer. We restore the session FIRST, then process
+            // the push — the SDK only registers the invite internally
+            // when a valid session exists.
             val storedJwt = VonageClientHolder.getStoredJwt(applicationContext)
             if (!storedJwt.isNullOrEmpty()) {
                 android.util.Log.d("VonageFCM", "Restoring session from stored JWT...")
                 client.createSession(storedJwt) { error, sessionId ->
                     if (error != null) {
-                        android.util.Log.e("VonageFCM", "❌ Background createSession failed: ${error.message}")
+                        android.util.Log.e("VonageFCM", "Background createSession failed: ${error.message}")
+                        // Session failed — still try processPushCallInvite as fallback
+                        processInviteAndNotify(client, dataString, callerDisplay, clientWasNull, inviteHandledDirectly, wakeLock)
                     } else {
-                        android.util.Log.d("VonageFCM", "✅ Background session created: $sessionId")
+                        android.util.Log.d("VonageFCM", "Background session created: $sessionId")
                         VonageClientHolder.isSessionReady = true
+                        // NOW process the push — session is active so the SDK
+                        // will properly register the invite for answer().
+                        processInviteAndNotify(client, dataString, callerDisplay, clientWasNull, inviteHandledDirectly, wakeLock)
                     }
                 }
             } else {
-                android.util.Log.w("VonageFCM", "⚠️ No stored JWT — answer will fail without session")
+                android.util.Log.w("VonageFCM", "No stored JWT -- answer will fail without session")
+                // No JWT — try processing anyway (will show notification but answer will fail)
+                processInviteAndNotify(client, dataString, callerDisplay, clientWasNull, inviteHandledDirectly, wakeLock)
             }
         } else {
-            // Client was already alive — release WakeLock after processPushCallInvite returns.
-            // The plugin's own listener will handle the invite.
+            // Client was already alive (app in foreground/background) —
+            // process the push inline. The plugin's own listener handles the invite.
+            android.util.Log.d("VonageFCM", "Calling processPushCallInvite (client alive)...")
+            try {
+                val callId = client.processPushCallInvite(dataString)
+                android.util.Log.d("VonageFCM", "processPushCallInvite returned: $callId")
+            } catch (e: Exception) {
+                android.util.Log.e("VonageFCM", "processPushCallInvite threw: ${e.message}", e)
+            }
+            releaseProcessingWakeLock(wakeLock)
         }
+    }
 
-        android.util.Log.d("VonageFCM", "Calling processPushCallInvite...")
+    /**
+     * Process the push invite and send the incoming call intent to TVConnectionService.
+     *
+     * Called AFTER createSession() completes (or fails) when the app was killed.
+     * This ensures the SDK has an active session when it processes the push,
+     * so the invite is properly registered and client.answer(callId) will work.
+     */
+    private fun processInviteAndNotify(
+        client: VoiceClient,
+        dataString: String,
+        callerDisplay: String?,
+        clientWasNull: Boolean,
+        inviteHandledDirectly: java.util.concurrent.atomic.AtomicBoolean,
+        wakeLock: PowerManager.WakeLock?
+    ) {
+        android.util.Log.d("VonageFCM", "Calling processPushCallInvite (after session restore)...")
         try {
             val callId = client.processPushCallInvite(dataString)
             android.util.Log.d("VonageFCM", "processPushCallInvite returned: $callId")
             if (!callId.isNullOrEmpty()) {
-                android.util.Log.d("VonageFCM", "✅ Incoming call processed with callId: $callId")
+                android.util.Log.d("VonageFCM", "Incoming call processed with callId: $callId")
 
-                // When the app was killed, setCallInviteListener may NEVER fire
-                // because the Vonage SDK requires an active session to trigger it.
-                // processPushCallInvite() can parse the push without a session
-                // and returns a callId, but the listener won't fire. So we use
-                // the callId directly to send the REAL incoming call intent.
                 if (clientWasNull && inviteHandledDirectly.compareAndSet(false, true)) {
                     val displayFrom = VonageClientHolder.pendingCallerDisplay ?: callerDisplay ?: "Unknown"
                     VonageClientHolder.pendingCallerDisplay = null
@@ -261,28 +288,22 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                     }
                     try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            android.util.Log.d("VonageFCM", "📞 Sending incoming call intent with real callId: $callId")
+                            android.util.Log.d("VonageFCM", "Sending incoming call intent with real callId: $callId")
                             applicationContext.startForegroundService(realIntent)
                         } else {
                             applicationContext.startService(realIntent)
                         }
                     } catch (e: Exception) {
-                        android.util.Log.e("VonageFCM", "Error sending incoming call intent: ${e.message}", e)
+                        android.util.Log.e("VonageFCM", "Error sending real incoming call intent: ${e.message}", e)
                     }
-                    releaseProcessingWakeLock(wakeLock)
                 }
             } else {
-                android.util.Log.d("VonageFCM", "ℹ️ processPushCallInvite returned null — waiting for setCallInviteListener callback")
+                android.util.Log.d("VonageFCM", "processPushCallInvite returned null -- waiting for listener")
             }
         } catch (e: Exception) {
-            android.util.Log.e("VonageFCM", "❌ processPushCallInvite threw: ${e.message}", e)
+            android.util.Log.e("VonageFCM", "processPushCallInvite threw: ${e.message}", e)
         }
-
-        // If the client was already alive, release WakeLock now — the plugin's
-        // own listener handles the invite and the service is already running.
-        if (!clientWasNull) {
-            releaseProcessingWakeLock(wakeLock)
-        }
+        releaseProcessingWakeLock(wakeLock)
     }
 
     // ── Push payload helpers ────────────────────────────────────────────────

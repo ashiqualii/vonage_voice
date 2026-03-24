@@ -81,8 +81,8 @@ class _LoginScreenState extends State<LoginScreen> {
       // ── Battery optimization exemption (critical for Vivo/Xiaomi/OPPO) ──
       // Without this, the OEM kills the app and FCM cannot deliver incoming
       // call pushes when the app is backgrounded or killed.
-      final isBatteryOptimized =
-          await VonageVoice.instance.isBatteryOptimized();
+      final isBatteryOptimized = await VonageVoice.instance
+          .isBatteryOptimized();
       if (isBatteryOptimized) {
         await VonageVoice.instance.requestBatteryOptimizationExemption();
       }
@@ -90,8 +90,7 @@ class _LoginScreenState extends State<LoginScreen> {
       // ── Full-screen intent permission (Android 14+ / API 34+) ──────────
       // Without this, the incoming call notification will not show as a
       // full-screen intent on the lock screen.
-      final canFullScreen =
-          await VonageVoice.instance.canUseFullScreenIntent();
+      final canFullScreen = await VonageVoice.instance.canUseFullScreenIntent();
       if (!canFullScreen) {
         await VonageVoice.instance.openFullScreenIntentSettings();
       }
@@ -230,17 +229,17 @@ class _DialerScreenState extends State<DialerScreen> {
       switch (event) {
         // ── Incoming call ───────────────────────────────────────────────
         case CallEvent.incoming:
-          log('📞 CallEvent.incoming received');
+          log('CallEvent.incoming received');
           setState(() => _status = 'incoming...');
 
           Future.delayed(const Duration(milliseconds: 100)).then((_) {
             if (!mounted) return;
 
             final activeCall = VonageVoice.instance.call.activeCall;
-            log('📞 activeCall: ${activeCall?.from} → ${activeCall?.to}');
+            log('activeCall: ${activeCall?.from} -> ${activeCall?.to}');
 
             if (activeCall != null) {
-              log('✅ Navigating to IncomingCallScreen');
+              log('Navigating to IncomingCallScreen');
               _onCallScreen = true;
               Navigator.of(context).push(
                 MaterialPageRoute(
@@ -248,13 +247,13 @@ class _DialerScreenState extends State<DialerScreen> {
                 ),
               );
             } else {
-              log('❌ activeCall is NULL — cannot navigate');
+              log('activeCall is NULL -- cannot navigate');
               setState(() => _status = 'Error: activeCall not set');
             }
           });
           break;
         case CallEvent.ringing:
-          log('📞 CallEvent.ringing — outgoing call is ringing');
+          log('CallEvent.ringing -- outgoing call is ringing');
           // Outgoing call is ringing on remote side
           // ActiveCallScreen is already pushed by _makeCall()
           // so we just update the status — no navigation needed
@@ -263,10 +262,10 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Call connected ──────────────────────────────────────────────
         case CallEvent.connected:
-          log('📞 CallEvent.connected');
+          log('CallEvent.connected');
           final activeCall = VonageVoice.instance.call.activeCall;
           if (activeCall != null && mounted) {
-            log('✅ Navigating to ActiveCallScreen');
+            log('Navigating to ActiveCallScreen');
             _onCallScreen = true;
             // Push active call screen (don't replace — DialerScreen stays in stack)
             Navigator.of(context).push(
@@ -275,7 +274,7 @@ class _DialerScreenState extends State<DialerScreen> {
               ),
             );
           } else {
-            log('❌ activeCall is NULL on connected event');
+            log('activeCall is NULL on connected event');
           }
           break;
 
@@ -472,22 +471,69 @@ class _DialerScreenState extends State<DialerScreen> {
 // SCREEN 3 — Incoming Call
 // ══════════════════════════════════════════════════════════════════════════
 
-class IncomingCallScreen extends StatelessWidget {
+class IncomingCallScreen extends StatefulWidget {
   final ActiveCall activeCall;
 
   const IncomingCallScreen({super.key, required this.activeCall});
 
+  @override
+  State<IncomingCallScreen> createState() => _IncomingCallScreenState();
+}
+
+class _IncomingCallScreenState extends State<IncomingCallScreen> {
+  StreamSubscription<CallEvent>? _eventSub;
+  bool _navigated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Listen for events so that answering from the notification
+    // (which bypasses _answer()) still navigates to ActiveCallScreen.
+    _eventSub = VonageVoice.instance.callEventsListener.listen((event) {
+      if (!mounted || _navigated) return;
+      switch (event) {
+        case CallEvent.connected:
+          _navigated = true;
+          final call =
+              VonageVoice.instance.call.activeCall ?? widget.activeCall;
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (_) => ActiveCallScreen(activeCall: call),
+            ),
+          );
+          break;
+        case CallEvent.callEnded:
+        case CallEvent.missedCall:
+        case CallEvent.declined:
+          _navigated = true;
+          if (mounted) Navigator.of(context).pop();
+          break;
+        default:
+          break;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _eventSub?.cancel();
+    super.dispose();
+  }
+
   Future<void> _answer(BuildContext context) async {
+    if (_navigated) return;
+    _navigated = true;
     await VonageVoice.instance.call.answer();
     if (!context.mounted) return;
-    // Navigate to active call screen immediately — same pattern as outgoing calls
-    final call = VonageVoice.instance.call.activeCall ?? activeCall;
+    final call = VonageVoice.instance.call.activeCall ?? widget.activeCall;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(builder: (_) => ActiveCallScreen(activeCall: call)),
     );
   }
 
   Future<void> _reject(BuildContext context) async {
+    if (_navigated) return;
+    _navigated = true;
     await VonageVoice.instance.call.hangUp();
     if (context.mounted) Navigator.of(context).pop();
   }
@@ -512,9 +558,9 @@ class IncomingCallScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    activeCall.fromFormatted.isNotEmpty
-                        ? activeCall.fromFormatted
-                        : activeCall.from,
+                    widget.activeCall.fromFormatted.isNotEmpty
+                        ? widget.activeCall.fromFormatted
+                        : widget.activeCall.from,
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 28,
