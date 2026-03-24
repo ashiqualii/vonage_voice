@@ -154,6 +154,8 @@ class VonageVoicePlugin :
             if (error != null) logEvent("deleteSession error: ${error.message}")
         }
         VonageClientHolder.voiceClient = null
+        VonageClientHolder.isCallAnsweredNatively = false
+        VonageClientHolder.isAnsweringInProgress = false
         voiceClient = null
 
         context = null
@@ -1357,11 +1359,24 @@ class VonageVoicePlugin :
             Constants.BROADCAST_CALL_ENDED -> {
                 // Guard against duplicate broadcasts (hangup + SDK listener)
                 if (activeCallId == null && !isMuted && !isHolding) return
+
+                // If invite listeners were skipped during registerVoiceClientListeners()
+                // because the call was answered natively, register them now so the
+                // next incoming call is handled properly.
+                val needsInviteListenerRegistration = VonageClientHolder.isCallAnsweredNatively
+
                 activeCallId = null
                 isMuted = false
                 isHolding = false
                 pendingCallReEmitted = null
+                // Clear native-answer flags so future incoming calls work normally
+                VonageClientHolder.isCallAnsweredNatively = false
+                VonageClientHolder.isAnsweringInProgress = false
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
+
+                if (needsInviteListenerRegistration) {
+                    registerInviteListeners()
+                }
             }
 
             // ── Reconnecting ──────────────────────────────────────────────
@@ -1429,6 +1444,8 @@ class VonageVoicePlugin :
                 activeCallId = null
                 isMuted = false
                 isHolding = false
+                VonageClientHolder.isCallAnsweredNatively = false
+                VonageClientHolder.isAnsweringInProgress = false
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
             }
 
@@ -1461,35 +1478,50 @@ class VonageVoicePlugin :
         }
         val ctx = context ?: return
 
-        // ── Incoming call invite ──────────────────────────────────────────
-        client.setCallInviteListener { callId, from, channelType ->
-            // Prefer the display name extracted from the push payload
-            // (set by handleProcessPush or VonageFirebaseMessagingService).
-            val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
-            VonageClientHolder.pendingCallerDisplay = null
-            android.util.Log.d("VonagePlugin", "INCOMING CALL -- callId: $callId, from: $from, display: $displayFrom")
-            val intent = Intent(ctx, TVConnectionService::class.java).apply {
-                action = Constants.ACTION_INCOMING_CALL
-                putExtra(Constants.EXTRA_CALL_ID, callId)
-                putExtra(Constants.EXTRA_CALL_FROM, displayFrom)
-                putExtra(Constants.EXTRA_CALL_TO, "")
-            }
-            // Must use startForegroundService — the SDK callback fires
-            // asynchronously and on Android 10+ the FCM background
-            // execution window may have expired by this point.
-            ContextCompat.startForegroundService(ctx, intent)
-        }
+        // ── Guard: skip invite listeners when a call was already answered natively ──
+        // When the app was killed and the user tapped Answer on the notification,
+        // TVConnectionService.doAnswer() already answered the call via the VoiceClient
+        // created by VonageFirebaseMessagingService. Re-registering setCallInviteListener
+        // at this point can interfere with the SDK's internal state for the active call,
+        // causing an unexpected hangup. The cancel listener is also skipped because
+        // the invite has already been consumed.
+        val skipInviteListeners = VonageClientHolder.isCallAnsweredNatively
+                || VonageClientHolder.isAnsweringInProgress
 
-        // ── Incoming invite cancelled by remote ───────────────────────────
-        client.setCallInviteCancelListener { callId, reason ->
-            val intent = Intent(ctx, TVConnectionService::class.java).apply {
-                action = Constants.ACTION_CANCEL_CALL_INVITE
-                putExtra(Constants.EXTRA_CALL_ID, callId)
+        if (skipInviteListeners) {
+            android.util.Log.d("VonagePlugin",
+                "Skipping setCallInviteListener — call already answered/answering natively")
+        } else {
+            // ── Incoming call invite ──────────────────────────────────────────
+            client.setCallInviteListener { callId, from, channelType ->
+                // Prefer the display name extracted from the push payload
+                // (set by handleProcessPush or VonageFirebaseMessagingService).
+                val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
+                VonageClientHolder.pendingCallerDisplay = null
+                android.util.Log.d("VonagePlugin", "INCOMING CALL -- callId: $callId, from: $from, display: $displayFrom")
+                val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_INCOMING_CALL
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                    putExtra(Constants.EXTRA_CALL_FROM, displayFrom)
+                    putExtra(Constants.EXTRA_CALL_TO, "")
+                }
+                // Must use startForegroundService — the SDK callback fires
+                // asynchronously and on Android 10+ the FCM background
+                // execution window may have expired by this point.
+                ContextCompat.startForegroundService(ctx, intent)
             }
-            // Service is already in foreground from the invite, so
-            // startService is fine here. But use startForegroundService
-            // as a safety net in case the invite was never delivered.
-            ContextCompat.startForegroundService(ctx, intent)
+
+            // ── Incoming invite cancelled by remote ───────────────────────────
+            client.setCallInviteCancelListener { callId, reason ->
+                val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_CANCEL_CALL_INVITE
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                // Service is already in foreground from the invite, so
+                // startService is fine here. But use startForegroundService
+                // as a safety net in case the invite was never delivered.
+                ContextCompat.startForegroundService(ctx, intent)
+            }
         }
 
         // ── Call hung up ──────────────────────────────────────────────────
@@ -1546,6 +1578,39 @@ class VonageVoicePlugin :
         // ── Session error ─────────────────────────────────────────────────
         client.setSessionErrorListener { reason ->
             emitEvent(VNNativeCallEvents.callErrorEvent("Session error: $reason"))
+        }
+    }
+
+    /**
+     * Register (or re-register) only the invite-related listeners on VoiceClient.
+     * Called after a natively-answered call ends so that the next incoming call
+     * is properly handled via the plugin path.
+     */
+    private fun registerInviteListeners() {
+        val client = voiceClient ?: return
+        val ctx = context ?: return
+
+        android.util.Log.d("VonagePlugin", "registerInviteListeners — re-registering invite listeners after native call ended")
+
+        client.setCallInviteListener { callId, from, channelType ->
+            val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
+            VonageClientHolder.pendingCallerDisplay = null
+            android.util.Log.d("VonagePlugin", "INCOMING CALL -- callId: $callId, from: $from, display: $displayFrom")
+            val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_INCOMING_CALL
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                putExtra(Constants.EXTRA_CALL_FROM, displayFrom)
+                putExtra(Constants.EXTRA_CALL_TO, "")
+            }
+            ContextCompat.startForegroundService(ctx, intent)
+        }
+
+        client.setCallInviteCancelListener { callId, reason ->
+            val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_CANCEL_CALL_INVITE
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            ContextCompat.startForegroundService(ctx, intent)
         }
     }
 

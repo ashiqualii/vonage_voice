@@ -587,6 +587,7 @@ class TVConnectionService : ConnectionService() {
      * tapping Answer very quickly.
      */
     private fun doAnswer(client: VoiceClient, callId: String, retriesLeft: Int) {
+        VonageClientHolder.isAnsweringInProgress = true
         client.answer(callId) { error ->
             if (error != null) {
                 android.util.Log.e("TVConnectionService",
@@ -598,10 +599,18 @@ class TVConnectionService : ConnectionService() {
                         doAnswer(client, callId, retriesLeft - 1)
                     }, 1500)
                 } else {
+                    VonageClientHolder.isAnsweringInProgress = false
                     broadcastError("answer failed: ${error.message}")
                 }
                 return@answer
             }
+
+            // Mark that the call was answered via the native path so that
+            // registerVoiceClientListeners() (called when Flutter starts)
+            // does not overwrite the setCallInviteListener and interfere
+            // with this already-answered call.
+            VonageClientHolder.isAnsweringInProgress = false
+            VonageClientHolder.isCallAnsweredNatively = true
 
             // Promote invite connection to active connection
             val invite = pendingInvites.remove(callId)
@@ -1062,6 +1071,24 @@ object VonageClientHolder {
     /** True once createSession() has succeeded on the current VoiceClient. */
     @Volatile
     var isSessionReady: Boolean = false
+
+    /**
+     * True when a call was answered via the native path (notification Answer button
+     * or IncomingCallActivity) BEFORE Flutter's engine had attached its listeners.
+     * Prevents registerVoiceClientListeners() from re-registering setCallInviteListener
+     * which can interfere with the already-answered call on the Vonage SDK.
+     * Cleared when the call ends.
+     */
+    @Volatile
+    var isCallAnsweredNatively: Boolean = false
+
+    /**
+     * True while doAnswer() is in progress (including retries).
+     * Prevents registerVoiceClientListeners() from overwriting SDK listeners
+     * mid-answer which could reset the invite state.
+     */
+    @Volatile
+    var isAnsweringInProgress: Boolean = false
 
     private const val PREFS_NAME = "vonage_voice_prefs"
     private const val KEY_JWT = "vonage_jwt"
