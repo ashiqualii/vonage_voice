@@ -25,12 +25,27 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var voiceClient: VGVoiceClient!
     private var accessToken: String?
     private var deviceId: String?
+    /// Tracks whether the Vonage SDK session is active (prevents double createSession).
+    private var isSessionReady: Bool = false
 
     // MARK: - CallKit
 
     private var callKitProvider: CXProvider!
     private var callKitCallController: CXCallController!
     private var callKitCompletionCallback: ((Bool) -> Void)?
+
+    // MARK: - Killed-State Push Coordination
+
+    /// Completion handler from PushKit — deferred until CallKit is fully set up.
+    private var pendingPushCompletion: (() -> Void)?
+    /// UUID of the call pre-reported to CallKit before session restore (killed state).
+    private var pendingPushUUID: UUID?
+    /// Safety timer: if didReceiveInviteForCall never fires, end the pre-reported call.
+    private var pushCompletionTimer: Timer?
+    /// Answer action queued while waiting for callId (user tapped Answer before session restore).
+    private var pendingAnswerAction: CXAnswerCallAction?
+    /// End action queued while waiting for callId (user declined before session restore).
+    private var pendingEndAction: CXEndCallAction?
 
     // MARK: - PushKit
 
@@ -382,6 +397,16 @@ extension VonageVoicePlugin {
         self.isSandbox = arguments["isSandbox"] as? Bool ?? false
         storeJwt(jwt)
 
+        // If session was already restored by PushKit (killed state), skip creation
+        if isSessionReady {
+            sendPhoneCallEvents(description: "LOG|tokens: Session already ready (restored by PushKit), skipping createSession")
+            if let token = self.deviceToken {
+                self.registerPushToken(token)
+            }
+            result(true)
+            return
+        }
+
         sendPhoneCallEvents(description: "LOG|tokens: Creating session with Vonage")
 
         voiceClient.createSession(jwt) { [weak self] error, sessionId in
@@ -392,6 +417,7 @@ extension VonageVoicePlugin {
                 return
             }
 
+            self.isSessionReady = true
             self.sendPhoneCallEvents(description: "LOG|Session created successfully: \(sessionId ?? "nil")")
 
             // Register VoIP push token if available
@@ -424,6 +450,7 @@ extension VonageVoicePlugin {
 
         self.accessToken = nil
         self.deviceId = nil
+        self.isSessionReady = false
         UserDefaults.standard.removeObject(forKey: kCachedDeviceId)
         clearStoredJwt()
         result(true)
@@ -953,6 +980,43 @@ extension VonageVoicePlugin {
     }
 }
 
+// MARK: - Killed-State Push Helpers
+
+extension VonageVoicePlugin {
+
+    /// Clean up all pending push coordination state.
+    private func cleanupPushState() {
+        pushCompletionTimer?.invalidate()
+        pushCompletionTimer = nil
+        pendingPushCompletion = nil
+        pendingPushUUID = nil
+        pendingAnswerAction = nil
+        pendingEndAction = nil
+    }
+
+    /// Called when the push completion safety timer fires (didReceiveInviteForCall never came).
+    private func handlePushTimeout() {
+        guard let pushUUID = pendingPushUUID else { return }
+        sendPhoneCallEvents(description: "LOG|Push completion timeout — ending pre-reported call")
+        callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .failed)
+        callDisconnected(uuid: pushUUID)
+        sendPhoneCallEvents(description: "Missed Call")
+        pendingPushCompletion?()
+        cleanupPushState()
+    }
+
+    /// Called when session restore fails in killed state.
+    private func handleSessionRestoreFailure() {
+        guard let pushUUID = pendingPushUUID else { return }
+        sendPhoneCallEvents(description: "LOG|Session restore failed — ending pre-reported call")
+        callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .failed)
+        callDisconnected(uuid: pushUUID)
+        sendPhoneCallEvents(description: "Missed Call")
+        pendingPushCompletion?()
+        cleanupPushState()
+    }
+}
+
 // MARK: - CallKit Actions
 
 extension VonageVoicePlugin {
@@ -1055,6 +1119,8 @@ extension VonageVoicePlugin: CXProviderDelegate {
         callInvites.removeAll()
         callIdToUUID.removeAll()
         activeCallUUID = nil
+        isSessionReady = false
+        cleanupPushState()
     }
 
     public func providerDidBegin(_ provider: CXProvider) {
@@ -1095,7 +1161,10 @@ extension VonageVoicePlugin: CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
-        sendPhoneCallEvents(description: "LOG|provider:timedOutPerformingAction")
+        sendPhoneCallEvents(description: "LOG|provider:timedOutPerformingAction \(type(of: action))")
+        // Do NOT fulfill here — the actual async callback (answer/start/end)
+        // will fulfill or fail when it completes. Fulfilling prematurely can
+        // cause undefined behavior if the callback later calls fail().
     }
 
     // MARK: Start Call
@@ -1158,6 +1227,13 @@ extension VonageVoicePlugin: CXProviderDelegate {
             return
         }
 
+        // KILLED STATE: callId not yet available — queue the action for later
+        if invite.callId.isEmpty {
+            sendPhoneCallEvents(description: "LOG|Deferring answer — waiting for callId (killed state)")
+            pendingAnswerAction = action
+            return
+        }
+
         voiceClient.answer(invite.callId) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
@@ -1193,6 +1269,13 @@ extension VonageVoicePlugin: CXProviderDelegate {
 
         // Check if it's a pending invite — reject it
         if let invite = callInvites[action.callUUID] {
+            // KILLED STATE: callId not yet available — queue the action for later
+            if invite.callId.isEmpty {
+                sendPhoneCallEvents(description: "LOG|Deferring decline — waiting for callId (killed state)")
+                pendingEndAction = action
+                return
+            }
+
             sendPhoneCallEvents(description: "LOG|Rejecting invite id=\(invite.callId)")
             voiceClient.reject(invite.callId) { [weak self] error in
                 if let error = error {
@@ -1316,44 +1399,82 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         // MUST report the incoming call to CallKit before returning from this method.
         // Apple kills the app if a VoIP push doesn't result in a reportNewIncomingCall.
 
-        // Process with Vonage SDK — the delegate callback will handle the call invite
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
         NSLog("[VonageVoice-Push] Vonage push type: %@", String(describing: pushType))
-        if pushType == .incomingCall {
-            // If no session exists, try to restore from stored JWT
-            if accessToken == nil, let storedJwt = getStoredJwt() {
-                sendPhoneCallEvents(description: "LOG|Restoring session from stored JWT for push processing")
-                accessToken = storedJwt
-                voiceClient.createSession(storedJwt) { [weak self] error, sessionId in
-                    guard let self = self else {
-                        completion()
-                        return
-                    }
-                    if let error = error {
-                        self.sendPhoneCallEvents(description: "LOG|Session restore failed: \(error.localizedDescription)")
-                        // Still need to report a call to CallKit — report and immediately end
-                        let uuid = UUID()
-                        self.reportIncomingCall(from: "Unknown", uuid: uuid) { _ in
-                            self.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
-                            completion()
-                        }
-                        return
-                    }
-                    self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
-                    completion()
-                }
-            } else {
-                voiceClient.processCallInvitePushData(payload.dictionaryPayload)
-                completion()
-            }
-        } else {
-            // Not a Vonage push — still need to report to CallKit to satisfy PushKit requirement
+
+        guard pushType == .incomingCall else {
+            // Not a Vonage call push — report dummy call and end it to satisfy PushKit
             let uuid = UUID()
             reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
                 self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
                 completion()
             }
+            return
         }
+
+        // ── KILLED / TERMINATED STATE ──
+        // No active session — restore from stored JWT.
+        // Report to CallKit IMMEDIATELY (before async session restore) so Apple
+        // doesn't kill the app, and the user sees the incoming-call UI right away.
+        if accessToken == nil, let storedJwt = getStoredJwt() {
+            sendPhoneCallEvents(description: "LOG|KILLED STATE: Restoring session from stored JWT")
+
+            let uuid = UUID()
+            let callerName = defaultCaller
+
+            // Pre-report to CallKit immediately
+            pendingPushUUID = uuid
+            pendingPushCompletion = completion
+
+            // Create a placeholder invite (callId filled in by didReceiveInviteForCall)
+            let invite = CallInviteInfo(callId: "", from: "", to: identity)
+            callInvites[uuid] = invite
+
+            reportIncomingCall(from: callerName, uuid: uuid)
+
+            // Safety timeout: end the call if didReceiveInviteForCall never fires
+            pushCompletionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
+                self?.handlePushTimeout()
+            }
+
+            // Restore session in background
+            accessToken = storedJwt
+            voiceClient.createSession(storedJwt) { [weak self] error, sessionId in
+                guard let self = self else { return }
+                if let error = error {
+                    self.sendPhoneCallEvents(description: "LOG|Session restore failed: \(error.localizedDescription)")
+                    self.handleSessionRestoreFailure()
+                    return
+                }
+
+                self.isSessionReady = true
+                self.sendPhoneCallEvents(description: "LOG|Session restored successfully, processing push")
+                // This triggers didReceiveInviteForCall synchronously
+                self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+                // completion() is called from didReceiveInviteForCall via pendingPushCompletion
+            }
+            return
+        }
+
+        // ── NO SESSION, NO STORED JWT ──
+        // Cannot process — user logged out or JWT was cleared.
+        // Report dummy call and end it to satisfy PushKit requirement.
+        if accessToken == nil {
+            sendPhoneCallEvents(description: "LOG|No session and no stored JWT — cannot process push")
+            let uuid = UUID()
+            reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
+                self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+                completion()
+            }
+            return
+        }
+
+        // ── FOREGROUND / BACKGROUND STATE ──
+        // Session exists — process push normally.
+        // processCallInvitePushData triggers didReceiveInviteForCall synchronously,
+        // which calls reportNewIncomingCall before we reach completion().
+        voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+        completion()
     }
 
     // iOS < 13 fallback
@@ -1366,7 +1487,16 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
 
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
         if pushType == .incomingCall {
-            voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+            if accessToken == nil, let storedJwt = getStoredJwt() {
+                accessToken = storedJwt
+                voiceClient.createSession(storedJwt) { [weak self] error, _ in
+                    guard let self = self, error == nil else { return }
+                    self.isSessionReady = true
+                    self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+                }
+            } else if accessToken != nil {
+                voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+            }
         }
     }
 }
@@ -1386,6 +1516,70 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             return
         }
 
+        // ── KILLED STATE: Associate callId with pre-reported UUID ──
+        if let pushUUID = pendingPushUUID {
+            pushCompletionTimer?.invalidate()
+            pushCompletionTimer = nil
+
+            let callerDisplay = clients[caller] ?? caller
+
+            // Update the placeholder invite with real data
+            let invite = CallInviteInfo(callId: callId, from: caller, to: identity)
+            callInvites[pushUUID] = invite
+            callIdToUUID[callId] = pushUUID
+
+            // Update CallKit with real caller info
+            let callUpdate = CXCallUpdate()
+            callUpdate.localizedCallerName = callerDisplay
+            callUpdate.remoteHandle = CXHandle(type: .generic, value: callerDisplay)
+            callKitProvider.reportCall(with: pushUUID, updated: callUpdate)
+
+            // Send Incoming event to Flutter
+            sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
+
+            // If user already tapped Answer before we had the callId
+            if let answerAction = pendingAnswerAction {
+                pendingAnswerAction = nil
+                voiceClient.answer(callId) { [weak self] error in
+                    guard let self = self else { return }
+                    if let error = error {
+                        self.sendPhoneCallEvents(description: "LOG|Deferred answer failed: \(error.localizedDescription)")
+                        answerAction.fail()
+                        return
+                    }
+                    self.activeCalls[pushUUID] = callId
+                    self.activeCallUUID = pushUUID
+                    self.callInvites.removeValue(forKey: pushUUID)
+                    self.userExplicitlyChangedAudioRoute = false
+                    self.sendPhoneCallEvents(description: "Answer|\(caller)|\(self.identity)|Incoming")
+                    self.sendPhoneCallEvents(description: "Connected|\(caller)|\(self.identity)|Incoming")
+                    answerAction.fulfill()
+                }
+            }
+
+            // If user already tapped Decline before we had the callId
+            if let endAction = pendingEndAction {
+                pendingEndAction = nil
+                voiceClient.reject(callId) { [weak self] error in
+                    if let error = error {
+                        self?.sendPhoneCallEvents(description: "LOG|Deferred reject failed: \(error.localizedDescription)")
+                    }
+                }
+                callInvites.removeValue(forKey: pushUUID)
+                callIdToUUID.removeValue(forKey: callId)
+                callDisconnected(uuid: pushUUID)
+                sendPhoneCallEvents(description: "Declined")
+                endAction.fulfill()
+            }
+
+            // Call the deferred PushKit completion handler
+            pendingPushCompletion?()
+            pendingPushCompletion = nil
+            pendingPushUUID = nil
+            return
+        }
+
+        // ── NORMAL PATH (foreground / background) ──
         let uuid = UUID()
         let callerDisplay = clients[caller] ?? caller
         let invite = CallInviteInfo(callId: callId, from: caller, to: identity)
@@ -1403,8 +1597,32 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         NSLog("[VonageVoice-Push] *** didReceiveInviteCancelForCall *** callId=%@ reason=%@", callId, String(describing: reason))
         sendPhoneCallEvents(description: "LOG|didReceiveInviteCancelForCall callId=\(callId), reason=\(reason)")
 
+        // ── KILLED STATE: Cancel arrived before didReceiveInviteForCall ──
+        if callIdToUUID[callId] == nil, let pushUUID = pendingPushUUID {
+            pushCompletionTimer?.invalidate()
+            pushCompletionTimer = nil
+            pendingAnswerAction?.fail()
+            pendingEndAction?.fulfill()
+            callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .remoteEnded)
+            callDisconnected(uuid: pushUUID)
+            sendPhoneCallEvents(description: "Missed Call")
+            pendingPushCompletion?()
+            cleanupPushState()
+            return
+        }
+
+        // ── NORMAL PATH ──
         // Find and remove the matching call invite
         if let uuid = callIdToUUID[callId] {
+            // GUARD: If the call was already answered and moved to activeCalls,
+            // do NOT process the cancel — the SDK may fire cancel as a cleanup
+            // after the invite was consumed by answer. Ending an active call
+            // here would cause the "auto-hangup after answer" bug.
+            if activeCalls[uuid] != nil {
+                sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for already-answered call callId=\(callId)")
+                return
+            }
+
             callInvites.removeValue(forKey: uuid)
             callIdToUUID.removeValue(forKey: callId)
 

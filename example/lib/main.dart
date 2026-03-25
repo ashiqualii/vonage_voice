@@ -129,12 +129,6 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   @override
-  void initState() {
-    super.initState();
-    _login();
-  }
-
-  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Vonage Voice — Login')),
@@ -238,7 +232,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
           _incomingTimer?.cancel();
           _incomingTimer = Timer(const Duration(milliseconds: 100), () {
-            if (!mounted) return;
+            if (!mounted || _onCallScreen) return;
 
             final activeCall = VonageVoice.instance.call.activeCall;
             log('activeCall: ${activeCall?.from} -> ${activeCall?.to}');
@@ -268,6 +262,11 @@ class _DialerScreenState extends State<DialerScreen> {
         // ── Call connected ──────────────────────────────────────────────
         case CallEvent.connected:
           log('CallEvent.connected');
+          // Cancel incoming timer — if the call was answered before
+          // the IncomingCallScreen was pushed (e.g. answered from CallKit
+          // notification while app was in background), prevent the
+          // IncomingCallScreen from being pushed on top of ActiveCallScreen.
+          _incomingTimer?.cancel();
           final activeCall = VonageVoice.instance.call.activeCall;
           if (activeCall != null && mounted) {
             log('Navigating to ActiveCallScreen');
