@@ -1,3 +1,22 @@
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │  VonageVoicePlugin.swift                                           │
+// │                                                                    │
+// │  Flutter plugin that bridges the Vonage Voice SDK on iOS.          │
+// │  Handles:                                                          │
+// │    • CallKit integration (incoming / outgoing calls)               │
+// │    • PushKit VoIP push delivery                                    │
+// │    • Audio routing (speaker, Bluetooth, earpiece)                  │
+// │    • Session lifecycle (login, refresh, logout)                    │
+// │    • Killed / background / locked state recovery                   │
+// │                                                                    │
+// │  Architecture overview:                                            │
+// │    1. PushKit push arrives → report to CallKit immediately         │
+// │    2. Vonage SDK fires didReceiveInviteForCall                     │
+// │    3. CallKit shows the native incoming-call UI                    │
+// │    4. User answers/declines → CXProviderDelegate methods fire      │
+// │    5. Events forwarded to Flutter via EventChannel                 │
+// └──────────────────────────────────────────────────────────────────────┘
+
 import Flutter
 import UIKit
 import AVFoundation
@@ -5,142 +24,175 @@ import PushKit
 import CallKit
 import VonageClientSDKVoice
 
-// MARK: - Main Plugin
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - Main Plugin Class
+// ═══════════════════════════════════════════════════════════════════════
 
 public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
-    // MARK: - Shared Instance
-
-    /// Shared instance for AppDelegate to forward PushKit events when needed.
+    // ─── Shared Instance ─────────────────────────────────────────────
+    // Accessible from AppDelegate to forward PushKit events when needed.
     public static var sharedInstance: VonageVoicePlugin?
 
-    // MARK: - Flutter Channels
-
+    // ─── Flutter Communication ───────────────────────────────────────
+    /// Sends events (call state, audio, errors) to Flutter via EventChannel.
     private var eventSink: FlutterEventSink?
+
+    /// Events queued while Flutter isn't listening (e.g. app was killed).
+    /// Replayed automatically when the EventChannel reconnects.
     private var pendingEvents: [Any] = []
     private static let maxPendingEvents = 50
 
-    // MARK: - Vonage SDK
-
+    // ─── Vonage SDK ──────────────────────────────────────────────────
     private var voiceClient: VGVoiceClient!
+
+    /// The JWT used to authenticate with Vonage. `nil` when logged out.
     private var accessToken: String?
+
+    /// The Vonage device-id returned after registering a VoIP push token.
     private var deviceId: String?
-    /// Tracks whether the Vonage SDK session is active (prevents double createSession).
-    private var isSessionReady: Bool = false
 
-    // MARK: - CallKit
+    /// `true` once `createSession()` succeeds — prevents double creation
+    /// when PushKit restores the session before Flutter calls `tokens()`.
+    private var isSessionReady = false
 
+    // ─── CallKit ─────────────────────────────────────────────────────
     private var callKitProvider: CXProvider!
     private var callKitCallController: CXCallController!
     private var callKitCompletionCallback: ((Bool) -> Void)?
 
-    // MARK: - Killed-State Push Coordination
+    // ─── Killed-State Push Coordination ──────────────────────────────
+    // When the app is killed and a VoIP push arrives, iOS launches the
+    // app in the background. We must report to CallKit *immediately*
+    // (before the async session restore finishes). These properties
+    // coordinate between the push receipt and didReceiveInviteForCall.
 
-    /// Completion handler from PushKit — deferred until CallKit is fully set up.
+    /// PushKit completion handler — deferred until the invite arrives.
     private var pendingPushCompletion: (() -> Void)?
-    /// UUID of the call pre-reported to CallKit before session restore (killed state).
+
+    /// UUID of the call pre-reported to CallKit before session restore.
     private var pendingPushUUID: UUID?
-    /// Safety timer: if didReceiveInviteForCall never fires, end the pre-reported call.
+
+    /// Safety timer: ends the pre-reported call if didReceiveInviteForCall never fires.
     private var pushCompletionTimer: Timer?
-    /// Answer action queued while waiting for callId (user tapped Answer before session restore).
+
+    /// Answer action queued because the user tapped Answer before the callId was available.
     private var pendingAnswerAction: CXAnswerCallAction?
-    /// End action queued while waiting for callId (user declined before session restore).
+
+    /// Decline action queued because the user tapped Decline before the callId was available.
     private var pendingEndAction: CXEndCallAction?
 
-    // MARK: - PushKit
-
+    // ─── PushKit ─────────────────────────────────────────────────────
     private var voipRegistry: PKPushRegistry!
+
+    /// VoIP push token persisted in UserDefaults so it survives app restarts.
     private var deviceToken: Data? {
-        get { UserDefaults.standard.data(forKey: kCachedDeviceToken) }
-        set { UserDefaults.standard.set(newValue, forKey: kCachedDeviceToken) }
+        get { UserDefaults.standard.data(forKey: Keys.cachedDeviceToken) }
+        set { UserDefaults.standard.set(newValue, forKey: Keys.cachedDeviceToken) }
     }
 
-    // MARK: - Push Environment
+    /// Whether to register VoIP tokens against Apple's sandbox APNS.
+    /// Set from Dart via the `isSandbox` parameter. Defaults to `false` (production).
+    private var isSandbox = false
 
-    /// Whether to register VoIP push tokens against Apple's sandbox APNS.
-    /// Set from Dart via the `isSandbox` parameter in `setTokens()`.
-    /// Defaults to `false` (production).
-    private var isSandbox: Bool = false
-
-    // MARK: - Call State
-
-    /// Stores pending call invites keyed by UUID: (callId, from, to, customParams)
+    // ─── Call State ──────────────────────────────────────────────────
+    /// Pending call invites keyed by CallKit UUID.
     private var callInvites: [UUID: CallInviteInfo] = [:]
-    /// Stores active calls keyed by UUID -> callId
+
+    /// Active (answered/connected) calls: CallKit UUID → Vonage callId.
     private var activeCalls: [UUID: String] = [:]
-    /// Maps Vonage callId -> CallKit UUID for quick lookup
+
+    /// Reverse lookup: Vonage callId → CallKit UUID.
     private var callIdToUUID: [String: UUID] = [:]
-    /// The UUID of the currently active (foreground) call
+
+    /// The UUID of the currently active (foreground) call.
     private var activeCallUUID: UUID?
 
-    private var callOutgoing: Bool = false
-    private var userInitiatedDisconnect: Bool = false
-    private var callTo: String = ""
-    private var identity: String = ""
+    /// Outgoing call state — set before the CXStartCallAction fires.
+    private var callOutgoing = false
+    private var userInitiatedDisconnect = false
+    private var callTo = ""
+    private var identity = ""
     private var callArgs: [String: Any] = [:]
-    private var outgoingCallerName: String = ""
+    private var outgoingCallerName = ""
 
-    // MARK: - Audio State
+    // ─── Audio State ─────────────────────────────────────────────────
+    private var isMuted = false
+    private var isHolding = false
+    private var desiredSpeakerState = false
+    private var desiredBluetoothState = false
 
-    private var isMuted: Bool = false
-    private var isHolding: Bool = false
-    private var desiredSpeakerState: Bool = false
-    private var desiredBluetoothState: Bool = false
-    private var userExplicitlyChangedAudioRoute: Bool = false
-    private var isChangingAudioRoute: Bool = false
+    /// `true` when the user explicitly changed the route (prevents echo from OS notification).
+    private var userExplicitlyChangedAudioRoute = false
+    private var isChangingAudioRoute = false
 
-    // MARK: - Caller Registry
-
+    // ─── Caller Registry ─────────────────────────────────────────────
+    /// Maps caller IDs to display names (persisted in UserDefaults).
     private var clients: [String: String] = [:]
-    private var defaultCaller: String = "Unknown Caller"
+    private var defaultCaller = "Unknown Caller"
 
-    // MARK: - Persistence Keys
+    // ─── Bluetooth Port Types ────────────────────────────────────────
+    /// All Bluetooth AVAudioSession port types in one place.
+    /// Used throughout the audio management code instead of repeating the check.
+    private static let bluetoothPorts: Set<AVAudioSession.Port> = [
+        .bluetoothHFP, .bluetoothA2DP, .bluetoothLE
+    ]
 
-    private let kCachedDeviceToken = "VonageCachedDeviceToken"
-    private let kCachedBindingDate = "VonageCachedBindingDate"
-    private let kClientList = "VonageContactList"
-    private let kCachedJwt = "VonageCachedJwt"
-    private let kCachedDeviceId = "VonageCachedDeviceId"
-    private let kDefaultCallKitIcon = "callkit_icon"
-
-    // MARK: - App Name
-
-    static var appName: String {
-        return (Bundle.main.infoDictionary?["CFBundleName"] as? String) ?? "Vonage Voice"
+    // ─── UserDefaults Keys ───────────────────────────────────────────
+    /// Centralised constants for all UserDefaults keys used by the plugin.
+    private enum Keys {
+        static let cachedDeviceToken = "VonageCachedDeviceToken"
+        static let clientList        = "VonageContactList"
+        static let cachedJwt         = "VonageCachedJwt"
+        static let cachedDeviceId    = "VonageCachedDeviceId"
+        static let defaultCallKitIcon = "callkit_icon"
     }
 
-    // MARK: - Init
+    // ─── App Name ────────────────────────────────────────────────────
+    static var appName: String {
+        (Bundle.main.infoDictionary?["CFBundleName"] as? String) ?? "Vonage Voice"
+    }
+
+
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - Initialisation
+    // ═════════════════════════════════════════════════════════════════
 
     public override init() {
-        voipRegistry = PKPushRegistry(queue: DispatchQueue.main)
+        // PushKit registry — receives VoIP pushes even when app is killed.
+        voipRegistry = PKPushRegistry(queue: .main)
 
-        let configuration = CXProviderConfiguration(localizedName: VonageVoicePlugin.appName)
-        configuration.maximumCallGroups = 1
-        configuration.maximumCallsPerCallGroup = 1
-        configuration.supportedHandleTypes = [.phoneNumber, .generic]
-        configuration.supportsVideo = false
+        // CallKit provider configuration — tells the system what our calls support.
+        let config = CXProviderConfiguration(localizedName: VonageVoicePlugin.appName)
+        config.maximumCallGroups = 1
+        config.maximumCallsPerCallGroup = 1
+        config.supportedHandleTypes = [.phoneNumber, .generic]
+        config.supportsVideo = false
 
-        clients = UserDefaults.standard.object(forKey: kClientList) as? [String: String] ?? [:]
-        callKitProvider = CXProvider(configuration: configuration)
+        // Restore persisted caller registry from disk.
+        clients = UserDefaults.standard.object(forKey: Keys.clientList) as? [String: String] ?? [:]
+
+        callKitProvider = CXProvider(configuration: config)
         callKitCallController = CXCallController()
 
         super.init()
 
+        // Set ourselves as the CXProvider delegate (incoming/outgoing call actions).
         callKitProvider.setDelegate(self, queue: nil)
 
-        // Initialize Vonage Voice Client
+        // Create the Vonage voice client and tell it CallKit manages audio.
         voiceClient = VGVoiceClient()
         voiceClient.delegate = self
 
-        // Tell the Vonage SDK that CallKit manages the audio session.
         // Without this, the SDK won't hook into CallKit's audio lifecycle.
         VGVoiceClient.isUsingCallKit = true
 
-        // Set default CallKit icon
-        let defaultIcon = UserDefaults.standard.string(forKey: kDefaultCallKitIcon) ?? kDefaultCallKitIcon
-        _ = updateCallKitIcon(icon: defaultIcon)
+        // Restore the CallKit icon (if one was set previously).
+        let iconName = UserDefaults.standard.string(forKey: Keys.defaultCallKitIcon) ?? Keys.defaultCallKitIcon
+        _ = updateCallKitIcon(icon: iconName)
 
-        // Listen for audio route changes
+        // Listen for hardware audio-route changes (e.g. headphones plugged in).
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAudioRouteChange),
@@ -154,15 +206,21 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         NotificationCenter.default.removeObserver(self)
     }
 
-    // MARK: - Plugin Registration
+
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - Flutter Plugin Registration
+    // ═════════════════════════════════════════════════════════════════
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let instance = VonageVoicePlugin()
 
+        // Method channel: receives commands from Flutter (e.g. answer, hangUp).
         let methodChannel = FlutterMethodChannel(
             name: "vonage_voice/messages",
             binaryMessenger: registrar.messenger()
         )
+
+        // Event channel: sends call events to Flutter (e.g. Connected, Call Ended).
         let eventChannel = FlutterEventChannel(
             name: "vonage_voice/events",
             binaryMessenger: registrar.messenger()
@@ -172,57 +230,61 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         registrar.addMethodCallDelegate(instance, channel: methodChannel)
         registrar.addApplicationDelegate(instance)
 
-        VonageVoicePlugin.sharedInstance = instance
+        sharedInstance = instance
 
-        // Set up PushKit for VoIP pushes.
-        // When a VoIP push arrives, Apple wakes the app and delivers it via
-        // PKPushRegistryDelegate. The plugin processes it through the Vonage SDK,
-        // which fires didReceiveInviteForCall, and we report to CallKit.
+        // Start listening for VoIP pushes.
         instance.voipRegistry.delegate = instance
         instance.voipRegistry.desiredPushTypes = [.voIP]
     }
 
-    // MARK: - FlutterStreamHandler
 
-    public func onListen(withArguments arguments: Any?, eventSink: @escaping FlutterEventSink) -> FlutterError? {
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - FlutterStreamHandler (EventChannel)
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Called when Flutter starts listening on the EventChannel.
+    public func onListen(withArguments arguments: Any?,
+                         eventSink: @escaping FlutterEventSink) -> FlutterError? {
         self.eventSink = eventSink
 
-        // Replay queued events
+        // Replay any events that were queued while Flutter wasn't listening.
         if !pendingEvents.isEmpty {
-            let eventsToReplay = pendingEvents
+            let queued = pendingEvents
             pendingEvents.removeAll()
-            for event in eventsToReplay {
-                DispatchQueue.main.async {
-                    eventSink(event)
-                }
+            for event in queued {
+                DispatchQueue.main.async { eventSink(event) }
             }
         }
-
         return nil
     }
 
+    /// Called when Flutter stops listening (e.g. app goes to background).
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
         eventSink = nil
         return nil
     }
 
-    // MARK: - Event Sending
 
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - Event Sending (Native → Flutter)
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Logs the event to NSLog and sends it to Flutter.
     private func sendPhoneCallEvents(description: String, isError: Bool = false) {
         NSLog("[VonageVoice] \(description)")
-
         if isError {
-            let err = FlutterError(code: "unavailable", message: description, details: nil)
-            sendEvent(err)
+            sendEvent(FlutterError(code: "unavailable", message: description, details: nil))
         } else {
             sendEvent(description)
         }
     }
 
+    /// Dispatches an event to Flutter, or queues it if Flutter isn't listening.
+    /// LOG events are never queued — only critical call-state events are preserved.
     private func sendEvent(_ event: Any) {
-        guard let eventSink = eventSink else {
-            // Queue critical call events for replay when Flutter reconnects
-            if let strEvent = event as? String, !strEvent.hasPrefix("LOG|") {
+        guard let sink = eventSink else {
+            // Only queue non-LOG events (critical call state changes).
+            if let str = event as? String, !str.hasPrefix("LOG|") {
                 if pendingEvents.count < VonageVoicePlugin.maxPendingEvents {
                     pendingEvents.append(event)
                 } else {
@@ -232,19 +294,21 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             }
             return
         }
-        DispatchQueue.main.async {
-            eventSink(event)
-        }
+        DispatchQueue.main.async { sink(event) }
     }
 
-    // MARK: - Method Channel Handler
 
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - Method Channel Router (Flutter → Native)
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Receives a command from Flutter and dispatches it to the correct handler.
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         let arguments = call.arguments as? [String: Any] ?? [:]
 
         switch call.method {
 
-        // Session
+        // ── Session ──────────────────────────────────────────────────
         case "tokens":
             handleTokens(arguments: arguments, result: result)
         case "unregister":
@@ -252,7 +316,7 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "refreshSession":
             handleRefreshSession(arguments: arguments, result: result)
 
-        // Calls
+        // ── Calls ────────────────────────────────────────────────────
         case "makeCall":
             handleMakeCall(arguments: arguments, result: result)
         case "hangUp":
@@ -268,25 +332,25 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 result(nil)
             }
 
-        // Hold
+        // ── Hold ─────────────────────────────────────────────────────
         case "holdCall":
             handleHoldCall(arguments: arguments, result: result)
         case "isHolding":
             result(isHolding)
 
-        // Mute
+        // ── Mute ─────────────────────────────────────────────────────
         case "toggleMute":
             handleToggleMute(arguments: arguments, result: result)
         case "isMuted":
             result(isMuted)
 
-        // Speaker
+        // ── Speaker ──────────────────────────────────────────────────
         case "toggleSpeaker":
             handleToggleSpeaker(arguments: arguments, result: result)
         case "isOnSpeaker":
             result(isSpeakerOn())
 
-        // Bluetooth
+        // ── Bluetooth ────────────────────────────────────────────────
         case "toggleBluetooth":
             handleToggleBluetooth(arguments: arguments, result: result)
         case "isBluetoothOn":
@@ -294,34 +358,31 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "isBluetoothAvailable":
             result(isBluetoothAvailable())
         case "isBluetoothEnabled":
-            // iOS doesn't expose BT adapter state directly — return true if BT audio is available
+            // iOS doesn't expose BT adapter state — return BT audio availability instead.
             result(isBluetoothAvailable())
         case "showBluetoothEnablePrompt":
-            // Not available on iOS
+            // Not available on iOS.
             result(false)
         case "openBluetoothSettings":
-            // Open iOS Settings app
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 UIApplication.shared.open(url, options: [:], completionHandler: nil)
             }
             result(true)
 
-        // DTMF
+        // ── DTMF ─────────────────────────────────────────────────────
         case "sendDigits":
             handleSendDigits(arguments: arguments, result: result)
 
-        // Permissions
+        // ── Permissions ──────────────────────────────────────────────
         case "hasMicPermission":
-            let permission = AVAudioSession.sharedInstance().recordPermission
-            result(permission == .granted)
+            result(AVAudioSession.sharedInstance().recordPermission == .granted)
         case "requestMicPermission":
             handleRequestMicPermission(result: result)
-        case "hasBluetoothPermission":
-            result(true)
-        case "requestBluetoothPermission":
+        case "hasBluetoothPermission", "requestBluetoothPermission":
+            // iOS doesn't require explicit Bluetooth permission for audio routing.
             result(true)
 
-        // Caller Registry
+        // ── Caller Registry ──────────────────────────────────────────
         case "registerClient":
             handleRegisterClient(arguments: arguments, result: result)
         case "unregisterClient":
@@ -329,35 +390,34 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "defaultCaller":
             handleDefaultCaller(arguments: arguments, result: result)
 
-        // Notifications
+        // ── Notifications ────────────────────────────────────────────
         case "showNotifications":
             let show = arguments["show"] as? Bool ?? true
             UserDefaults.standard.set(show, forKey: "vonage-show-notifications")
             result(true)
 
-        // CallKit Icon
+        // ── CallKit Icon ─────────────────────────────────────────────
         case "updateCallKitIcon":
-            let icon = arguments["icon"] as? String ?? kDefaultCallKitIcon
+            let icon = arguments["icon"] as? String ?? Keys.defaultCallKitIcon
             result(updateCallKitIcon(icon: icon))
 
-        // Push processing
+        // ── Push Processing ──────────────────────────────────────────
         case "processVonagePush":
             handleProcessPush(arguments: arguments, result: result)
 
-        // Telecom (Android-only, return defaults)
+        // ── Android-Only: return safe defaults ───────────────────────
+        // These methods exist on Android (Telecom, permissions, battery)
+        // but have no iOS equivalent. Return sensible defaults so the
+        // Dart side doesn't need platform checks.
         case "hasRegisteredPhoneAccount", "registerPhoneAccount",
              "isPhoneAccountEnabled", "openPhoneAccountSettings":
             result(true)
-
-        // Android-only permissions (return true)
         case "hasReadPhoneStatePermission", "requestReadPhoneStatePermission",
              "hasCallPhonePermission", "requestCallPhonePermission",
              "hasManageOwnCallsPermission", "requestManageOwnCallsPermission",
              "hasReadPhoneNumbersPermission", "requestReadPhoneNumbersPermission",
              "hasNotificationPermission", "requestNotificationPermission":
             result(true)
-
-        // Android-only settings (return defaults)
         case "rejectCallOnNoPermissions":
             result(true)
         case "isRejectingCallOnNoPermissions":
@@ -373,7 +433,7 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "backgroundCallUI":
             result(true)
 
-        // Platform version
+        // ── Platform Version ─────────────────────────────────────────
         case "getPlatformVersion":
             result("iOS " + UIDevice.current.systemVersion)
 
@@ -383,7 +443,19 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
 // MARK: - Session Management
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  Login flow:
+//    1. Flutter calls `tokens(jwt:)` → handleTokens()
+//    2. We store the JWT, create a Vonage session, register VoIP token.
+//
+//  Logout flow:
+//    1. Flutter calls `unregister()` → handleUnregister()
+//    2. We unregister the push token, delete the session, clear stored data.
+//
 
 extension VonageVoicePlugin {
 
@@ -393,15 +465,15 @@ extension VonageVoicePlugin {
             return
         }
 
-        self.accessToken = jwt
-        self.isSandbox = arguments["isSandbox"] as? Bool ?? false
+        accessToken = jwt
+        isSandbox = arguments["isSandbox"] as? Bool ?? false
         storeJwt(jwt)
 
-        // If session was already restored by PushKit (killed state), skip creation
+        // If PushKit already restored the session (killed-state), skip creation.
         if isSessionReady {
             sendPhoneCallEvents(description: "LOG|tokens: Session already ready (restored by PushKit), skipping createSession")
-            if let token = self.deviceToken {
-                self.registerPushToken(token)
+            if let token = deviceToken {
+                registerPushToken(token)
             }
             result(true)
             return
@@ -420,18 +492,16 @@ extension VonageVoicePlugin {
             self.isSessionReady = true
             self.sendPhoneCallEvents(description: "LOG|Session created successfully: \(sessionId ?? "nil")")
 
-            // Register VoIP push token if available
             if let token = self.deviceToken {
                 self.registerPushToken(token)
             }
-
             result(true)
         }
     }
 
     private func handleUnregister(arguments: [String: Any], result: @escaping FlutterResult) {
-        // Unregister push token
-        if let deviceId = self.deviceId {
+        // Unregister push token from Vonage.
+        if let deviceId = deviceId {
             voiceClient.unregisterDeviceTokens(byDeviceId: deviceId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
@@ -439,7 +509,7 @@ extension VonageVoicePlugin {
             }
         }
 
-        // Delete session
+        // Delete the Vonage session.
         voiceClient.deleteSession { [weak self] error in
             if let error = error {
                 self?.sendPhoneCallEvents(description: "LOG|deleteSession failed: \(error.localizedDescription)")
@@ -448,10 +518,11 @@ extension VonageVoicePlugin {
             }
         }
 
-        self.accessToken = nil
-        self.deviceId = nil
-        self.isSessionReady = false
-        UserDefaults.standard.removeObject(forKey: kCachedDeviceId)
+        // Clear all session state.
+        accessToken = nil
+        deviceId = nil
+        isSessionReady = false
+        UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
         clearStoredJwt()
         result(true)
     }
@@ -462,7 +533,7 @@ extension VonageVoicePlugin {
             return
         }
 
-        self.accessToken = jwt
+        accessToken = jwt
         storeJwt(jwt)
 
         voiceClient.refreshSession(jwt) { [weak self] error in
@@ -476,19 +547,20 @@ extension VonageVoicePlugin {
         }
     }
 
+    // ─── Push Token Registration ─────────────────────────────────────
+
+    /// Unregisters any old deviceId first (to free a device slot),
+    /// then registers the current token.
     private func registerPushToken(_ token: Data) {
-        // If we have a previously stored deviceId (from a prior session/install),
-        // unregister it first to free up a device slot on Vonage's side.
-        let storedDeviceId = UserDefaults.standard.string(forKey: kCachedDeviceId)
-        if let oldDeviceId = storedDeviceId, oldDeviceId != self.deviceId {
-            sendPhoneCallEvents(description: "LOG|Unregistering old deviceId before re-registering: \(oldDeviceId)")
-            voiceClient.unregisterDeviceTokens(byDeviceId: oldDeviceId) { [weak self] error in
+        let storedId = UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
+        if let oldId = storedId, oldId != deviceId {
+            sendPhoneCallEvents(description: "LOG|Unregistering old deviceId before re-registering: \(oldId)")
+            voiceClient.unregisterDeviceTokens(byDeviceId: oldId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|Old device unregister failed (non-fatal): \(error.localizedDescription)")
                 } else {
                     self?.sendPhoneCallEvents(description: "LOG|Old device unregistered successfully")
                 }
-                // Proceed with registration regardless of unregister result
                 self?.doRegisterVoipToken(token, isRetry: false)
             }
         } else {
@@ -496,84 +568,106 @@ extension VonageVoicePlugin {
         }
     }
 
+    /// Actually registers the VoIP token with Vonage.
+    /// If the first attempt fails with "max-device-limit", unregisters the old device and retries once.
     private func doRegisterVoipToken(_ token: Data, isRetry: Bool) {
         let hexToken = token.map { String(format: "%02x", $0) }.joined()
-        NSLog("[VonageVoice-Push] registerVoipToken sandbox=%d retry=%d tokenLen=%d hex=%@", isSandbox ? 1 : 0, isRetry ? 1 : 0, token.count, hexToken)
+        NSLog("[VonageVoice-Push] registerVoipToken sandbox=%d retry=%d tokenLen=%d hex=%@",
+              isSandbox ? 1 : 0, isRetry ? 1 : 0, token.count, hexToken)
         sendPhoneCallEvents(description: "LOG|Registering VoIP push token with Vonage (sandbox=\(isSandbox), retry=\(isRetry)) hex=\(hexToken)")
-        voiceClient.registerVoipToken(token, isSandbox: isSandbox) { [weak self] error, deviceId in
-            guard let self = self else { return }
-            if let error = error {
-                let errorDesc = error.localizedDescription
-                self.sendPhoneCallEvents(description: "LOG|registerVoipToken failed: \(errorDesc)")
 
-                // Handle max-device-limit: unregister stored device and retry once
-                if !isRetry && errorDesc.contains("max-device-limit") {
+        voiceClient.registerVoipToken(token, isSandbox: isSandbox) { [weak self] error, newDeviceId in
+            guard let self = self else { return }
+
+            if let error = error {
+                let desc = error.localizedDescription
+                self.sendPhoneCallEvents(description: "LOG|registerVoipToken failed: \(desc)")
+
+                // Auto-recover from max-device-limit by unregistering the old device and retrying.
+                if !isRetry && desc.contains("max-device-limit") {
                     self.sendPhoneCallEvents(description: "LOG|Max device limit reached — attempting to unregister stored device and retry")
-                    if let oldId = self.deviceId ?? UserDefaults.standard.string(forKey: self.kCachedDeviceId) {
+                    if let oldId = self.deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId) {
                         self.voiceClient.unregisterDeviceTokens(byDeviceId: oldId) { [weak self] unregError in
                             if let unregError = unregError {
                                 self?.sendPhoneCallEvents(description: "LOG|Unregister for retry failed: \(unregError.localizedDescription)")
                             }
-                            // Retry registration once
                             self?.doRegisterVoipToken(token, isRetry: true)
                         }
                     } else {
                         self.sendPhoneCallEvents(description: "LOG|No stored deviceId to unregister — cannot auto-recover from max-device-limit. Use Vonage REST API to clear old devices.")
                     }
                 }
-            } else {
-                self.deviceId = deviceId
-                // Persist deviceId so we can unregister it on next install/session
-                if let deviceId = deviceId {
-                    UserDefaults.standard.set(deviceId, forKey: self.kCachedDeviceId)
-                }
-                self.sendPhoneCallEvents(description: "LOG|VoIP push token registered. deviceId=\(deviceId ?? "nil")")
+                return
             }
+
+            // Success — persist the new deviceId.
+            self.deviceId = newDeviceId
+            if let id = newDeviceId {
+                UserDefaults.standard.set(id, forKey: Keys.cachedDeviceId)
+            }
+            self.sendPhoneCallEvents(description: "LOG|VoIP push token registered. deviceId=\(newDeviceId ?? "nil")")
         }
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
 // MARK: - Call Management
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  All call actions go through CallKit so iOS manages the call lifecycle:
+//    • makeCall   → CXStartCallAction  → provider(perform:startCall)
+//    • answer     → CXAnswerCallAction → provider(perform:answerCall)
+//    • hangUp     → CXEndCallAction    → provider(perform:endCall)
+//
 
 extension VonageVoicePlugin {
+
+    // ─── Outgoing Call ───────────────────────────────────────────────
 
     private func handleMakeCall(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let to = arguments["to"] as? String else {
             result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing 'to' parameter", details: nil))
             return
         }
+
         let from = arguments["from"] as? String ?? identity
         let callerName = arguments["CallerName"] as? String ?? ""
 
-        self.callArgs = arguments
-        self.callOutgoing = true
-        self.callTo = to
-        self.identity = from
-        self.outgoingCallerName = callerName
+        callArgs = arguments
+        callOutgoing = true
+        callTo = to
+        identity = from
+        outgoingCallerName = callerName
 
-        // Check for pending incoming call
+        // Can't make a call while there's a pending incoming call.
         if !callInvites.isEmpty {
             sendPhoneCallEvents(description: "LOG|Cannot make call - pending incoming call exists")
             result(FlutterError(code: "CALL_IN_PROGRESS", message: "Cannot make call while there's a pending incoming call", details: nil))
             return
         }
 
-        let uuid = UUID()
-        performStartCallAction(uuid: uuid, handle: to)
+        performStartCallAction(uuid: UUID(), handle: to)
         result(true)
     }
 
+    // ─── Hang Up ─────────────────────────────────────────────────────
+
     private func handleHangUp(result: @escaping FlutterResult) {
         if let uuid = activeCallUUID, activeCalls[uuid] != nil {
+            // End an active (answered) call.
             sendPhoneCallEvents(description: "LOG|hangUp: ending active call uuid=\(uuid)")
             userInitiatedDisconnect = true
             performEndCallAction(uuid: uuid)
         } else if let (uuid, _) = callInvites.first {
+            // Reject a pending incoming invite.
             sendPhoneCallEvents(description: "LOG|hangUp: rejecting pending invite uuid=\(uuid)")
             performEndCallAction(uuid: uuid)
         }
         result(true)
     }
+
+    // ─── Answer ──────────────────────────────────────────────────────
 
     private func handleAnswer(result: @escaping FlutterResult) {
         if let (uuid, _) = callInvites.first {
@@ -592,20 +686,19 @@ extension VonageVoicePlugin {
         result(true)
     }
 
-    private func handleHoldCall(arguments: [String: Any], result: @escaping FlutterResult) {
-        guard let shouldHold = arguments["shouldHold"] as? Bool else {
-            result(false)
-            return
-        }
+    // ─── Hold ────────────────────────────────────────────────────────
 
-        guard let uuid = activeCallUUID, let callId = activeCalls[uuid] else {
+    private func handleHoldCall(arguments: [String: Any], result: @escaping FlutterResult) {
+        guard let shouldHold = arguments["shouldHold"] as? Bool,
+              let uuid = activeCallUUID,
+              let callId = activeCalls[uuid] else {
             result(false)
             return
         }
 
         if shouldHold && !isHolding {
             isHolding = true
-            // Vonage SDK doesn't have a native hold — mute audio as hold behavior
+            // Vonage SDK doesn't have a native hold — mute audio as hold behavior.
             voiceClient.mute(callId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|Hold (mute) failed: \(error.localizedDescription)")
@@ -623,6 +716,8 @@ extension VonageVoicePlugin {
         }
         result(true)
     }
+
+    // ─── Mute ────────────────────────────────────────────────────────
 
     private func handleToggleMute(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let muted = arguments["muted"] as? Bool else {
@@ -657,17 +752,15 @@ extension VonageVoicePlugin {
         result(true)
     }
 
+    // ─── DTMF ────────────────────────────────────────────────────────
+
     private func handleSendDigits(arguments: [String: Any], result: @escaping FlutterResult) {
-        guard let digits = arguments["digits"] as? String else {
+        guard let digits = arguments["digits"] as? String,
+              let uuid = activeCallUUID,
+              let callId = activeCalls[uuid] else {
             result(false)
             return
         }
-
-        guard let uuid = activeCallUUID, let callId = activeCalls[uuid] else {
-            result(false)
-            return
-        }
-
         voiceClient.sendDTMF(callId, withDigits: digits) { [weak self] error in
             if let error = error {
                 self?.sendPhoneCallEvents(description: "LOG|sendDTMF failed: \(error.localizedDescription)")
@@ -676,15 +769,14 @@ extension VonageVoicePlugin {
         result(true)
     }
 
+    // ─── Push Processing ─────────────────────────────────────────────
+
     private func handleProcessPush(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let data = arguments["data"] as? [String: Any] else {
             result(nil)
             return
         }
-
-        // Check if it's a Vonage push using the static method
-        let pushType = VGBaseClient.vonagePushType(data)
-        if pushType == .incomingCall {
+        if VGBaseClient.vonagePushType(data) == .incomingCall {
             voiceClient.processCallInvitePushData(data)
             result("processed")
         } else {
@@ -693,9 +785,19 @@ extension VonageVoicePlugin {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
 // MARK: - Audio Management
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  iOS audio routing uses AVAudioSession.
+//  CallKit owns the audio session lifecycle — we only override the
+//  output port or set a preferred input *after* CallKit activates it.
+//
 
 extension VonageVoicePlugin {
+
+    // ─── Flutter Method Handlers ─────────────────────────────────────
 
     private func handleToggleSpeaker(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let speakerOn = arguments["speakerIsOn"] as? Bool else {
@@ -704,9 +806,7 @@ extension VonageVoicePlugin {
         }
 
         desiredSpeakerState = speakerOn
-        if speakerOn {
-            desiredBluetoothState = false
-        }
+        if speakerOn { desiredBluetoothState = false }
         userExplicitlyChangedAudioRoute = true
         applySpeakerSetting(toSpeaker: speakerOn)
         result(true)
@@ -729,23 +829,18 @@ extension VonageVoicePlugin {
         result(true)
     }
 
+    // ─── Speaker ─────────────────────────────────────────────────────
+
     private func applySpeakerSetting(toSpeaker: Bool) {
-        let audioSession = AVAudioSession.sharedInstance()
+        let session = AVAudioSession.sharedInstance()
         do {
             if toSpeaker {
-                try audioSession.overrideOutputAudioPort(.speaker)
+                try session.overrideOutputAudioPort(.speaker)
                 sendPhoneCallEvents(description: "Speaker On")
             } else {
-                try audioSession.overrideOutputAudioPort(.none)
-                // Set built-in mic as preferred input to route to earpiece
-                if let availableInputs = audioSession.availableInputs {
-                    for input in availableInputs {
-                        if input.portType == .builtInMic {
-                            try audioSession.setPreferredInput(input)
-                            break
-                        }
-                    }
-                }
+                try session.overrideOutputAudioPort(.none)
+                // Route to earpiece by selecting the built-in mic as preferred input.
+                try setPreferredInput(portType: .builtInMic)
                 sendPhoneCallEvents(description: "Speaker Off")
             }
         } catch {
@@ -753,37 +848,23 @@ extension VonageVoicePlugin {
         }
     }
 
+    // ─── Bluetooth ───────────────────────────────────────────────────
+
     private func toggleBluetoothAudio(bluetoothOn: Bool) {
-        let audioSession = AVAudioSession.sharedInstance()
+        let session = AVAudioSession.sharedInstance()
         do {
             if bluetoothOn {
-                try audioSession.setCategory(.playAndRecord, mode: .voiceChat,
-                                            options: [.allowBluetooth, .allowBluetoothA2DP])
-                // Find and set Bluetooth input
-                if let availableInputs = audioSession.availableInputs {
-                    for input in availableInputs {
-                        if input.portType == .bluetoothHFP ||
-                           input.portType == .bluetoothA2DP ||
-                           input.portType == .bluetoothLE {
-                            try audioSession.setPreferredInput(input)
-                            break
-                        }
-                    }
-                }
-                try audioSession.overrideOutputAudioPort(.none)
+                try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                        options: [.allowBluetooth, .allowBluetoothA2DP])
+                // Find and select the first available Bluetooth input.
+                try setPreferredInput(portTypes: Self.bluetoothPorts)
+                try session.overrideOutputAudioPort(.none)
                 sendPhoneCallEvents(description: "Bluetooth On")
             } else {
-                // Route to earpiece
-                try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [])
-                if let availableInputs = audioSession.availableInputs {
-                    for input in availableInputs {
-                        if input.portType == .builtInMic {
-                            try audioSession.setPreferredInput(input)
-                            break
-                        }
-                    }
-                }
-                try audioSession.overrideOutputAudioPort(.none)
+                // Route back to earpiece.
+                try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+                try setPreferredInput(portType: .builtInMic)
+                try session.overrideOutputAudioPort(.none)
                 sendPhoneCallEvents(description: "Bluetooth Off")
             }
         } catch {
@@ -791,85 +872,38 @@ extension VonageVoicePlugin {
         }
     }
 
+    // ─── Audio Route Queries ─────────────────────────────────────────
+
     private func isSpeakerOn() -> Bool {
-        let currentRoute = AVAudioSession.sharedInstance().currentRoute
-        for output in currentRoute.outputs {
-            if output.portType == .builtInSpeaker {
-                return true
-            }
-        }
-        return false
+        AVAudioSession.sharedInstance().currentRoute.outputs
+            .contains { $0.portType == .builtInSpeaker }
     }
 
     private func isBluetoothOn() -> Bool {
-        let currentRoute = AVAudioSession.sharedInstance().currentRoute
-        for output in currentRoute.outputs {
-            if output.portType == .bluetoothHFP ||
-               output.portType == .bluetoothA2DP ||
-               output.portType == .bluetoothLE {
-                return true
-            }
-        }
-        return false
+        AVAudioSession.sharedInstance().currentRoute.outputs
+            .contains { Self.bluetoothPorts.contains($0.portType) }
     }
 
     private func isBluetoothAvailable() -> Bool {
-        let audioSession = AVAudioSession.sharedInstance()
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute
 
-        // Check current route first
-        let currentRoute = audioSession.currentRoute
-        for output in currentRoute.outputs {
-            if output.portType == .bluetoothHFP ||
-               output.portType == .bluetoothA2DP ||
-               output.portType == .bluetoothLE {
-                return true
-            }
-        }
-        for input in currentRoute.inputs {
-            if input.portType == .bluetoothHFP ||
-               input.portType == .bluetoothA2DP ||
-               input.portType == .bluetoothLE {
-                return true
-            }
-        }
+        // Check current outputs and inputs.
+        if route.outputs.contains(where: { Self.bluetoothPorts.contains($0.portType) }) { return true }
+        if route.inputs.contains(where: { Self.bluetoothPorts.contains($0.portType) }) { return true }
 
-        // Check available inputs
-        if let availableInputs = audioSession.availableInputs {
-            for input in availableInputs {
-                if input.portType == .bluetoothHFP ||
-                   input.portType == .bluetoothA2DP ||
-                   input.portType == .bluetoothLE {
-                    return true
-                }
-            }
-        }
+        // Check available inputs (paired but not currently active).
+        if let inputs = session.availableInputs,
+           inputs.contains(where: { Self.bluetoothPorts.contains($0.portType) }) { return true }
 
         return false
     }
 
-    @objc private func handleAudioRouteChange(notification: Notification) {
-        guard !isChangingAudioRoute else { return }
-        guard !userExplicitlyChangedAudioRoute else {
-            userExplicitlyChangedAudioRoute = false
-            return
-        }
-
-        // Only send audio route events when there are active calls
-        guard !activeCalls.isEmpty else { return }
-
-        let currentRoute = getAudioRoute()
-        let btAvailable = isBluetoothAvailable()
-
-        sendPhoneCallEvents(description: "AudioRoute|\(currentRoute)|bluetoothAvailable=\(btAvailable)")
-    }
-
+    /// Returns the current audio route as a human-readable string.
     private func getAudioRoute() -> String {
-        let audioSession = AVAudioSession.sharedInstance()
-        let currentRoute = audioSession.currentRoute
-
-        for output in currentRoute.outputs {
+        for output in AVAudioSession.sharedInstance().currentRoute.outputs {
             switch output.portType {
-            case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
+            case _ where Self.bluetoothPorts.contains(output.portType):
                 return "bluetooth"
             case .builtInSpeaker:
                 return "speaker"
@@ -879,17 +913,53 @@ extension VonageVoicePlugin {
                 break
             }
         }
-
-        // Fallback: check desired state
+        // Fallback: check desired state.
         if desiredSpeakerState { return "speaker" }
         if desiredBluetoothState { return "bluetooth" }
         return "earpiece"
     }
+
+    // ─── OS Audio Route Change Notification ──────────────────────────
+
+    @objc private func handleAudioRouteChange(notification: Notification) {
+        guard !isChangingAudioRoute else { return }
+        guard !userExplicitlyChangedAudioRoute else {
+            userExplicitlyChangedAudioRoute = false
+            return
+        }
+        // Only send audio route events when there are active calls.
+        guard !activeCalls.isEmpty else { return }
+
+        sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+    }
+
+    // ─── Audio Input Helpers ─────────────────────────────────────────
+
+    /// Finds the first available input matching `portType` and sets it as preferred.
+    private func setPreferredInput(portType: AVAudioSession.Port) throws {
+        guard let inputs = AVAudioSession.sharedInstance().availableInputs else { return }
+        if let match = inputs.first(where: { $0.portType == portType }) {
+            try AVAudioSession.sharedInstance().setPreferredInput(match)
+        }
+    }
+
+    /// Finds the first available input matching any of `portTypes` and sets it as preferred.
+    private func setPreferredInput(portTypes: Set<AVAudioSession.Port>) throws {
+        guard let inputs = AVAudioSession.sharedInstance().availableInputs else { return }
+        if let match = inputs.first(where: { portTypes.contains($0.portType) }) {
+            try AVAudioSession.sharedInstance().setPreferredInput(match)
+        }
+    }
 }
 
-// MARK: - Permissions
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - Permissions, Caller Registry & Utilities
+// ═══════════════════════════════════════════════════════════════════════
 
 extension VonageVoicePlugin {
+
+    // ─── Permissions ─────────────────────────────────────────────────
 
     private func handleRequestMicPermission(result: @escaping FlutterResult) {
         switch AVAudioSession.sharedInstance().recordPermission {
@@ -905,11 +975,10 @@ extension VonageVoicePlugin {
             result(false)
         }
     }
-}
 
-// MARK: - Caller Registry
-
-extension VonageVoicePlugin {
+    // ─── Caller Registry ─────────────────────────────────────────────
+    // Maps Vonage user IDs to human-readable display names.
+    // Used to show "John Smith" instead of "user-abc-123" on the CallKit UI.
 
     private func handleRegisterClient(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let clientId = arguments["id"] as? String,
@@ -919,7 +988,7 @@ extension VonageVoicePlugin {
         }
         if clients[clientId] == nil || clients[clientId] != clientName {
             clients[clientId] = clientName
-            UserDefaults.standard.set(clients, forKey: kClientList)
+            UserDefaults.standard.set(clients, forKey: Keys.clientList)
         }
         result(true)
     }
@@ -930,7 +999,7 @@ extension VonageVoicePlugin {
             return
         }
         clients.removeValue(forKey: clientId)
-        UserDefaults.standard.set(clients, forKey: kClientList)
+        UserDefaults.standard.set(clients, forKey: Keys.clientList)
         result(true)
     }
 
@@ -942,49 +1011,55 @@ extension VonageVoicePlugin {
         defaultCaller = caller
         if clients["defaultCaller"] == nil || clients["defaultCaller"] != defaultCaller {
             clients["defaultCaller"] = defaultCaller
-            UserDefaults.standard.set(clients, forKey: kClientList)
+            UserDefaults.standard.set(clients, forKey: Keys.clientList)
         }
         result(true)
     }
-}
 
-// MARK: - CallKit Icon
-
-extension VonageVoicePlugin {
+    // ─── CallKit Icon ────────────────────────────────────────────────
 
     private func updateCallKitIcon(icon: String) -> Bool {
         guard let newIcon = UIImage(named: icon) else { return false }
-
         let configuration = callKitProvider.configuration
         configuration.iconTemplateImageData = newIcon.pngData()
         callKitProvider.configuration = configuration
-        UserDefaults.standard.set(icon, forKey: kDefaultCallKitIcon)
+        UserDefaults.standard.set(icon, forKey: Keys.defaultCallKitIcon)
         return true
     }
-}
 
-// MARK: - JWT Persistence
-
-extension VonageVoicePlugin {
+    // ─── JWT Persistence ─────────────────────────────────────────────
+    // The JWT is stored in UserDefaults so that when the app is killed
+    // and a VoIP push wakes it, we can restore the Vonage session
+    // without needing Flutter to provide the token again.
 
     private func storeJwt(_ jwt: String) {
-        UserDefaults.standard.set(jwt, forKey: kCachedJwt)
+        UserDefaults.standard.set(jwt, forKey: Keys.cachedJwt)
     }
 
     private func getStoredJwt() -> String? {
-        return UserDefaults.standard.string(forKey: kCachedJwt)
+        UserDefaults.standard.string(forKey: Keys.cachedJwt)
     }
 
     private func clearStoredJwt() {
-        UserDefaults.standard.removeObject(forKey: kCachedJwt)
+        UserDefaults.standard.removeObject(forKey: Keys.cachedJwt)
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
 // MARK: - Killed-State Push Helpers
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  When the app is killed and a VoIP push arrives:
+//    1. We report to CallKit immediately (with a placeholder caller name)
+//    2. We restore the Vonage session from stored JWT
+//    3. didReceiveInviteForCall fires → we update the real caller info
+//    4. If the user already tapped Answer/Decline, we fulfil that action
+//
 
 extension VonageVoicePlugin {
 
-    /// Clean up all pending push coordination state.
+    /// Cleans up all pending push coordination state.
     private func cleanupPushState() {
         pushCompletionTimer?.invalidate()
         pushCompletionTimer = nil
@@ -994,33 +1069,31 @@ extension VonageVoicePlugin {
         pendingEndAction = nil
     }
 
-    /// Called when the push completion safety timer fires (didReceiveInviteForCall never came).
-    private func handlePushTimeout() {
-        guard let pushUUID = pendingPushUUID else { return }
-        sendPhoneCallEvents(description: "LOG|Push completion timeout — ending pre-reported call")
-        callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .failed)
-        callDisconnected(uuid: pushUUID)
-        sendPhoneCallEvents(description: "Missed Call")
-        pendingPushCompletion?()
-        cleanupPushState()
-    }
-
-    /// Called when session restore fails in killed state.
-    private func handleSessionRestoreFailure() {
-        guard let pushUUID = pendingPushUUID else { return }
-        sendPhoneCallEvents(description: "LOG|Session restore failed — ending pre-reported call")
-        callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .failed)
-        callDisconnected(uuid: pushUUID)
+    /// Ends the pre-reported call when something goes wrong (timeout or session restore failure).
+    /// Called by both the safety timer and the session-restore error handler.
+    private func endPreReportedCall(reason: String) {
+        guard let uuid = pendingPushUUID else { return }
+        sendPhoneCallEvents(description: "LOG|\(reason)")
+        callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+        callDisconnected(uuid: uuid)
         sendPhoneCallEvents(description: "Missed Call")
         pendingPushCompletion?()
         cleanupPushState()
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
 // MARK: - CallKit Actions
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  These are internal helpers that request CallKit actions.
+//  The actual handling happens in the CXProviderDelegate methods below.
+//
 
 extension VonageVoicePlugin {
 
+    /// Requests CallKit to start an outgoing call.
     private func performStartCallAction(uuid: UUID, handle: String) {
         let callHandle = CXHandle(type: .generic, value: handle)
         let startCallAction = CXStartCallAction(call: uuid, handle: callHandle)
@@ -1035,6 +1108,7 @@ extension VonageVoicePlugin {
 
             self.sendPhoneCallEvents(description: "LOG|StartCallAction successful")
 
+            // Update the CallKit UI with caller name.
             let callUpdate = CXCallUpdate()
             callUpdate.remoteHandle = callHandle
             callUpdate.localizedCallerName = self.outgoingCallerName.isEmpty ? handle : self.outgoingCallerName
@@ -1048,6 +1122,7 @@ extension VonageVoicePlugin {
         }
     }
 
+    /// Reports a new incoming call to CallKit.
     private func reportIncomingCall(from: String, uuid: UUID, completion: ((Error?) -> Void)? = nil) {
         let callHandle = CXHandle(type: .generic, value: from)
 
@@ -1070,6 +1145,7 @@ extension VonageVoicePlugin {
         }
     }
 
+    /// Requests CallKit to end a call.
     private func performEndCallAction(uuid: UUID) {
         let endCallAction = CXEndCallAction(call: uuid)
         let transaction = CXTransaction(action: endCallAction)
@@ -1081,12 +1157,12 @@ extension VonageVoicePlugin {
         }
     }
 
+    /// Resets all state associated with a call after it disconnects.
     private func callDisconnected(uuid: UUID) {
         let callId = activeCalls[uuid]
         activeCalls.removeValue(forKey: uuid)
         callInvites.removeValue(forKey: uuid)
 
-        // Remove from callId -> UUID mapping
         if let callId = callId {
             callIdToUUID.removeValue(forKey: callId)
         }
@@ -1095,7 +1171,7 @@ extension VonageVoicePlugin {
             activeCallUUID = nil
         }
 
-        // Reset state when all calls end
+        // Reset all per-call state when no calls remain.
         if activeCalls.isEmpty && callInvites.isEmpty {
             callOutgoing = false
             userInitiatedDisconnect = false
@@ -1108,13 +1184,20 @@ extension VonageVoicePlugin {
     }
 }
 
-// MARK: - CXProviderDelegate
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - CXProviderDelegate (CallKit Callbacks)
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  These methods are called by iOS whenever the user interacts with
+//  the native call UI (answer, decline, hold, mute, etc.).
+//
 
 extension VonageVoicePlugin: CXProviderDelegate {
 
+    /// Called when CallKit resets (e.g. all calls dropped).
     public func providerDidReset(_ provider: CXProvider) {
         sendPhoneCallEvents(description: "LOG|providerDidReset")
-        // Clean up all calls
         activeCalls.removeAll()
         callInvites.removeAll()
         callIdToUUID.removeAll()
@@ -1127,24 +1210,26 @@ extension VonageVoicePlugin: CXProviderDelegate {
         sendPhoneCallEvents(description: "LOG|providerDidBegin")
     }
 
+    // ─── Audio Session Lifecycle ─────────────────────────────────────
+
+    /// CallKit activated the audio session — hook Vonage into it.
     public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         sendPhoneCallEvents(description: "LOG|provider:didActivateAudioSession")
 
-        // CRITICAL: Tell the Vonage SDK to start audio.
+        // CRITICAL: Without this call, the call connects but no audio flows.
         // This hooks WebRTC into the CallKit-managed audio session.
-        // Without this call, the call connects but no audio flows.
         VGVoiceClient.enableAudio(audioSession)
 
-        // Configure audio session for voice call
+        // Configure audio session for voice call.
         do {
             try audioSession.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.allowBluetooth, .allowBluetoothA2DP])
+                                         options: [.allowBluetooth, .allowBluetoothA2DP])
             try audioSession.setActive(true)
         } catch {
             sendPhoneCallEvents(description: "LOG|Audio session configuration failed: \(error.localizedDescription)")
         }
 
-        // Apply initial audio route
+        // Apply the user's preferred audio route.
         if desiredSpeakerState {
             applySpeakerSetting(toSpeaker: true)
         } else if isBluetoothAvailable() {
@@ -1153,36 +1238,32 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
     }
 
+    /// CallKit deactivated the audio session — unhook Vonage.
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         sendPhoneCallEvents(description: "LOG|provider:didDeactivateAudioSession")
-
         // Tell the Vonage SDK to stop audio when CallKit deactivates the session.
         VGVoiceClient.disableAudio(audioSession)
     }
 
+    /// An action timed out. We do NOT fulfil it here — the actual async
+    /// callback will fulfil or fail the action when it completes.
     public func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
         sendPhoneCallEvents(description: "LOG|provider:timedOutPerformingAction \(type(of: action))")
-        // Do NOT fulfill here — the actual async callback (answer/start/end)
-        // will fulfill or fail when it completes. Fulfilling prematurely can
-        // cause undefined behavior if the callback later calls fail().
     }
 
-    // MARK: Start Call
+    // ─── Start Call (Outgoing) ───────────────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performStartCallAction")
 
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
 
-        // Build call context from stored arguments
+        // Build call context from stored arguments (exclude "from" — Vonage infers it from JWT).
         var context: [String: String] = [:]
-        for (key, value) in callArgs {
-            if key != "from" {
-                context[key] = "\(value)"
-            }
+        for (key, value) in callArgs where key != "from" {
+            context[key] = "\(value)"
         }
 
-        // Send Ringing event
         let from = identity
         let to = callTo
         sendPhoneCallEvents(description: "Ringing|\(from)|\(to)|Outgoing")
@@ -1216,7 +1297,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
     }
 
-    // MARK: Answer Call
+    // ─── Answer Call (Incoming) ──────────────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performAnswerCallAction uuid=\(action.callUUID)")
@@ -1227,13 +1308,15 @@ extension VonageVoicePlugin: CXProviderDelegate {
             return
         }
 
-        // KILLED STATE: callId not yet available — queue the action for later
+        // KILLED STATE: The callId isn't available yet (session still restoring).
+        // Queue the action — it will be fulfilled in didReceiveInviteForCall.
         if invite.callId.isEmpty {
             sendPhoneCallEvents(description: "LOG|Deferring answer — waiting for callId (killed state)")
             pendingAnswerAction = action
             return
         }
 
+        // Normal path — answer immediately.
         voiceClient.answer(invite.callId) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
@@ -1244,7 +1327,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
 
             self.sendPhoneCallEvents(description: "LOG|Call answered successfully callId=\(invite.callId)")
 
-            // Move from invites to active calls
+            // Move from invites to active calls.
             self.activeCalls[action.callUUID] = invite.callId
             self.callIdToUUID[invite.callId] = action.callUUID
             self.activeCallUUID = action.callUUID
@@ -1253,7 +1336,6 @@ extension VonageVoicePlugin: CXProviderDelegate {
 
             let from = invite.from
             let to = invite.to
-
             self.sendPhoneCallEvents(description: "Answer|\(from)|\(to)|Incoming")
             self.sendPhoneCallEvents(description: "Connected|\(from)|\(to)|Incoming")
 
@@ -1262,15 +1344,15 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
     }
 
-    // MARK: End Call
+    // ─── End Call ────────────────────────────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performEndCallAction uuid=\(action.callUUID)")
 
-        // Check if it's a pending invite — reject it
         if let invite = callInvites[action.callUUID] {
-            // KILLED STATE: callId not yet available — queue the action for later
+            // Pending invite — reject it.
             if invite.callId.isEmpty {
+                // KILLED STATE: callId not available yet — defer.
                 sendPhoneCallEvents(description: "LOG|Deferring decline — waiting for callId (killed state)")
                 pendingEndAction = action
                 return
@@ -1286,8 +1368,9 @@ extension VonageVoicePlugin: CXProviderDelegate {
             callIdToUUID.removeValue(forKey: invite.callId)
             callDisconnected(uuid: action.callUUID)
             sendPhoneCallEvents(description: "Declined")
+
         } else if let callId = activeCalls[action.callUUID] {
-            // Active call — hang up
+            // Active call — hang up.
             sendPhoneCallEvents(description: "LOG|Hanging up active call callId=\(callId)")
             voiceClient.hangup(callId) { [weak self] error in
                 if let error = error {
@@ -1296,6 +1379,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
             }
             callDisconnected(uuid: action.callUUID)
             sendPhoneCallEvents(description: "Call Ended")
+
         } else {
             callDisconnected(uuid: action.callUUID)
         }
@@ -1303,7 +1387,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
         action.fulfill()
     }
 
-    // MARK: Hold Call
+    // ─── Hold / Mute (from native CallKit UI) ───────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performSetHeldAction uuid=\(action.callUUID) isOnHold=\(action.isOnHold)")
@@ -1325,8 +1409,6 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
     }
 
-    // MARK: Mute Call
-
     public func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performSetMutedAction uuid=\(action.callUUID) isMuted=\(action.isMuted)")
 
@@ -1346,10 +1428,25 @@ extension VonageVoicePlugin: CXProviderDelegate {
     }
 }
 
-// MARK: - PKPushRegistryDelegate
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - PKPushRegistryDelegate (VoIP Pushes)
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  PushKit delivers VoIP pushes even when the app is killed.
+//  Apple REQUIRES that every VoIP push results in a reportNewIncomingCall
+//  call — otherwise the app gets terminated permanently.
+//
+//  Three scenarios:
+//    1. FOREGROUND/BACKGROUND — Session exists → process push normally.
+//    2. KILLED STATE — No session → report to CallKit immediately,
+//       then restore session from stored JWT in the background.
+//    3. LOGGED OUT — No session, no JWT → report dummy call and end it.
+//
 
 extension VonageVoicePlugin: PKPushRegistryDelegate {
 
+    /// Called when PushKit gives us a new VoIP token.
     public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
         NSLog("[VonageVoice-Push] didUpdatePushCredentials type=%@", String(describing: type))
         sendPhoneCallEvents(description: "LOG|pushRegistry:didUpdatePushCredentials")
@@ -1357,24 +1454,24 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         guard type == .voIP else { return }
 
         let token = pushCredentials.token
-        self.deviceToken = token
+        deviceToken = token
 
         let hexToken = token.map { String(format: "%02x", $0) }.joined()
         NSLog("[VonageVoice-Push] VoIP token (%d bytes): %@", token.count, hexToken)
         sendPhoneCallEvents(description: "LOG|VoIP push token received (\(token.count) bytes) hex=\(hexToken)")
 
-        // If we already have an access token, register the push token
         if accessToken != nil {
             registerPushToken(token)
         }
     }
 
+    /// Called when the VoIP push token is invalidated.
     public func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
         sendPhoneCallEvents(description: "LOG|pushRegistry:didInvalidatePushTokenForType")
 
         guard type == .voIP else { return }
 
-        if let deviceId = self.deviceId {
+        if let deviceId = deviceId {
             voiceClient.unregisterDeviceTokens(byDeviceId: deviceId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
@@ -1383,199 +1480,155 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         }
     }
 
+    // ─── Incoming VoIP Push (iOS 13+) ────────────────────────────────
+
     public func pushRegistry(_ registry: PKPushRegistry,
-                            didReceiveIncomingPushWith payload: PKPushPayload,
-                            for type: PKPushType,
-                            completion: @escaping () -> Void) {
+                             didReceiveIncomingPushWith payload: PKPushPayload,
+                             for type: PKPushType,
+                             completion: @escaping () -> Void) {
         NSLog("[VonageVoice-Push] *** didReceiveIncomingPush *** type=%@", String(describing: type))
-        NSLog("[VonageVoice-Push] Push payload keys: %@", payload.dictionaryPayload.keys.map { String(describing: $0) }.joined(separator: ", "))
+        NSLog("[VonageVoice-Push] Push payload keys: %@",
+              payload.dictionaryPayload.keys.map { String(describing: $0) }.joined(separator: ", "))
         sendPhoneCallEvents(description: "LOG|pushRegistry:didReceiveIncomingPush")
 
-        guard type == .voIP else {
-            completion()
-            return
-        }
+        guard type == .voIP else { completion(); return }
 
-        // MUST report the incoming call to CallKit before returning from this method.
         // Apple kills the app if a VoIP push doesn't result in a reportNewIncomingCall.
-
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
         NSLog("[VonageVoice-Push] Vonage push type: %@", String(describing: pushType))
 
+        // ── Not a Vonage call push → report dummy and end ────────────
         guard pushType == .incomingCall else {
-            // Not a Vonage call push — report dummy call and end it to satisfy PushKit
-            let uuid = UUID()
-            reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
-                self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
-                completion()
-            }
+            reportDummyCallAndEnd(completion: completion)
             return
         }
 
-        // ── KILLED / TERMINATED STATE ──
-        // No active session — restore from stored JWT.
-        // Report to CallKit IMMEDIATELY (before async session restore) so Apple
-        // doesn't kill the app, and the user sees the incoming-call UI right away.
+        // ── KILLED STATE: No session → restore from stored JWT ───────
         if accessToken == nil, let storedJwt = getStoredJwt() {
-            sendPhoneCallEvents(description: "LOG|KILLED STATE: Restoring session from stored JWT")
-
-            let uuid = UUID()
-            let callerName = defaultCaller
-
-            // Pre-report to CallKit immediately
-            pendingPushUUID = uuid
-            pendingPushCompletion = completion
-
-            // Create a placeholder invite (callId filled in by didReceiveInviteForCall)
-            let invite = CallInviteInfo(callId: "", from: "", to: identity)
-            callInvites[uuid] = invite
-
-            reportIncomingCall(from: callerName, uuid: uuid)
-
-            // Safety timeout: end the call if didReceiveInviteForCall never fires
-            pushCompletionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
-                self?.handlePushTimeout()
-            }
-
-            // Restore session in background
-            accessToken = storedJwt
-            voiceClient.createSession(storedJwt) { [weak self] error, sessionId in
-                guard let self = self else { return }
-                if let error = error {
-                    self.sendPhoneCallEvents(description: "LOG|Session restore failed: \(error.localizedDescription)")
-                    self.handleSessionRestoreFailure()
-                    return
-                }
-
-                self.isSessionReady = true
-                self.sendPhoneCallEvents(description: "LOG|Session restored successfully, processing push")
-                // This triggers didReceiveInviteForCall synchronously
-                self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
-                // completion() is called from didReceiveInviteForCall via pendingPushCompletion
-            }
+            handleKilledStatePush(payload: payload, storedJwt: storedJwt, completion: completion)
             return
         }
 
-        // ── NO SESSION, NO STORED JWT ──
-        // Cannot process — user logged out or JWT was cleared.
-        // Report dummy call and end it to satisfy PushKit requirement.
+        // ── LOGGED OUT: No session, no JWT ───────────────────────────
         if accessToken == nil {
             sendPhoneCallEvents(description: "LOG|No session and no stored JWT — cannot process push")
-            let uuid = UUID()
-            reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
-                self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
-                completion()
-            }
+            reportDummyCallAndEnd(completion: completion)
             return
         }
 
-        // ── FOREGROUND / BACKGROUND STATE ──
-        // Session exists — process push normally.
+        // ── FOREGROUND / BACKGROUND: Session exists ──────────────────
         // processCallInvitePushData triggers didReceiveInviteForCall synchronously,
         // which calls reportNewIncomingCall before we reach completion().
         voiceClient.processCallInvitePushData(payload.dictionaryPayload)
         completion()
     }
 
-    // iOS < 13 fallback
+    /// iOS < 13 fallback (no completion handler).
     public func pushRegistry(_ registry: PKPushRegistry,
-                            didReceiveIncomingPushWith payload: PKPushPayload,
-                            for type: PKPushType) {
+                             didReceiveIncomingPushWith payload: PKPushPayload,
+                             for type: PKPushType) {
         sendPhoneCallEvents(description: "LOG|pushRegistry:didReceiveIncomingPush (legacy)")
 
         guard type == .voIP else { return }
-
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
-        if pushType == .incomingCall {
-            if accessToken == nil, let storedJwt = getStoredJwt() {
-                accessToken = storedJwt
-                voiceClient.createSession(storedJwt) { [weak self] error, _ in
-                    guard let self = self, error == nil else { return }
-                    self.isSessionReady = true
-                    self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
-                }
-            } else if accessToken != nil {
-                voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+        guard pushType == .incomingCall else { return }
+
+        if accessToken == nil, let storedJwt = getStoredJwt() {
+            accessToken = storedJwt
+            voiceClient.createSession(storedJwt) { [weak self] error, _ in
+                guard let self = self, error == nil else { return }
+                self.isSessionReady = true
+                self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
             }
+        } else if accessToken != nil {
+            voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+        }
+    }
+
+    // ─── Killed-State Push Handler ───────────────────────────────────
+
+    /// Handles a VoIP push when the app was killed.
+    /// Reports to CallKit IMMEDIATELY, then restores the session in the background.
+    private func handleKilledStatePush(payload: PKPushPayload,
+                                       storedJwt: String,
+                                       completion: @escaping () -> Void) {
+        sendPhoneCallEvents(description: "LOG|KILLED STATE: Restoring session from stored JWT")
+
+        let uuid = UUID()
+        pendingPushUUID = uuid
+        pendingPushCompletion = completion
+
+        // Create a placeholder invite (callId filled by didReceiveInviteForCall later).
+        callInvites[uuid] = CallInviteInfo(callId: "", from: "", to: identity)
+
+        // Report to CallKit immediately so Apple doesn't kill us.
+        reportIncomingCall(from: defaultCaller, uuid: uuid)
+
+        // Safety timeout: end the call if didReceiveInviteForCall never fires.
+        pushCompletionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
+            self?.endPreReportedCall(reason: "Push completion timeout — ending pre-reported call")
+        }
+
+        // Restore the session asynchronously.
+        accessToken = storedJwt
+        voiceClient.createSession(storedJwt) { [weak self] error, sessionId in
+            guard let self = self else { return }
+            if let error = error {
+                self.sendPhoneCallEvents(description: "LOG|Session restore failed: \(error.localizedDescription)")
+                self.endPreReportedCall(reason: "Session restore failed — ending pre-reported call")
+                return
+            }
+            self.isSessionReady = true
+            self.sendPhoneCallEvents(description: "LOG|Session restored successfully, processing push")
+            self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+            // completion() is called from didReceiveInviteForCall via pendingPushCompletion.
+        }
+    }
+
+    /// Reports a dummy incoming call and immediately ends it.
+    /// Required by Apple: every VoIP push MUST result in reportNewIncomingCall.
+    private func reportDummyCallAndEnd(completion: @escaping () -> Void) {
+        let uuid = UUID()
+        reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
+            self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+            completion()
         }
     }
 }
 
-// MARK: - VGVoiceClientDelegate
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - VGVoiceClientDelegate (Vonage SDK Callbacks)
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  These methods are called by the Vonage SDK when:
+//    • A new call invite arrives (didReceiveInviteForCall)
+//    • An invite is cancelled by the caller (didReceiveInviteCancelForCall)
+//    • The remote party hangs up (didReceiveHangupForCall)
+//    • Media state changes (reconnecting, mute, errors)
+//    • The session token expires
+//
 
 extension VonageVoicePlugin: VGVoiceClientDelegate {
 
-    public func voiceClient(_ client: VGVoiceClient, didReceiveInviteForCall callId: String, from caller: String, with type: VGVoiceChannelType) {
+    // ─── New Call Invite ─────────────────────────────────────────────
+
+    public func voiceClient(_ client: VGVoiceClient,
+                            didReceiveInviteForCall callId: String,
+                            from caller: String,
+                            with type: VGVoiceChannelType) {
         NSLog("[VonageVoice-Push] *** didReceiveInviteForCall *** callId=%@ from=%@", callId, caller)
         sendPhoneCallEvents(description: "LOG|didReceiveInviteForCall callId=\(callId), from=\(caller)")
 
-        // Deduplicate: if we already have an invite for this callId (e.g. from
-        // both WebSocket and push processing), ignore the duplicate.
+        // Deduplicate: WebSocket and push processing can fire for the same call.
         if callIdToUUID[callId] != nil {
             sendPhoneCallEvents(description: "LOG|Duplicate invite for callId=\(callId), ignoring")
             return
         }
 
-        // ── KILLED STATE: Associate callId with pre-reported UUID ──
+        // ── KILLED STATE: Associate callId with the pre-reported UUID ──
         if let pushUUID = pendingPushUUID {
-            pushCompletionTimer?.invalidate()
-            pushCompletionTimer = nil
-
-            let callerDisplay = clients[caller] ?? caller
-
-            // Update the placeholder invite with real data
-            let invite = CallInviteInfo(callId: callId, from: caller, to: identity)
-            callInvites[pushUUID] = invite
-            callIdToUUID[callId] = pushUUID
-
-            // Update CallKit with real caller info
-            let callUpdate = CXCallUpdate()
-            callUpdate.localizedCallerName = callerDisplay
-            callUpdate.remoteHandle = CXHandle(type: .generic, value: callerDisplay)
-            callKitProvider.reportCall(with: pushUUID, updated: callUpdate)
-
-            // Send Incoming event to Flutter
-            sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
-
-            // If user already tapped Answer before we had the callId
-            if let answerAction = pendingAnswerAction {
-                pendingAnswerAction = nil
-                voiceClient.answer(callId) { [weak self] error in
-                    guard let self = self else { return }
-                    if let error = error {
-                        self.sendPhoneCallEvents(description: "LOG|Deferred answer failed: \(error.localizedDescription)")
-                        answerAction.fail()
-                        return
-                    }
-                    self.activeCalls[pushUUID] = callId
-                    self.activeCallUUID = pushUUID
-                    self.callInvites.removeValue(forKey: pushUUID)
-                    self.userExplicitlyChangedAudioRoute = false
-                    self.sendPhoneCallEvents(description: "Answer|\(caller)|\(self.identity)|Incoming")
-                    self.sendPhoneCallEvents(description: "Connected|\(caller)|\(self.identity)|Incoming")
-                    answerAction.fulfill()
-                }
-            }
-
-            // If user already tapped Decline before we had the callId
-            if let endAction = pendingEndAction {
-                pendingEndAction = nil
-                voiceClient.reject(callId) { [weak self] error in
-                    if let error = error {
-                        self?.sendPhoneCallEvents(description: "LOG|Deferred reject failed: \(error.localizedDescription)")
-                    }
-                }
-                callInvites.removeValue(forKey: pushUUID)
-                callIdToUUID.removeValue(forKey: callId)
-                callDisconnected(uuid: pushUUID)
-                sendPhoneCallEvents(description: "Declined")
-                endAction.fulfill()
-            }
-
-            // Call the deferred PushKit completion handler
-            pendingPushCompletion?()
-            pendingPushCompletion = nil
-            pendingPushUUID = nil
+            handleKilledStateInvite(callId: callId, caller: caller, pushUUID: pushUUID)
             return
         }
 
@@ -1586,18 +1639,83 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         callInvites[uuid] = invite
         callIdToUUID[callId] = uuid
 
-        // Send Incoming event to Flutter (matches Dart parser's "Incoming|from|to|direction" format)
         sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
-
-        // Report to CallKit
         reportIncomingCall(from: callerDisplay, uuid: uuid)
     }
 
-    public func voiceClient(_ client: VGVoiceClient, didReceiveInviteCancelForCall callId: String, with reason: VGVoiceInviteCancelReason) {
-        NSLog("[VonageVoice-Push] *** didReceiveInviteCancelForCall *** callId=%@ reason=%@", callId, String(describing: reason))
+    /// Handles didReceiveInviteForCall when the app was launched from killed state.
+    /// The call was already pre-reported to CallKit — now we update it with real data
+    /// and fulfil any queued answer/decline actions.
+    private func handleKilledStateInvite(callId: String, caller: String, pushUUID: UUID) {
+        pushCompletionTimer?.invalidate()
+        pushCompletionTimer = nil
+
+        let callerDisplay = clients[caller] ?? caller
+
+        // Update the placeholder invite with real data.
+        let invite = CallInviteInfo(callId: callId, from: caller, to: identity)
+        callInvites[pushUUID] = invite
+        callIdToUUID[callId] = pushUUID
+
+        // Update CallKit with the real caller info.
+        let callUpdate = CXCallUpdate()
+        callUpdate.localizedCallerName = callerDisplay
+        callUpdate.remoteHandle = CXHandle(type: .generic, value: callerDisplay)
+        callKitProvider.reportCall(with: pushUUID, updated: callUpdate)
+
+        sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
+
+        // Fulfil any queued answer action (user tapped Answer before callId was available).
+        if let answerAction = pendingAnswerAction {
+            pendingAnswerAction = nil
+            voiceClient.answer(callId) { [weak self] error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.sendPhoneCallEvents(description: "LOG|Deferred answer failed: \(error.localizedDescription)")
+                    answerAction.fail()
+                    return
+                }
+                self.activeCalls[pushUUID] = callId
+                self.activeCallUUID = pushUUID
+                self.callInvites.removeValue(forKey: pushUUID)
+                self.userExplicitlyChangedAudioRoute = false
+                self.sendPhoneCallEvents(description: "Answer|\(caller)|\(self.identity)|Incoming")
+                self.sendPhoneCallEvents(description: "Connected|\(caller)|\(self.identity)|Incoming")
+                answerAction.fulfill()
+            }
+        }
+
+        // Fulfil any queued decline action (user tapped Decline before callId was available).
+        if let endAction = pendingEndAction {
+            pendingEndAction = nil
+            voiceClient.reject(callId) { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|Deferred reject failed: \(error.localizedDescription)")
+                }
+            }
+            callInvites.removeValue(forKey: pushUUID)
+            callIdToUUID.removeValue(forKey: callId)
+            callDisconnected(uuid: pushUUID)
+            sendPhoneCallEvents(description: "Declined")
+            endAction.fulfill()
+        }
+
+        // Call the deferred PushKit completion handler.
+        pendingPushCompletion?()
+        pendingPushCompletion = nil
+        pendingPushUUID = nil
+    }
+
+    // ─── Call Invite Cancelled (caller hung up before we answered) ───
+
+    public func voiceClient(_ client: VGVoiceClient,
+                            didReceiveInviteCancelForCall callId: String,
+                            with reason: VGVoiceInviteCancelReason) {
+        NSLog("[VonageVoice-Push] *** didReceiveInviteCancelForCall *** callId=%@ reason=%@",
+              callId, String(describing: reason))
         sendPhoneCallEvents(description: "LOG|didReceiveInviteCancelForCall callId=\(callId), reason=\(reason)")
 
-        // ── KILLED STATE: Cancel arrived before didReceiveInviteForCall ──
+        // ── KILLED STATE: cancel arrived before didReceiveInviteForCall ──
         if callIdToUUID[callId] == nil, let pushUUID = pendingPushUUID {
             pushCompletionTimer?.invalidate()
             pushCompletionTimer = nil
@@ -1612,35 +1730,38 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         }
 
         // ── NORMAL PATH ──
-        // Find and remove the matching call invite
-        if let uuid = callIdToUUID[callId] {
-            // GUARD: If the call was already answered and moved to activeCalls,
-            // do NOT process the cancel — the SDK may fire cancel as a cleanup
-            // after the invite was consumed by answer. Ending an active call
-            // here would cause the "auto-hangup after answer" bug.
-            if activeCalls[uuid] != nil {
-                sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for already-answered call callId=\(callId)")
-                return
-            }
+        guard let uuid = callIdToUUID[callId] else { return }
 
-            callInvites.removeValue(forKey: uuid)
-            callIdToUUID.removeValue(forKey: callId)
-
-            // Use provider API to end the call — NOT performEndCallAction.
-            // performEndCallAction goes through CXCallController (user-initiated end)
-            // which can race with reportNewIncomingCall. reportCall(endedAt:reason:)
-            // is the correct API for server-initiated cancellation and works even if
-            // CallKit hasn't fully processed the incoming call report yet.
-            callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
-            callDisconnected(uuid: uuid)
+        // GUARD: If the call was already answered and moved to activeCalls,
+        // do NOT process the cancel — the SDK may fire cancel as cleanup
+        // after the invite was consumed by answer. Ending an active call
+        // here would cause the "auto-hangup after answer" bug.
+        if activeCalls[uuid] != nil {
+            sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for already-answered call callId=\(callId)")
+            return
         }
+
+        callInvites.removeValue(forKey: uuid)
+        callIdToUUID.removeValue(forKey: callId)
+
+        // Use reportCall(endedAt:reason:) — NOT performEndCallAction.
+        // performEndCallAction goes through CXCallController (user-initiated end)
+        // which can race with reportNewIncomingCall. reportCall is the correct
+        // API for server-initiated cancellation.
+        callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+        callDisconnected(uuid: uuid)
 
         if activeCalls.isEmpty {
             sendPhoneCallEvents(description: "Missed Call")
         }
     }
 
-    public func voiceClient(_ client: VGVoiceClient, didReceiveHangupForCall callId: String, withQuality callQuality: VGRTCQuality, reason: VGHangupReason) {
+    // ─── Remote Hangup ───────────────────────────────────────────────
+
+    public func voiceClient(_ client: VGVoiceClient,
+                            didReceiveHangupForCall callId: String,
+                            withQuality callQuality: VGRTCQuality,
+                            reason: VGHangupReason) {
         sendPhoneCallEvents(description: "LOG|didReceiveHangupForCall callId=\(callId), reason=\(reason)")
 
         if let uuid = callIdToUUID[callId] {
@@ -1655,6 +1776,8 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         }
     }
 
+    // ─── Media State Changes ─────────────────────────────────────────
+
     public func voiceClient(_ client: VGVoiceClient, didReceiveMediaReconnectingForCall callId: String) {
         sendPhoneCallEvents(description: "Reconnecting")
     }
@@ -1667,27 +1790,34 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         sendPhoneCallEvents(description: "LOG|didReceiveMediaError callId=\(callId), error=\(error.localizedDescription)")
     }
 
-    public func voiceClient(_ client: VGVoiceClient, didReceiveMuteForCall callId: String, withLegId legId: String, andStatus isMuted: DarwinBoolean) {
+    public func voiceClient(_ client: VGVoiceClient,
+                            didReceiveMuteForCall callId: String,
+                            withLegId legId: String,
+                            andStatus isMuted: DarwinBoolean) {
         let muted = isMuted.boolValue
         sendPhoneCallEvents(description: "LOG|didReceiveMute callId=\(callId), isMuted=\(muted)")
         self.isMuted = muted
         sendPhoneCallEvents(description: muted ? "Mute" : "Unmute")
     }
 
+    // ─── Session Error ───────────────────────────────────────────────
+
     public func client(_ client: VGBaseClient, didReceiveSessionErrorWith reason: VGSessionErrorReason) {
         sendPhoneCallEvents(description: "LOG|didReceiveSessionError reason=\(reason)")
-
         if reason == .tokenExpired || reason == VGSessionErrorReason.tokenExpired {
             sendPhoneCallEvents(description: "DEVICETOKEN|expired")
         }
     }
 }
 
-// MARK: - Helper Types
 
+// ═══════════════════════════════════════════════════════════════════════
+// MARK: - Helper Types
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Holds the data for a pending call invite.
 struct CallInviteInfo {
     let callId: String
     let from: String
     let to: String
-    var customParams: [String: Any]? = nil
 }
