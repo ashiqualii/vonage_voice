@@ -92,6 +92,20 @@ dependencies {
     // ── Firebase (FCM — incoming call push delivery) ──────────────────────
     // BOM pins all Firebase versions consistently
     implementation(platform("com.google.firebase:firebase-bom:32.7.0"))
+
+    // NOTE: firebase-messaging-ktx is deprecated since Firebase BOM 32+.
+    // The KTX extensions are now bundled inside the main artifact.
+    //
+    // Migration (when ready):
+    //   Replace this line with:
+    //     implementation("com.google.firebase:firebase-messaging")
+    //
+    //   That's it — all KTX extension functions (e.g. Firebase.messaging)
+    //   are included in the main artifact since BOM 32.0.0.
+    //
+    // Why we keep it for now:
+    //   Works fine with BOM 32.7.0 — no functional difference.
+    //   Kept to avoid unnecessary churn on a working build.
     implementation("com.google.firebase:firebase-messaging-ktx")
 
     // ── AndroidX ──────────────────────────────────────────────────────────
@@ -103,6 +117,26 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
 
     // LocalBroadcastManager — internal event bus between services and plugin
+    //
+    // NOTE: LocalBroadcastManager is officially deprecated by Google
+    // (androidx.localbroadcastmanager:localbroadcastmanager:1.1.0).
+    // Google recommends using LiveData, SharedFlow, or a custom event bus.
+    //
+    // Migration (when ready):
+    //   1. Create a singleton LocalEventBus using Kotlin SharedFlow or
+    //      a simple callback pattern.
+    //   2. Replace LocalBroadcastManager.getInstance(ctx).sendBroadcast()
+    //      with LocalEventBus.sendBroadcast() in all services.
+    //   3. Replace LocalBroadcastManager.getInstance(ctx).registerReceiver()
+    //      with LocalEventBus.registerReceiver() in the plugin.
+    //   4. Remove this dependency line.
+    //
+    // Why we keep it for now:
+    //   Works reliably on all Android versions (API 24+). Removing it
+    //   requires migrating 5+ Kotlin files (TVConnectionService,
+    //   TVBroadcastReceiver, VonageFirebaseMessagingService,
+    //   TVCallInviteConnection, TVCallConnection). Planned for a
+    //   future release.
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
     // Lifecycle — process lifecycle awareness for background call handling
@@ -110,5 +144,18 @@ dependencies {
 
     // ── Kotlin ────────────────────────────────────────────────────────────
     implementation(platform("org.jetbrains.kotlin:kotlin-bom:2.2.20"))
+
+    // NOTE: kotlin-stdlib-jdk8 is deprecated since Kotlin 1.8.
+    // The JDK 7/8 extensions are now merged into the main kotlin-stdlib.
+    //
+    // Migration (when ready):
+    //   Replace this line with:
+    //     implementation("org.jetbrains.kotlin:kotlin-stdlib")
+    //   Or simply remove it — the Kotlin BOM above already pulls in
+    //   kotlin-stdlib transitively.
+    //
+    // Why we keep it for now:
+    //   Works fine — it just re-exports kotlin-stdlib since Kotlin 1.8.
+    //   Kept to avoid build-config changes on a working setup.
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
 }

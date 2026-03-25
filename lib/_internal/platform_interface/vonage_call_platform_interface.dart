@@ -34,107 +34,322 @@ abstract class VonageCallPlatform extends SharedPlatformInterface {
     _instance = instance;
   }
 
-  // ── Active call state ─────────────────────────────────────────────────
+  // ── Active Call State ─────────────────────────────────────────────────
 
-  /// The currently active or pending call.
-  /// Null when no call is in progress.
+  /// The currently active or most-recently-active voice call.
+  ///
+  /// Returns the [ActiveCall] object containing caller/callee identity,
+  /// call direction, start time, and any custom parameters received from
+  /// the Vonage backend.
+  ///
+  /// Returns `null` when no call is in progress.
+  ///
+  /// This property is updated automatically by the event parser whenever
+  /// the native layer emits call-state events (Incoming, Ringing,
+  /// Connected, Call Ended, etc.).
+  ///
+  /// ```dart
+  /// final call = VonageVoice.instance.call.activeCall;
+  /// if (call != null) {
+  ///   print('On call with ${call.fromFormatted}');
+  ///   print('Direction: ${call.callDirection}');
+  /// }
+  /// ```
   ActiveCall? get activeCall;
 
-  /// Update the active call state.
-  /// Set to null when the call ends.
+  /// Updates the active call state.
+  ///
+  /// Set to `null` when the call ends to clear the state.
+  /// Normally you don't need to call this directly — the plugin's
+  /// event parser updates it automatically.
   set activeCall(ActiveCall? activeCall);
 
-  // ── Outbound call ─────────────────────────────────────────────────────
+  // ── Outbound Call ─────────────────────────────────────────────────────
 
-  /// Places a new outbound call.
+  /// Places a new outbound VoIP call.
   ///
-  /// [from] — caller identity (your Vonage user or number)
-  /// [to]   — destination number or Vonage user identity
-  /// [extraOptions] — optional custom params forwarded to your backend
+  /// This triggers the Vonage backend to initiate the call. On Android,
+  /// the call is routed through the Telecom `ConnectionService` which
+  /// shows a native dialing screen. On iOS, CallKit shows the native
+  /// outgoing-call UI.
   ///
-  /// Returns true if the call was successfully initiated.
+  /// [from] — your Vonage user identity or phone number (the caller).
+  /// [to] — the destination phone number or Vonage user identity.
+  /// [extraOptions] — optional key-value pairs forwarded to your Vonage
+  ///   backend's NCCO answer URL. Use this to pass custom data like
+  ///   caller display names, recording flags, etc.
+  ///
+  /// Returns `true` if the call was successfully initiated on the native
+  /// layer. Returns `false` or `null` if the call failed to start.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// await VonageVoice.instance.call.place(
+  ///   from: 'my_vonage_user',
+  ///   to: '+14155551234',
+  ///   extraOptions: {'displayName': 'John Doe'},
+  /// );
+  /// ```
+  ///
+  /// See also: [activeCall], which is set to an outgoing [ActiveCall]
+  /// immediately when this method is called.
   Future<bool?> place({
     required String from,
     required String to,
     Map<String, dynamic>? extraOptions,
   });
 
-  /// Places an outbound call using only [extraOptions].
-  /// Web-only at this stage — returns false on mobile.
+  /// **Deprecated** — Web-only method, not supported on Android or iOS.
+  ///
+  /// ### Why deprecated?
+  /// This method was designed for the Vonage JavaScript SDK (web) which
+  /// uses a different connection model. On mobile platforms (Android & iOS),
+  /// outbound calls must always specify `from` and `to` parameters.
+  ///
+  /// ### Migration
+  /// Use [place] instead, which works on both Android and iOS:
+  ///
+  /// ```dart
+  /// // Before (old way — web only):
+  /// await VonageVoice.instance.call.connect(
+  ///   extraOptions: {'to': '+14155551234'},
+  /// );
+  ///
+  /// // After (new way — works on Android & iOS):
+  /// await VonageVoice.instance.call.place(
+  ///   from: 'my_vonage_user',
+  ///   to: '+14155551234',
+  /// );
+  /// ```
+  ///
+  /// Always returns `false` on mobile platforms.
+  @Deprecated(
+    'Web-only method — not supported on Android or iOS. '
+    'Use place(from:, to:) for mobile outbound calls. '
+    'Always returns false on mobile.',
+  )
   Future<bool?> connect({Map<String, dynamic>? extraOptions});
 
-  // ── Core call controls ────────────────────────────────────────────────
+  // ── Core Call Controls ────────────────────────────────────────────────
 
-  /// Hangs up the active call.
+  /// Hangs up (disconnects) the currently active call.
+  ///
+  /// On **Android**, this triggers `CXEndCallAction` via the Telecom
+  /// `ConnectionService`. On **iOS**, this triggers `CXEndCallAction`
+  /// via CallKit.
+  ///
+  /// After a successful hangup, the native layer emits a
+  /// [CallEvent.callEnded] event and [activeCall] is set to `null`.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// await VonageVoice.instance.call.hangUp();
+  /// ```
   Future<bool?> hangUp();
 
-  /// Returns true if there is an active call in progress.
+  /// Returns `true` if there is an active call in progress.
+  ///
+  /// On **Android**, checks the Telecom `ConnectionService` for active
+  /// connections. On **iOS**, checks the CallKit call registry.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool> isOnCall();
 
-  /// Returns the active call ID (Vonage callId).
-  /// Null until the first [CallEvent.ringing] event.
+  /// Returns the Vonage call ID (session ID) of the active call.
+  ///
+  /// Returns `null` until the first [CallEvent.ringing] event fires,
+  /// because the call ID is assigned by the Vonage backend after the
+  /// call request is acknowledged.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// final callId = await VonageVoice.instance.call.getSid();
+  /// print('Active call ID: $callId');
+  /// ```
   Future<String?> getSid();
 
   /// Answers a pending incoming call invite.
+  ///
+  /// On **Android**, this fulfils the Telecom `ConnectionService` answer
+  /// action. On **iOS**, this fulfils the `CXAnswerCallAction` in CallKit.
+  ///
+  /// After answering, the native layer emits [CallEvent.answer] followed
+  /// by [CallEvent.connected] once media is established.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// // When you receive CallEvent.incoming:
+  /// await VonageVoice.instance.call.answer();
+  /// ```
   Future<bool?> answer();
 
   // ── Hold ──────────────────────────────────────────────────────────────
 
   /// Puts the active call on hold or resumes it.
   ///
-  /// [holdCall] — true to hold, false to resume.
+  /// When [holdCall] is `true`, the call audio is paused and the remote
+  /// party hears silence (or hold music if configured on your backend).
+  /// When `false`, the call resumes.
+  ///
+  /// On **Android**, this triggers `onStateChanged(STATE_HOLDING)` /
+  /// `onStateChanged(STATE_ACTIVE)` on the `Connection`. On **iOS**, this
+  /// triggers `CXSetHeldCallAction` in CallKit.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// // Put on hold
+  /// await VonageVoice.instance.call.holdCall(holdCall: true);
+  ///
+  /// // Resume
+  /// await VonageVoice.instance.call.holdCall(holdCall: false);
+  /// ```
   Future<bool?> holdCall({bool holdCall = true});
 
-  /// Returns true if the call is currently on hold.
+  /// Returns `true` if the current call is on hold.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isHolding();
 
   // ── Mute ──────────────────────────────────────────────────────────────
 
-  /// Mutes or unmutes the microphone.
+  /// Mutes or unmutes the local microphone.
   ///
-  /// [isMuted] — true to mute, false to unmute.
+  /// When [isMuted] is `true`, the remote party cannot hear the local user.
+  /// When `false`, the microphone is active again.
+  ///
+  /// On **Android**, this updates the `Connection` audio state.
+  /// On **iOS**, this triggers `CXSetMutedCallAction` in CallKit.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// // Mute
+  /// await VonageVoice.instance.call.toggleMute(true);
+  ///
+  /// // Unmute
+  /// await VonageVoice.instance.call.toggleMute(false);
+  /// ```
   Future<bool?> toggleMute(bool isMuted);
 
-  /// Returns true if the microphone is currently muted.
+  /// Returns `true` if the microphone is currently muted.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isMuted();
 
   // ── Speaker ───────────────────────────────────────────────────────────
 
-  /// Routes audio to or from the speakerphone.
+  /// Routes call audio to or from the device's speakerphone.
   ///
-  /// [speakerIsOn] — true to enable speaker, false to use earpiece.
+  /// When [speakerIsOn] is `true`, audio output switches from the earpiece
+  /// to the loudspeaker. When `false`, it switches back to earpiece or
+  /// the currently connected Bluetooth device.
+  ///
+  /// On **Android**, this sets `AudioManager.MODE_IN_COMMUNICATION` and
+  /// toggles the speaker route. On **iOS**, this overrides the
+  /// `AVAudioSession` output port.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// // Enable speaker
+  /// await VonageVoice.instance.call.toggleSpeaker(true);
+  ///
+  /// // Disable speaker (back to earpiece/bluetooth)
+  /// await VonageVoice.instance.call.toggleSpeaker(false);
+  /// ```
   Future<bool?> toggleSpeaker(bool speakerIsOn);
 
-  /// Returns true if audio is currently routed to the speakerphone.
+  /// Returns `true` if audio is currently routed to the speakerphone.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isOnSpeaker();
 
   // ── Bluetooth ─────────────────────────────────────────────────────────
 
-  /// Routes audio to or from a Bluetooth headset.
+  /// Routes call audio to or from a connected Bluetooth headset.
   ///
-  /// [bluetoothOn] — true to enable Bluetooth audio, false to disable.
+  /// When [bluetoothOn] is `true`, audio output switches to the paired
+  /// Bluetooth device. When `false`, audio falls back to earpiece or speaker.
+  ///
+  /// On **Android**, this uses `AudioManager` to set the preferred audio
+  /// device. On **iOS**, this uses `AVAudioSession.setPreferredInput()` to
+  /// select the Bluetooth HFP/A2DP/LE port.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// if (await VonageVoice.instance.call.isBluetoothAvailable() ?? false) {
+  ///   await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: true);
+  /// }
+  /// ```
   Future<bool?> toggleBluetooth({bool bluetoothOn = true});
 
-  /// Returns true if audio is currently routed via Bluetooth.
+  /// Returns `true` if audio is currently routed through a Bluetooth device.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isBluetoothOn();
 
-  /// Returns true if a Bluetooth audio device is connected and available.
+  /// Returns `true` if a Bluetooth audio device is connected and available
+  /// for audio routing.
+  ///
+  /// Use this to check before calling [toggleBluetooth] — there's no point
+  /// enabling Bluetooth routing if no device is connected.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isBluetoothAvailable();
 
-  /// Returns true if the device's Bluetooth adapter is enabled.
+  /// Returns `true` if the device's Bluetooth adapter is turned on.
+  ///
+  /// On **iOS**, this returns the same value as [isBluetoothAvailable]
+  /// because iOS doesn't expose the raw BT adapter state to apps.
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> isBluetoothEnabled();
 
-  /// Shows the native "Turn on Bluetooth?" dialog.
-  /// Returns true if the user enabled Bluetooth, false if they declined.
+  /// Shows the native system dialog asking the user to turn on Bluetooth.
+  ///
+  /// On **Android**, this launches an `ACTION_REQUEST_ENABLE` intent.
+  /// On **iOS**, this is a **no-op** (returns `false`) because iOS does
+  /// not allow apps to programmatically prompt for Bluetooth.
+  ///
+  /// Returns `true` if the user enabled Bluetooth, `false` if they
+  /// declined or if the prompt isn't available on the platform.
+  ///
+  /// **Platform:** Android only — returns `false` on iOS.
   Future<bool?> showBluetoothEnablePrompt();
 
   /// Opens the system Bluetooth settings screen to pair/connect devices.
+  ///
+  /// On **Android**, this opens the Bluetooth settings directly.
+  /// On **iOS**, this opens the app's general settings page (iOS doesn't
+  /// allow deep-linking to Bluetooth settings).
+  ///
+  /// **Platform:** Android & iOS.
   Future<bool?> openBluetoothSettings();
 
-  // ── DTMF ──────────────────────────────────────────────────────────────
+  // ── DTMF (Dual-Tone Multi-Frequency) ──────────────────────────────────
 
   /// Sends DTMF tones on the active call.
   ///
-  /// [digits] — string of digits to send e.g. "1234" or "*#"
+  /// DTMF tones are used for IVR (Interactive Voice Response) navigation
+  /// — e.g. "Press 1 for sales, press 2 for support".
+  ///
+  /// [digits] — a string of DTMF characters to send. Valid characters
+  /// are `0-9`, `*`, and `#`. Multiple digits can be sent at once.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// // Send a single digit
+  /// await VonageVoice.instance.call.sendDigits('1');
+  ///
+  /// // Send multiple digits at once
+  /// await VonageVoice.instance.call.sendDigits('1234#');
+  /// ```
   Future<bool?> sendDigits(String digits);
 }

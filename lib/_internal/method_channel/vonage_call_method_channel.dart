@@ -11,13 +11,18 @@ import '../platform_interface/vonage_call_platform_interface.dart';
 /// Method names are shared across both platforms — any change on
 /// the native side must be reflected here and vice versa.
 class MethodChannelVonageCall extends VonageCallPlatform {
-  /// Holds the current active call state.
-  /// Updated automatically by [MethodChannelVonageVoice.parseCallEvent].
+  /// Holds the current active call state — updated automatically
+  /// by [MethodChannelVonageVoice.parseCallEvent] when native events arrive.
+  ///
+  /// Contains the caller/callee identity, direction, start time, and
+  /// any custom parameters. `null` when no call is active.
   ActiveCall? _activeCall;
 
+  /// Returns the current [ActiveCall] or `null` if idle.
   @override
   ActiveCall? get activeCall => _activeCall;
 
+  /// Updates the active call state. Set to `null` when the call ends.
   @override
   set activeCall(ActiveCall? activeCall) => _activeCall = activeCall;
 
@@ -25,15 +30,18 @@ class MethodChannelVonageCall extends VonageCallPlatform {
 
   MethodChannelVonageCall();
 
-  // ── Outbound call ─────────────────────────────────────────────────────
+  // ── Outbound Call ─────────────────────────────────────────────────────
 
-  /// Places a new outbound call.
+  /// Places a new outbound VoIP call via the native `makeCall` method.
   ///
-  /// Sets [activeCall] immediately with [CallDirection.outgoing] so
-  /// the UI can reflect the outgoing state before the native layer confirms.
+  /// Sets [activeCall] immediately with [CallDirection.outgoing] so the
+  /// UI can reflect the dialing state before the native layer confirms.
   ///
-  /// [from] and [to] are forwarded as-is to the native [makeCall] handler —
-  /// never hardcoded here.
+  /// [from] and [to] are merged into [extraOptions] and forwarded to the
+  /// native handler as-is — never hardcoded on the Dart side.
+  ///
+  /// On **Android**, this triggers `ConnectionService.onCreateOutgoingConnection()`.
+  /// On **iOS**, this triggers `CXStartCallAction` in CallKit.
   @override
   Future<bool?> place({
     required String from,
@@ -52,21 +60,34 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     return _channel.invokeMethod('makeCall', options);
   }
 
-  /// Web-only — not supported on Android. Returns false.
+  /// **Deprecated** — Web-only, not supported on mobile. Always returns `false`.
+  ///
+  /// Use [place] instead for Android & iOS outbound calls.
+  /// See [VonageCallPlatform.connect] for full migration details.
+  @Deprecated(
+    'Web-only method — not supported on Android or iOS. '
+    'Use place(from:, to:) for mobile outbound calls. '
+    'Always returns false on mobile.',
+  )
   @override
   Future<bool?> connect({Map<String, dynamic>? extraOptions}) {
     return Future.value(false);
   }
 
-  // ── Core call controls ────────────────────────────────────────────────
+  // ── Core Call Controls ────────────────────────────────────────────────
 
-  /// Hangs up the active call.
+  /// Hangs up the active call via the native `hangUp` method.
+  ///
+  /// Triggers `CXEndCallAction` (iOS) or disconnects the
+  /// `ConnectionService` connection (Android).
   @override
   Future<bool?> hangUp() {
     return _channel.invokeMethod('hangUp', <String, dynamic>{});
   }
 
-  /// Returns true if there is an active call in progress.
+  /// Returns `true` if there is an active call in progress.
+  ///
+  /// On Android, queries the `ConnectionService`. On iOS, queries CallKit.
   @override
   Future<bool> isOnCall() {
     return _channel
@@ -74,8 +95,10 @@ class MethodChannelVonageCall extends VonageCallPlatform {
         .then<bool>((bool? value) => value ?? false);
   }
 
-  /// Returns the active Vonage callId.
-  /// Null until the first [CallEvent.ringing] event fires.
+  /// Returns the active Vonage call ID (session identifier).
+  ///
+  /// `null` until the first [CallEvent.ringing] event fires because
+  /// the call ID is assigned server-side by Vonage.
   @override
   Future<String?> getSid() {
     return _channel
@@ -84,6 +107,9 @@ class MethodChannelVonageCall extends VonageCallPlatform {
   }
 
   /// Answers a pending incoming call invite.
+  ///
+  /// On Android, fulfils the `ConnectionService` answer action.
+  /// On iOS, fulfils `CXAnswerCallAction` in CallKit.
   @override
   Future<bool?> answer() {
     return _channel.invokeMethod('answer', <String, dynamic>{});
@@ -92,7 +118,9 @@ class MethodChannelVonageCall extends VonageCallPlatform {
   // ── Hold ──────────────────────────────────────────────────────────────
 
   /// Puts the active call on hold or resumes it.
-  /// [holdCall] — true to hold, false to resume.
+  ///
+  /// [holdCall] — `true` to hold, `false` to resume.
+  /// On iOS, triggers `CXSetHeldCallAction` in CallKit.
   @override
   Future<bool?> holdCall({bool holdCall = true}) {
     return _channel.invokeMethod('holdCall', <String, dynamic>{
@@ -100,7 +128,7 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     });
   }
 
-  /// Returns true if the call is currently on hold.
+  /// Returns `true` if the current call is on hold.
   @override
   Future<bool?> isHolding() {
     return _channel.invokeMethod('isHolding', <String, dynamic>{});
@@ -108,8 +136,10 @@ class MethodChannelVonageCall extends VonageCallPlatform {
 
   // ── Mute ──────────────────────────────────────────────────────────────
 
-  /// Mutes or unmutes the microphone.
-  /// [isMuted] — true to mute, false to unmute.
+  /// Mutes or unmutes the local microphone.
+  ///
+  /// [isMuted] — `true` to mute, `false` to unmute.
+  /// On iOS, triggers `CXSetMutedCallAction` in CallKit.
   @override
   Future<bool?> toggleMute(bool isMuted) {
     return _channel.invokeMethod('toggleMute', <String, dynamic>{
@@ -117,7 +147,7 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     });
   }
 
-  /// Returns true if the microphone is currently muted.
+  /// Returns `true` if the microphone is currently muted.
   @override
   Future<bool?> isMuted() {
     return _channel.invokeMethod('isMuted', <String, dynamic>{});
@@ -125,8 +155,10 @@ class MethodChannelVonageCall extends VonageCallPlatform {
 
   // ── Speaker ───────────────────────────────────────────────────────────
 
-  /// Routes audio to or from the speakerphone.
-  /// [speakerIsOn] — true to enable speaker, false to use earpiece.
+  /// Routes call audio to or from the speakerphone.
+  ///
+  /// [speakerIsOn] — `true` to enable speaker, `false` for earpiece.
+  /// On Android uses `AudioManager`, on iOS overrides `AVAudioSession`.
   @override
   Future<bool?> toggleSpeaker(bool speakerIsOn) {
     return _channel.invokeMethod('toggleSpeaker', <String, dynamic>{
@@ -134,7 +166,7 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     });
   }
 
-  /// Returns true if audio is routed to the speakerphone.
+  /// Returns `true` if audio is routed to the speakerphone.
   @override
   Future<bool?> isOnSpeaker() {
     return _channel.invokeMethod('isOnSpeaker', <String, dynamic>{});
@@ -142,8 +174,10 @@ class MethodChannelVonageCall extends VonageCallPlatform {
 
   // ── Bluetooth ─────────────────────────────────────────────────────────
 
-  /// Routes audio to or from a Bluetooth headset.
-  /// [bluetoothOn] — true to enable Bluetooth audio.
+  /// Routes call audio to or from a Bluetooth headset.
+  ///
+  /// [bluetoothOn] — `true` to enable Bluetooth audio.
+  /// On iOS uses `AVAudioSession.setPreferredInput()` for BT HFP/A2DP/LE.
   @override
   Future<bool?> toggleBluetooth({bool bluetoothOn = true}) {
     return _channel.invokeMethod('toggleBluetooth', <String, dynamic>{
@@ -151,31 +185,39 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     });
   }
 
-  /// Returns true if audio is routed via Bluetooth.
+  /// Returns `true` if audio is currently routed through a Bluetooth device.
   @override
   Future<bool?> isBluetoothOn() {
     return _channel.invokeMethod('isBluetoothOn', <String, dynamic>{});
   }
 
-  /// Returns true if a Bluetooth audio device is connected and available.
+  /// Returns `true` if a Bluetooth audio device is connected and available.
   @override
   Future<bool?> isBluetoothAvailable() {
     return _channel.invokeMethod('isBluetoothAvailable', <String, dynamic>{});
   }
 
-  /// Returns true if the device's Bluetooth adapter is enabled.
+  /// Returns `true` if the device's Bluetooth adapter is enabled.
+  ///
+  /// On iOS, returns the same value as [isBluetoothAvailable] since
+  /// iOS doesn't expose the raw Bluetooth adapter state to apps.
   @override
   Future<bool?> isBluetoothEnabled() {
     return _channel.invokeMethod('isBluetoothEnabled', <String, dynamic>{});
   }
 
-  /// Shows the native "Turn on Bluetooth?" dialog.
+  /// Shows the native "Turn on Bluetooth?" system dialog.
+  ///
+  /// **Android only** — returns `false` on iOS (not supported by Apple).
   @override
   Future<bool?> showBluetoothEnablePrompt() {
     return _channel.invokeMethod('showBluetoothEnablePrompt', <String, dynamic>{});
   }
 
   /// Opens the system Bluetooth settings screen.
+  ///
+  /// On iOS, opens the app's general Settings page (Apple doesn't allow
+  /// deep-linking directly to Bluetooth settings).
   @override
   Future<bool?> openBluetoothSettings() {
     return _channel.invokeMethod('openBluetoothSettings', <String, dynamic>{});
@@ -183,8 +225,9 @@ class MethodChannelVonageCall extends VonageCallPlatform {
 
   // ── DTMF ──────────────────────────────────────────────────────────────
 
-  /// Sends DTMF tones on the active call.
-  /// [digits] — string of digits e.g. "1234" or "*#"
+  /// Sends DTMF tones on the active call for IVR navigation.
+  ///
+  /// [digits] — DTMF characters (`0-9`, `*`, `#`).
   @override
   Future<bool?> sendDigits(String digits) {
     return _channel.invokeMethod('sendDigits', <String, dynamic>{

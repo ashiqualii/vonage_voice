@@ -99,13 +99,36 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     });
   }
 
-  // ── Deprecated stubs ──────────────────────────────────────────────────
+  // ── Deprecated — Background Permissions ──────────────────────────────
+  //
+  // Kept for backward compatibility. These methods are no-ops.
+  // See VonageVoicePlatform for full migration documentation.
+  //
+  // Old behaviour: checked/requested SYSTEM_ALERT_WINDOW for overlay UI.
+  // New behaviour: ConnectionService (Android) and CallKit (iOS) handle
+  //                the native incoming-call screen automatically.
 
-  @Deprecated('custom call UI not used anymore, has no effect')
+  /// **Deprecated** — Always returns `false`.
+  ///
+  /// Background permissions are no longer needed because Android's
+  /// `ConnectionService` shows the native incoming-call screen.
+  /// See [VonageVoicePlatform.requiresBackgroundPermissions] for
+  /// full migration details.
+  @Deprecated(
+    'No longer needed — Android ConnectionService shows the native incoming-call '
+    'screen automatically. Remove calls to this method. Always returns false.',
+  )
   @override
   Future<bool> requiresBackgroundPermissions() => Future.value(false);
 
-  @Deprecated('custom call UI not used anymore, has no effect')
+  /// **Deprecated** — Always returns `false`.
+  ///
+  /// See [VonageVoicePlatform.requestBackgroundPermissions] for
+  /// full migration details.
+  @Deprecated(
+    'No longer needed — Android ConnectionService handles background calls '
+    'automatically. Remove calls to this method. Always returns false.',
+  )
   @override
   Future<bool?> requestBackgroundPermissions() => Future.value(false);
 
@@ -233,11 +256,36 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     return _channel.invokeMethod('requestReadPhoneNumbersPermission', {});
   }
 
-  @Deprecated('custom call UI not used anymore, has no effect')
+  // ── Deprecated — Bluetooth Permissions ────────────────────────────────
+  //
+  // Kept for backward compatibility. These methods are no-ops.
+  // See VonageVoicePlatform for full migration documentation.
+  //
+  // Old behaviour: checked/requested BLUETOOTH_CONNECT for custom call UI.
+  // New behaviour: Telecom/CallKit handles BT routing. Use
+  //                VonageCallPlatform.toggleBluetooth() to switch routes.
+
+  /// **Deprecated** — Always returns `false`.
+  ///
+  /// Bluetooth permissions are no longer needed. The native Telecom/CallKit
+  /// layer manages audio routing automatically.
+  /// See [VonageVoicePlatform.hasBluetoothPermissions] for migration details.
+  @Deprecated(
+    'No longer needed — the native Telecom/CallKit layer manages Bluetooth '
+    'audio routing automatically. Use call.toggleBluetooth() instead. '
+    'Always returns false on Android, true on iOS.',
+  )
   @override
   Future<bool> hasBluetoothPermissions() => Future.value(false);
 
-  @Deprecated('custom call UI not used anymore, has no effect')
+  /// **Deprecated** — Always returns `false`.
+  ///
+  /// See [VonageVoicePlatform.requestBluetoothPermissions] for migration.
+  @Deprecated(
+    'No longer needed — the native Telecom/CallKit layer manages Bluetooth '
+    'audio routing automatically. Use call.toggleBluetooth() instead. '
+    'Always returns false on Android, true on iOS.',
+  )
   @override
   Future<bool?> requestBluetoothPermissions() => Future.value(false);
 
@@ -367,7 +415,24 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     return _channel.invokeMethod('openFullScreenIntentSettings', {});
   }
 
-  @Deprecated('custom call UI not used anymore, has no effect')
+  // ── Deprecated — Background Call UI ──────────────────────────────────
+  //
+  // Kept for backward compatibility. This method is a no-op.
+  // See VonageVoicePlatform.showBackgroundCallUI for full migration docs.
+  //
+  // Old behaviour: showed custom floating overlay during backgrounded calls.
+  // New behaviour: ConnectionService (Android) / CallKit (iOS) show native UI.
+
+  /// **Deprecated** — Always returns `true` (no-op success).
+  ///
+  /// Custom background call UI is no longer used. The native OS call
+  /// notification handles it automatically.
+  /// See [VonageVoicePlatform.showBackgroundCallUI] for migration details.
+  @Deprecated(
+    'No longer needed — ConnectionService (Android) and CallKit (iOS) show the '
+    'native background call UI automatically. Remove calls to this method. '
+    'Always returns true.',
+  )
   @override
   Future<bool?> showBackgroundCallUI() => Future.value(true);
 

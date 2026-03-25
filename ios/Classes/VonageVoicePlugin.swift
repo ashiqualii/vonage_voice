@@ -405,31 +405,55 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "processVonagePush":
             handleProcessPush(arguments: arguments, result: result)
 
-        // ── Android-Only: return safe defaults ───────────────────────
-        // These methods exist on Android (Telecom, permissions, battery)
-        // but have no iOS equivalent. Return sensible defaults so the
-        // Dart side doesn't need platform checks.
+        // ── Android-Only Methods: return safe defaults ────────────────
+        //
+        // These methods exist on Android (Telecom PhoneAccount, extra
+        // runtime permissions, battery optimization, full-screen intent)
+        // but have no iOS equivalent.
+        //
+        // Return sensible defaults so Flutter Dart code can call the same
+        // API on both platforms without platform checks:
+        //   • Permission checks → true  (iOS doesn't need them)
+        //   • Settings screens  → true  (no-op on iOS)
+        //   • Battery optimized → false (not an issue on iOS)
+        //
+        // Deprecated methods (backgroundCallUI, hasBluetoothPermission,
+        // requestBluetoothPermission) also return safe defaults here.
+        // See the Dart @Deprecated annotations for full migration docs.
+
+        // PhoneAccount (Android Telecom) — iOS uses CallKit instead.
         case "hasRegisteredPhoneAccount", "registerPhoneAccount",
              "isPhoneAccountEnabled", "openPhoneAccountSettings":
             result(true)
+
+        // Android runtime permissions — iOS handles these via Info.plist.
         case "hasReadPhoneStatePermission", "requestReadPhoneStatePermission",
              "hasCallPhonePermission", "requestCallPhonePermission",
              "hasManageOwnCallsPermission", "requestManageOwnCallsPermission",
              "hasReadPhoneNumbersPermission", "requestReadPhoneNumbersPermission",
              "hasNotificationPermission", "requestNotificationPermission":
             result(true)
+
+        // Call rejection on no permissions — not needed on iOS.
         case "rejectCallOnNoPermissions":
             result(true)
         case "isRejectingCallOnNoPermissions":
             result(false)
+
+        // Battery optimization — not an issue on iOS.
         case "isBatteryOptimized":
             result(false)
         case "requestBatteryOptimizationExemption":
             result(true)
+
+        // Full-screen intent (Android 14+) — iOS always shows full-screen.
         case "canUseFullScreenIntent":
             result(true)
         case "openFullScreenIntentSettings":
             result(true)
+
+        // Deprecated: custom background call UI overlay (Android only).
+        // Now handled by ConnectionService on Android, CallKit on iOS.
         case "backgroundCallUI":
             result(true)
 
@@ -625,6 +649,18 @@ extension VonageVoicePlugin {
 
     // ─── Outgoing Call ───────────────────────────────────────────────
 
+    /// Handles the `makeCall` method from Flutter.
+    ///
+    /// Flow:
+    ///   1. Validates the `to` parameter from Flutter arguments.
+    ///   2. Stores caller identity, callee, and extra options.
+    ///   3. Requests CallKit to start an outgoing call via `CXStartCallAction`.
+    ///   4. CallKit triggers `provider(perform: CXStartCallAction)` where
+    ///      the actual Vonage `serverCall()` is made.
+    ///
+    /// - Parameter arguments: `["to": String, "from": String?, "CallerName": String?, ...]`
+    /// - Parameter result: Returns `true` on success, `FlutterError` on failure.
+
     private func handleMakeCall(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let to = arguments["to"] as? String else {
             result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing 'to' parameter", details: nil))
@@ -653,6 +689,14 @@ extension VonageVoicePlugin {
 
     // ─── Hang Up ─────────────────────────────────────────────────────
 
+    /// Handles the `hangUp` method from Flutter.
+    ///
+    /// If there's an active (answered) call, ends it via `CXEndCallAction`.
+    /// If there's only a pending incoming invite, rejects it instead.
+    /// Both paths go through CallKit so the system call UI is updated.
+    ///
+    /// - Parameter result: Returns `true` immediately (async completion via CallKit).
+
     private func handleHangUp(result: @escaping FlutterResult) {
         if let uuid = activeCallUUID, activeCalls[uuid] != nil {
             // End an active (answered) call.
@@ -668,6 +712,15 @@ extension VonageVoicePlugin {
     }
 
     // ─── Answer ──────────────────────────────────────────────────────
+
+    /// Handles the `answer` method from Flutter.
+    ///
+    /// Sends a `CXAnswerCallAction` to CallKit for the first pending
+    /// incoming invite. CallKit then triggers
+    /// `provider(perform: CXAnswerCallAction)` where the actual
+    /// `voiceClient.answer()` is called.
+    ///
+    /// - Parameter result: Returns `true` on success, `FlutterError` if no invite exists.
 
     private func handleAnswer(result: @escaping FlutterResult) {
         if let (uuid, _) = callInvites.first {
@@ -687,6 +740,15 @@ extension VonageVoicePlugin {
     }
 
     // ─── Hold ────────────────────────────────────────────────────────
+
+    /// Handles the `holdCall` method from Flutter.
+    ///
+    /// The Vonage iOS SDK doesn't have a native hold/unhold API.
+    /// Hold is simulated by muting the microphone.
+    /// Events `"Hold"` / `"Unhold"` are sent to Flutter accordingly.
+    ///
+    /// - Parameter arguments: `["shouldHold": Bool]`
+    /// - Parameter result: Returns `true` if toggled, `false` if no active call.
 
     private func handleHoldCall(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let shouldHold = arguments["shouldHold"] as? Bool,
@@ -718,6 +780,14 @@ extension VonageVoicePlugin {
     }
 
     // ─── Mute ────────────────────────────────────────────────────────
+
+    /// Handles the `toggleMute` method from Flutter.
+    ///
+    /// Calls `voiceClient.mute()` or `voiceClient.unmute()` on the
+    /// active Vonage call. Sends `"Mute"` / `"Unmute"` events to Flutter.
+    ///
+    /// - Parameter arguments: `["muted": Bool]`
+    /// - Parameter result: Returns `true` on success, `FlutterError` if no call.
 
     private func handleToggleMute(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let muted = arguments["muted"] as? Bool else {
@@ -754,6 +824,14 @@ extension VonageVoicePlugin {
 
     // ─── DTMF ────────────────────────────────────────────────────────
 
+    /// Handles the `sendDigits` method from Flutter.
+    ///
+    /// Sends DTMF tones via `voiceClient.sendDTMF()` for IVR navigation.
+    /// Valid characters: `0-9`, `*`, `#`.
+    ///
+    /// - Parameter arguments: `["digits": String]`
+    /// - Parameter result: Returns `true` on success.
+
     private func handleSendDigits(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let digits = arguments["digits"] as? String,
               let uuid = activeCallUUID,
@@ -770,6 +848,18 @@ extension VonageVoicePlugin {
     }
 
     // ─── Push Processing ─────────────────────────────────────────────
+
+    /// Handles the `processVonagePush` method from Flutter.
+    ///
+    /// When `firebase_messaging` intercepts a push notification in Dart,
+    /// the native Vonage SDK never sees it. This method forwards the raw
+    /// push payload to `voiceClient.processCallInvitePushData()` so the
+    /// SDK can detect incoming call invites.
+    ///
+    /// On iOS, PushKit typically handles VoIP pushes directly, but this
+    /// is available as a fallback path for cross-platform consistency.
+    ///
+    /// Returns `"processed"` if the push was a Vonage call invite, `nil` otherwise.
 
     private func handleProcessPush(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let data = arguments["data"] as? [String: Any] else {
@@ -831,6 +921,12 @@ extension VonageVoicePlugin {
 
     // ─── Speaker ─────────────────────────────────────────────────────
 
+    /// Toggles the speakerphone using `AVAudioSession.overrideOutputAudioPort()`.
+    ///
+    /// When enabling speaker: overrides to `.speaker`.
+    /// When disabling: overrides to `.none` and selects built-in mic
+    /// as preferred input to force earpiece mode.
+
     private func applySpeakerSetting(toSpeaker: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
@@ -849,6 +945,14 @@ extension VonageVoicePlugin {
     }
 
     // ─── Bluetooth ───────────────────────────────────────────────────
+
+    /// Toggles Bluetooth audio using `AVAudioSession` category options.
+    ///
+    /// When enabling: sets `.allowBluetooth` + `.allowBluetoothA2DP`
+    /// category options and selects the first available Bluetooth input.
+    /// When disabling: removes BT options and routes back to earpiece.
+    ///
+    /// Supported Bluetooth types: HFP, A2DP, LE Audio.
 
     private func toggleBluetoothAudio(bluetoothOn: Bool) {
         let session = AVAudioSession.sharedInstance()
@@ -956,11 +1060,29 @@ extension VonageVoicePlugin {
 // ═══════════════════════════════════════════════════════════════════════
 // MARK: - Permissions, Caller Registry & Utilities
 // ═══════════════════════════════════════════════════════════════════════
+//
+//  Permissions:
+//    iOS only requires microphone permission for voice calls.
+//    All other Android-specific permissions (phone state, call phone,
+//    manage own calls, etc.) return `true` as safe defaults in the
+//    method channel router above.
+//
+//  Caller Registry:
+//    Maps Vonage user IDs → human-readable display names.
+//    Stored in UserDefaults and used to show "John Smith" instead of
+//    "user-abc-123" on the CallKit incoming-call screen.
+//
 
 extension VonageVoicePlugin {
 
     // ─── Permissions ─────────────────────────────────────────────────
 
+    /// Handles the `requestMicPermission` method from Flutter.
+    ///
+    /// Checks `AVAudioSession.recordPermission` and either:
+    ///   - Returns `true` immediately if already granted.
+    ///   - Returns `false` if previously denied.
+    ///   - Shows the system microphone dialog if undetermined.
     private func handleRequestMicPermission(result: @escaping FlutterResult) {
         switch AVAudioSession.sharedInstance().recordPermission {
         case .granted:
@@ -977,8 +1099,18 @@ extension VonageVoicePlugin {
     }
 
     // ─── Caller Registry ─────────────────────────────────────────────
+    //
     // Maps Vonage user IDs to human-readable display names.
     // Used to show "John Smith" instead of "user-abc-123" on the CallKit UI.
+    // Persisted in UserDefaults (key: "VonageContactList").
+
+    /// Registers a caller display name.
+    ///
+    /// Stores `clientId → clientName` in the caller registry.
+    /// Only writes to UserDefaults if the mapping is new or changed.
+    ///
+    /// - Parameter arguments: `["id": String, "name": String]`
+    /// - Parameter result: Returns `true` on success.
 
     private func handleRegisterClient(arguments: [String: Any], result: @escaping FlutterResult) {
         guard let clientId = arguments["id"] as? String,
