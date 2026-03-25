@@ -1362,11 +1362,21 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
 
         // Apply the user's preferred audio route.
+        // Priority: user-toggled speaker > Bluetooth > earpiece (default).
         if desiredSpeakerState {
             applySpeakerSetting(toSpeaker: true)
         } else if isBluetoothAvailable() {
             desiredBluetoothState = true
             toggleBluetoothAudio(bluetoothOn: true)
+        } else {
+            // Explicitly route to earpiece — without this, iOS may default
+            // to the loudspeaker under .voiceChat mode on some devices.
+            do {
+                try audioSession.overrideOutputAudioPort(.none)
+                try setPreferredInput(portType: .builtInMic)
+            } catch {
+                sendPhoneCallEvents(description: "LOG|Earpiece fallback failed: \(error.localizedDescription)")
+            }
         }
     }
 
