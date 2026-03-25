@@ -7,7 +7,8 @@ import '../method_channel/vonage_voice_method_channel.dart';
 import 'shared_platform_interface.dart';
 import 'vonage_call_platform_interface.dart';
 
-/// Callback type for FCM device token refresh events.
+/// Callback type for device token refresh events.
+/// On Android: FCM token refresh. On iOS: VoIP push token expiry.
 typedef OnDeviceTokenChanged = Function(String token);
 
 /// Abstract platform interface for Vonage Voice session and device management.
@@ -78,14 +79,23 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   ///
   /// [accessToken] — Vonage JWT obtained from your backend
   /// [deviceToken] — FCM token for incoming call push notifications (optional)
+  /// [isSandbox] — iOS only: whether to register VoIP push token with
+  ///   Apple's sandbox (development) or production APNS. Defaults to `false`
+  ///   (production). Set to `true` when running debug/development builds.
+  ///   Ignored on Android.
   ///
   /// ```dart
   /// await VonageVoice.instance.setTokens(
   ///   accessToken: jwtFromBackend,
   ///   deviceToken: fcmToken,
+  ///   isSandbox: true, // for development builds
   /// );
   /// ```
-  Future<bool?> setTokens({required String accessToken, String? deviceToken});
+  Future<bool?> setTokens({
+    required String accessToken,
+    String? deviceToken,
+    bool isSandbox = false,
+  });
 
   /// Whether to show a missed call notification.
   /// Persisted across app restarts until overridden.

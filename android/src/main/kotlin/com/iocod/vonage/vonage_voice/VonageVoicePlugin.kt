@@ -490,11 +490,7 @@ class VonageVoicePlugin :
             // Still register FCM token if provided
             val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
             if (!fcmToken.isNullOrEmpty()) {
-                voiceClient!!.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
-                    if (tokenError != null) {
-                        logEvent("FCM token registration failed: ${tokenError.message}")
-                    }
-                }
+                registerFcmTokenWithCleanup(fcmToken)
             }
 
             result.success(true)
@@ -522,15 +518,63 @@ class VonageVoicePlugin :
             // Register FCM push token if provided
             val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
             if (!fcmToken.isNullOrEmpty()) {
-                voiceClient!!.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
-                    if (tokenError != null) {
-                        // Non-fatal — session is still valid, just no push for incoming calls
-                        logEvent("FCM token registration failed: ${tokenError.message}")
-                    }
-                }
+                registerFcmTokenWithCleanup(fcmToken)
             }
 
             result.success(true)
+        }
+    }
+
+    /**
+     * Registers an FCM push token with Vonage, first unregistering any
+     * previously stored device to avoid hitting the max-device-limit.
+     * If registration still fails with max-device-limit, retries once.
+     */
+    private fun registerFcmTokenWithCleanup(fcmToken: String) {
+        val client = voiceClient ?: return
+        val ctx = context ?: return
+
+        // Unregister old stored deviceId first (from a prior install/session)
+        val oldDeviceId = VonageClientHolder.getStoredDeviceId(ctx)
+        if (!oldDeviceId.isNullOrEmpty()) {
+            logEvent("Unregistering old deviceId before re-registering: $oldDeviceId")
+            client.unregisterDevicePushToken(oldDeviceId) { error ->
+                if (error != null) {
+                    logEvent("Old device unregister failed (non-fatal): ${error.message}")
+                }
+                doRegisterFcmToken(fcmToken, isRetry = false)
+            }
+        } else {
+            doRegisterFcmToken(fcmToken, isRetry = false)
+        }
+    }
+
+    private fun doRegisterFcmToken(fcmToken: String, isRetry: Boolean) {
+        val client = voiceClient ?: return
+        val ctx = context ?: return
+
+        logEvent("Registering FCM push token (retry=$isRetry)")
+        client.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
+            if (tokenError != null) {
+                logEvent("FCM token registration failed: ${tokenError.message}")
+
+                // Handle max-device-limit: unregister stored device and retry once
+                if (!isRetry && (tokenError.message?.contains("max-device-limit") == true)) {
+                    logEvent("Max device limit reached — attempting unregister and retry")
+                    val storedId = VonageClientHolder.getStoredDeviceId(ctx)
+                    if (!storedId.isNullOrEmpty()) {
+                        client.unregisterDevicePushToken(storedId) { unregError ->
+                            if (unregError != null) logEvent("Unregister for retry failed: ${unregError.message}")
+                            doRegisterFcmToken(fcmToken, isRetry = true)
+                        }
+                    } else {
+                        logEvent("No stored deviceId — cannot auto-recover from max-device-limit. Use Vonage REST API to clear old devices.")
+                    }
+                }
+            } else if (deviceId != null) {
+                VonageClientHolder.storeDeviceId(ctx, deviceId)
+                logEvent("FCM push token registered. deviceId=$deviceId")
+            }
         }
     }
 
@@ -626,7 +670,10 @@ class VonageVoicePlugin :
             voiceClient = null
             VonageClientHolder.voiceClient = null
             VonageClientHolder.isSessionReady = false
-            context?.let { VonageClientHolder.clearStoredJwt(it) }
+            context?.let {
+                VonageClientHolder.clearStoredJwt(it)
+                VonageClientHolder.clearStoredDeviceId(it)
+            }
             result.success(true)
         }
     }
@@ -1452,10 +1499,7 @@ class VonageVoicePlugin :
             // ── New FCM token ─────────────────────────────────────────────
             Constants.BROADCAST_NEW_FCM_TOKEN -> {
                 val token = intent.getStringExtra(Constants.EXTRA_FCM_DATA) ?: return
-                val client = voiceClient ?: return
-                client.registerDevicePushToken(token) { error, deviceId ->
-                    if (error != null) logEvent("FCM token refresh failed: ${error.message}")
-                }
+                registerFcmTokenWithCleanup(token)
             }
         }
     }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer';
+import 'dart:io';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -96,14 +97,16 @@ class _LoginScreenState extends State<LoginScreen> {
       }
 
       // Get FCM token for incoming call push notifications
-      final fcmToken = await FirebaseMessaging.instance.getToken();
-
-      log('fcm token: $fcmToken');
+      String? fcmToken;
+      if (Platform.isAndroid) {
+        fcmToken = await FirebaseMessaging.instance.getToken();
+      }
 
       // Register JWT with Vonage + FCM token for incoming calls
       final result = await VonageVoice.instance.setTokens(
         accessToken: kTestJwt,
         deviceToken: fcmToken,
+        isSandbox: false,
       );
 
       if (result == true) {
@@ -179,6 +182,7 @@ class _DialerScreenState extends State<DialerScreen> {
   final TextEditingController _numberController = TextEditingController();
   StreamSubscription<CallEvent>? _eventSub;
   StreamSubscription<RemoteMessage>? _fcmForegroundSub;
+  Timer? _incomingTimer;
   bool _calling = false;
   bool _onCallScreen = false;
   String _status = 'Ready';
@@ -232,7 +236,8 @@ class _DialerScreenState extends State<DialerScreen> {
           log('CallEvent.incoming received');
           setState(() => _status = 'incoming...');
 
-          Future.delayed(const Duration(milliseconds: 100)).then((_) {
+          _incomingTimer?.cancel();
+          _incomingTimer = Timer(const Duration(milliseconds: 100), () {
             if (!mounted) return;
 
             final activeCall = VonageVoice.instance.call.activeCall;
@@ -280,6 +285,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Call ended ──────────────────────────────────────────────────
         case CallEvent.callEnded:
+          _incomingTimer?.cancel();
           _onCallScreen = false;
           setState(() {
             _calling = false;
@@ -293,6 +299,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Missed call ─────────────────────────────────────────────────
         case CallEvent.missedCall:
+          _incomingTimer?.cancel();
           _onCallScreen = false;
           setState(() => _status = 'Missed call');
           if (mounted) {
@@ -302,6 +309,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
         // ── Declined ───────────────────────────────────────────────────
         case CallEvent.declined:
+          _incomingTimer?.cancel();
           _onCallScreen = false;
           setState(() {
             _calling = false;
@@ -384,6 +392,7 @@ class _DialerScreenState extends State<DialerScreen> {
 
   @override
   void dispose() {
+    _incomingTimer?.cancel();
     _eventSub?.cancel();
     _fcmForegroundSub?.cancel();
     _numberController.dispose();
@@ -397,70 +406,72 @@ class _DialerScreenState extends State<DialerScreen> {
         title: const Text('Vonage Voice — Dialer'),
         actions: [TextButton(onPressed: _logout, child: const Text('Logout'))],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // ── Status ──────────────────────────────────────────────────
-            Text(
-              _status,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 15),
-            ),
-            const SizedBox(height: 24),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // ── Status ──────────────────────────────────────────────────
+              Text(
+                _status,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 15),
+              ),
+              const SizedBox(height: 24),
 
-            // ── Phone number input ───────────────────────────────────────
-            TextField(
-              controller: _numberController,
-              keyboardType: TextInputType.phone,
-              readOnly: true,
-              decoration: InputDecoration(
-                hintText: 'Phone number',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.phone),
-                suffixIcon: IconButton(
-                  icon: Icon(Icons.backspace_outlined, color: Colors.black54),
-                  onPressed: () {
-                    if (_numberController.text.isNotEmpty) {
-                      setState(() {
-                        _numberController.text = _numberController.text
-                            .substring(0, _numberController.text.length - 1);
-                      });
-                    }
-                  },
+              // ── Phone number input ───────────────────────────────────────
+              TextField(
+                controller: _numberController,
+                keyboardType: TextInputType.phone,
+                readOnly: true,
+                decoration: InputDecoration(
+                  hintText: 'Phone number',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.phone),
+                  suffixIcon: IconButton(
+                    icon: Icon(Icons.backspace_outlined, color: Colors.black54),
+                    onPressed: () {
+                      if (_numberController.text.isNotEmpty) {
+                        setState(() {
+                          _numberController.text = _numberController.text
+                              .substring(0, _numberController.text.length - 1);
+                        });
+                      }
+                    },
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 16),
+              const SizedBox(height: 16),
 
-            // ── Dial button ──────────────────────────────────────────────
-            ElevatedButton.icon(
-              onPressed: _calling ? null : _makeCall,
-              icon: _calling
-                  ? const SizedBox(
-                      height: 18,
-                      width: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.call),
-              label: Text(_calling ? 'Calling...' : 'Call'),
-            ),
-            const SizedBox(height: 32),
+              // ── Dial button ──────────────────────────────────────────────
+              ElevatedButton.icon(
+                onPressed: _calling ? null : _makeCall,
+                icon: _calling
+                    ? const SizedBox(
+                        height: 18,
+                        width: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.call),
+                label: Text(_calling ? 'Calling...' : 'Call'),
+              ),
+              const SizedBox(height: 32),
 
-            // ── Dialpad ──────────────────────────────────────────────────
-            const Text(
-              'Dialpad',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            _DialPad(
-              onDigitPressed: (digit) {
-                _numberController.text += digit;
-              },
-            ),
-          ],
+              // ── Dialpad ──────────────────────────────────────────────────
+              const Text(
+                'Dialpad',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontWeight: FontWeight.w500),
+              ),
+              const SizedBox(height: 8),
+              _DialPad(
+                onDigitPressed: (digit) {
+                  _numberController.text += digit;
+                },
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -487,6 +498,17 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
   @override
   void initState() {
     super.initState();
+
+    // If the call was already cancelled before this screen mounted, pop back.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_navigated) return;
+      final current = VonageVoice.instance.call.activeCall;
+      if (current == null) {
+        _navigated = true;
+        if (mounted) Navigator.of(context).pop();
+      }
+    });
+
     // Listen for events so that answering from the notification
     // (which bypasses _answer()) still navigates to ActiveCallScreen.
     _eventSub = VonageVoice.instance.callEventsListener.listen((event) {
@@ -523,8 +545,13 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
   Future<void> _answer(BuildContext context) async {
     if (_navigated) return;
     _navigated = true;
-    await VonageVoice.instance.call.answer();
+    final result = await VonageVoice.instance.call.answer();
     if (!context.mounted) return;
+    if (result != true) {
+      // Answer failed — allow retry
+      _navigated = false;
+      return;
+    }
     final call = VonageVoice.instance.call.activeCall ?? widget.activeCall;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(builder: (_) => ActiveCallScreen(activeCall: call)),

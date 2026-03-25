@@ -35,7 +35,10 @@ class FakeMethodChannelHandler {
           const MethodChannel('vonage_voice/messages'),
           (MethodCall call) async {
             _callLog.add(call);
-            return _responses[call.method] ?? true;
+            if (_responses.containsKey(call.method)) {
+              return _responses[call.method];
+            }
+            return true;
           },
         );
   }
@@ -113,6 +116,24 @@ void main() {
 
       final recorded = handler.lastCallFor('tokens');
       expect(recorded!.arguments['deviceToken'], isNull);
+    });
+
+    test('passes isSandbox=true when specified', () async {
+      handler.setResponse('tokens', true);
+
+      await voice.setTokens(accessToken: 'jwt_123', isSandbox: true);
+
+      final recorded = handler.lastCallFor('tokens');
+      expect(recorded!.arguments['isSandbox'], isTrue);
+    });
+
+    test('isSandbox defaults to false', () async {
+      handler.setResponse('tokens', true);
+
+      await voice.setTokens(accessToken: 'jwt_123');
+
+      final recorded = handler.lastCallFor('tokens');
+      expect(recorded!.arguments['isSandbox'], isFalse);
     });
   });
 
@@ -401,6 +422,32 @@ void main() {
     });
   });
 
+  // ── processVonagePush ────────────────────────────────────────────────────
+
+  group('processVonagePush()', () {
+    test('invokes processVonagePush with data map', () async {
+      handler.setResponse('processVonagePush', 'call_id_abc');
+
+      final result = await voice.processVonagePush({
+        'nexmo': 'data',
+        'channel': 'phone',
+      });
+
+      expect(result, equals('call_id_abc'));
+      final recorded = handler.lastCallFor('processVonagePush');
+      expect(recorded, isNotNull);
+      expect(recorded!.arguments['data'], isA<Map>());
+      expect(recorded.arguments['data']['nexmo'], equals('data'));
+    });
+
+    test('returns null when not a Vonage push', () async {
+      handler.setResponse('processVonagePush', null);
+
+      final result = await voice.processVonagePush({'other': 'payload'});
+      expect(result, isNull);
+    });
+  });
+
   // ── parseCallEvent ───────────────────────────────────────────────────────
 
   group('parseCallEvent()', () {
@@ -506,8 +553,142 @@ void main() {
       );
     });
 
-    test('parses Missed Call event', () {
-      expect(voice.parseCallEvent('Missed Call'), equals(CallEvent.missedCall));
+    test('parses Missed Call event and clears activeCall', () {
+      // Set active call first
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+      expect(voice.call.activeCall, isNotNull);
+
+      final event = voice.parseCallEvent('Missed Call');
+      expect(event, equals(CallEvent.missedCall));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('parses Declined and clears activeCall', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+      expect(voice.call.activeCall, isNotNull);
+
+      final event = voice.parseCallEvent('Declined');
+      expect(event, equals(CallEvent.declined));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('parses Call Rejected and clears activeCall', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+      expect(voice.call.activeCall, isNotNull);
+
+      final event = voice.parseCallEvent('Call Rejected');
+      expect(event, equals(CallEvent.declined));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('LOG with Vonage error 31603 returns declined', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+      expect(voice.call.activeCall, isNotNull);
+
+      final event = voice.parseCallEvent('LOG|Error 31603: Call rejected');
+      expect(event, equals(CallEvent.declined));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('LOG with Vonage error 31486 returns declined', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+
+      final event = voice.parseCallEvent('LOG|Error 31486: Busy here');
+      expect(event, equals(CallEvent.declined));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('LOG with "call rejected" text returns declined', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+
+      final event = voice.parseCallEvent('LOG|call rejected by remote');
+      expect(event, equals(CallEvent.declined));
+      expect(voice.call.activeCall, isNull);
+    });
+
+    test('LOG with "Rejecting invite" does NOT return declined', () {
+      voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
+
+      final event =
+          voice.parseCallEvent('LOG|Rejecting invite id=abc-123');
+      expect(event, equals(CallEvent.log));
+      // activeCall should still be set — this is a harmless native log
+      expect(voice.call.activeCall, isNotNull);
+    });
+
+    test('LOG without error codes returns log', () {
+      final event = voice.parseCallEvent('LOG|Session created successfully');
+      expect(event, equals(CallEvent.log));
+    });
+
+    test('parses ReturningCall event', () {
+      final event = voice.parseCallEvent(
+        'ReturningCall|+1234|+5678|Outgoing',
+      );
+      expect(event, equals(CallEvent.returningCall));
+      expect(
+        voice.call.activeCall!.callDirection,
+        equals(CallDirection.outgoing),
+      );
+    });
+
+    test('parses AudioRoute| event', () {
+      final event = voice.parseCallEvent('AudioRoute|Speaker');
+      expect(event, equals(CallEvent.audioRouteChanged));
+    });
+
+    test('parses Connected| event with custom params', () {
+      final event = voice.parseCallEvent(
+        'Connected|+1234|+5678|Incoming|{"key":"value"}',
+      );
+      expect(event, equals(CallEvent.connected));
+      expect(voice.call.activeCall!.customParams, isNotNull);
+      expect(voice.call.activeCall!.customParams!['key'], equals('value'));
+    });
+
+    test('parses Incoming| with custom params', () {
+      final event = voice.parseCallEvent(
+        'Incoming|caller|callee|Incoming|{"foo":"bar"}',
+      );
+      expect(event, equals(CallEvent.incoming));
+      expect(voice.call.activeCall!.customParams!['foo'], equals('bar'));
+    });
+
+    test('Incoming| sets correct from/to', () {
+      voice.parseCallEvent('Incoming|alice|bob|Incoming');
+      expect(voice.call.activeCall!.from, equals('alice'));
+      expect(voice.call.activeCall!.to, equals('bob'));
+    });
+
+    test('Connected| sets initiated timestamp', () {
+      voice.parseCallEvent('Connected|a|b|Outgoing');
+      expect(voice.call.activeCall!.initiated, isNotNull);
+      expect(
+        voice.call.activeCall!.initiated!
+            .difference(DateTime.now())
+            .inSeconds
+            .abs(),
+        lessThan(2),
+      );
+    });
+
+    test('Ringing| does not set initiated', () {
+      voice.parseCallEvent('Ringing|a|b|Outgoing');
+      expect(voice.call.activeCall!.initiated, isNull);
+    });
+
+    test('parses simple Connected (no pipe) event', () {
+      expect(voice.parseCallEvent('Connected'), equals(CallEvent.connected));
+    });
+
+    test('parses simple Ringing (no pipe) event', () {
+      expect(voice.parseCallEvent('Ringing'), equals(CallEvent.ringing));
+    });
+
+    test('ActiveCall strips client: prefix', () {
+      voice.parseCallEvent('Incoming|client:alice|client:bob|Incoming');
+      expect(voice.call.activeCall!.from, equals('alice'));
+      expect(voice.call.activeCall!.to, equals('bob'));
     });
 
     test('parses Call Error prefix as log', () {

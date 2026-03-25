@@ -1092,6 +1092,7 @@ object VonageClientHolder {
 
     private const val PREFS_NAME = "vonage_voice_prefs"
     private const val KEY_JWT = "vonage_jwt"
+    private const val KEY_DEVICE_ID = "vonage_device_id"
 
     /** Persist the JWT so VonageFirebaseMessagingService can restore the session
      *  when the app process was killed. */
@@ -1113,6 +1114,28 @@ object VonageClientHolder {
         context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
             .edit()
             .remove(KEY_JWT)
+            .apply()
+    }
+
+    /** Persist the Vonage device ID so we can unregister it on next install/session. */
+    fun storeDeviceId(context: android.content.Context, deviceId: String) {
+        context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_DEVICE_ID, deviceId)
+            .apply()
+    }
+
+    /** Read the stored Vonage device ID (may be null). */
+    fun getStoredDeviceId(context: android.content.Context): String? {
+        return context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .getString(KEY_DEVICE_ID, null)
+    }
+
+    /** Clear the stored device ID on unregister. */
+    fun clearStoredDeviceId(context: android.content.Context) {
+        context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_DEVICE_ID)
             .apply()
     }
 }

@@ -3,7 +3,7 @@ part of '../vonage_voice.dart';
 /// Represents all possible call events emitted over the EventChannel.
 ///
 /// These events are parsed from pipe-delimited strings sent by the
-/// native Android layer and mapped to this typed enum on the Dart side.
+/// native layer (Android & iOS) and mapped to this typed enum on the Dart side.
 ///
 /// Usage:
 /// ```dart
@@ -81,4 +81,7 @@ enum CallEvent {
 
   /// Returning call event (outgoing call placed back)
   returningCall,
+
+  /// Audio route changed (e.g. speaker, bluetooth, earpiece) — iOS only
+  audioRouteChanged,
 }

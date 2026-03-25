@@ -34,7 +34,7 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
 
   // ── Event stream ──────────────────────────────────────────────────────
 
-  /// Stream of typed [CallEvent] values from the native Android layer.
+  /// Stream of typed [CallEvent] values from the native layer.
   ///
   /// The raw EventChannel strings are mapped through [parseCallEvent]
   /// before being emitted to listeners.
@@ -58,13 +58,19 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
   ///
   /// [accessToken] — Vonage JWT from your backend (maps to 'jwt' on native)
   /// [deviceToken] — FCM token for incoming call push notifications
+  /// [isSandbox] — iOS only: use sandbox APNS (default: false = production)
   ///
   /// The native layer uses 'tokens' as the method name for compatibility.
   @override
-  Future<bool?> setTokens({required String accessToken, String? deviceToken}) {
+  Future<bool?> setTokens({
+    required String accessToken,
+    String? deviceToken,
+    bool isSandbox = false,
+  }) {
     return _channel.invokeMethod('tokens', <String, dynamic>{
       "jwt": accessToken,
       "deviceToken": deviceToken,
+      "isSandbox": isSandbox,
     });
   }
 
@@ -367,14 +373,16 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
 
   // ── Event parser ──────────────────────────────────────────────────────
 
-  /// Parses a raw pipe-delimited event string from the native Android layer
-  /// into a typed [CallEvent] and updates [call.activeCall] as needed.
+  /// Parses a raw pipe-delimited event string from the native layer
+  /// (Android & iOS) into a typed [CallEvent] and updates
+  /// [call.activeCall] as needed.
   ///
-  /// Event string formats:
+  /// Both platforms emit the same pipe-delimited format:
   ///   "Ringing|+14155551234|+14158765432|Outgoing"
   ///   "Connected|+14155551234|+14158765432|Incoming"
   ///   "Incoming|+14155551234|+14158765432|Incoming|{customParams}"
-  ///   "PERMISSION|Microphone|true"
+  ///   "PERMISSION|Microphone|true"  (Android only)
+  ///   "AudioRoute|speaker|bluetoothAvailable=true"  (iOS only)
   ///   "Call Ended"
   ///   "Call Error: some message"
   @override
@@ -403,8 +411,7 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       // Vonage error codes that map to a declined / rejected call
       if (tokens[1].contains("31603") ||
           tokens[1].contains("31486") ||
-          tokens.toString().toLowerCase().contains("call rejected") ||
-          tokens.toString().toLowerCase().contains("rejecting call")) {
+          tokens[1].toLowerCase().contains("call rejected")) {
         call.activeCall = null;
         return CallEvent.declined;
       }
@@ -498,6 +505,12 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       return CallEvent.reconnecting;
     }
 
+    // ── Audio route change (iOS) ──────────────────────────────────────
+    if (state.startsWith("AudioRoute|")) {
+      printDebug('Audio route changed: $state');
+      return CallEvent.audioRouteChanged;
+    }
+
     // ── Simple single-word events ─────────────────────────────────────
     switch (state) {
       case 'Ringing':
@@ -508,8 +521,10 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
         call.activeCall = null;
         return CallEvent.callEnded;
       case 'Missed Call':
+        call.activeCall = null;
         return CallEvent.missedCall;
       case 'Call Rejected':
+      case 'Declined':
         call.activeCall = null;
         return CallEvent.declined;
       case 'Unhold':

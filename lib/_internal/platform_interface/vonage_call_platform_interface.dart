@@ -12,7 +12,7 @@ import 'shared_platform_interface.dart';
 /// answer, hangup, mute, hold, speaker, bluetooth, DTMF.
 ///
 /// The concrete implementation is [MethodChannelVonageCall] which
-/// delegates each method to the native Android layer via MethodChannel.
+/// delegates each method to the native layer (Android & iOS) via MethodChannel.
 ///
 /// Access via:
 /// ```dart

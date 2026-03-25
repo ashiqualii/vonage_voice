@@ -5,11 +5,11 @@ import '../platform_interface/vonage_call_platform_interface.dart';
 
 /// Concrete [MethodChannel] implementation of [VonageCallPlatform].
 ///
-/// Each method invokes a named method on the native Android plugin
-/// via the shared MethodChannel "vonage_voice/messages".
+/// Each method invokes a named method on the native plugin
+/// (Android & iOS) via the shared MethodChannel "vonage_voice/messages".
 ///
-/// Method names match exactly the Kotlin [VNMethodChannels] enum values
-/// so any change on the native side must be reflected here and vice versa.
+/// Method names are shared across both platforms — any change on
+/// the native side must be reflected here and vice versa.
 class MethodChannelVonageCall extends VonageCallPlatform {
   /// Holds the current active call state.
   /// Updated automatically by [MethodChannelVonageVoice.parseCallEvent].
