@@ -1,134 +1,92 @@
 # Vonage Voice — Flutter Plugin
 
-A Flutter plugin for making and receiving voice calls using the **Vonage Client SDK**, with full native integration for both Android and iOS.
+A Flutter plugin that lets you make and receive voice calls using the **Vonage Client SDK**. It works on both Android and iOS with native call screens built in — **CallKit** on iOS and **ConnectionService** on Android.
 
 | Platform | Minimum Version |
 |----------|----------------|
 | Android  | API 24 (Android 7.0) |
 | iOS      | 13.0 |
 
-### Features
+### What You Can Do With This Plugin
 
-- Incoming and outgoing voice calls
-- Native call UI — **CallKit** on iOS, **Telecom ConnectionService** on Android
-- Push delivery — **PushKit VoIP** on iOS, **Firebase Cloud Messaging (FCM)** on Android
-- Audio routing — earpiece, speaker, Bluetooth
-- Call controls — mute, hold, DTMF tones
-- Caller registry — map caller IDs to display names
-- Background & killed state support on both platforms
-- Drop-in replacement for TwilioVoice Flutter plugin
+- Make outgoing voice calls
+- Receive incoming voice calls (even when the app is in the background or killed)
+- Native incoming call screen — CallKit on iOS, system notification on Android
+- Control active calls — mute, hold, speaker, Bluetooth, DTMF tones
+- Map caller IDs to display names so the call screen shows real names
+- Audio routing — switch between earpiece, speaker, and Bluetooth during a call
 
 ---
 
 ## Table of Contents
 
-1. [Backend Setup](#1-backend-setup)
-2. [Android Setup](#2-android-setup)
-3. [iOS Setup](#3-ios-setup)
-4. [Importing](#4-importing)
-5. [Authentication & Session](#5-authentication--session)
-6. [Permissions](#6-permissions)
-7. [Push Notification Handling](#7-push-notification-handling)
-8. [Call Events](#8-call-events)
+1. [Before You Start](#1-before-you-start)
+2. [Installation](#2-installation)
+3. [Android Setup](#3-android-setup)
+4. [iOS Setup](#4-ios-setup)
+5. [Upload Push Credentials to Vonage](#5-upload-push-credentials-to-vonage)
+6. [Import & Access the Plugin](#6-import--access-the-plugin)
+7. [Login](#7-login)
+8. [Permissions](#8-permissions)
 9. [Making Outgoing Calls](#9-making-outgoing-calls)
-10. [Handling Incoming Calls](#10-handling-incoming-calls)
-11. [Call Controls](#11-call-controls)
+10. [Receiving Incoming Calls](#10-receiving-incoming-calls)
+11. [In-Call Controls](#11-in-call-controls)
 12. [Caller Registry](#12-caller-registry)
-13. [ActiveCall Model](#13-activecall-model)
-14. [Platform-Specific Features](#14-platform-specific-features)
-15. [API Reference](#15-api-reference)
+13. [Token Refresh & Logout](#13-token-refresh--logout)
+14. [All Call Events](#14-all-call-events)
+15. [ActiveCall Model](#15-activecall-model)
+16. [Platform-Specific Extras](#16-platform-specific-extras)
+17. [Full API Reference](#17-full-api-reference)
 
 ---
 
-## 1. Backend Setup
+## 1. Before You Start
 
-Before using this plugin, your **backend server** must be able to generate a **Vonage JWT** (JSON Web Token) for each user.
+Make sure you have these things ready before you begin:
 
-### Step 1 — Create a Vonage Application
+- **A Vonage Application** with Voice capability enabled. You can create one from the [Vonage Dashboard](https://dashboard.nexmo.com/applications). Note down your **Application ID**.
+- **A JWT (JSON Web Token)** for each user — your backend server generates this. You don't need to worry about how it's generated. Your app will just receive a JWT string from your backend API and pass it to this plugin.
+- **Firebase set up in your project** (Android only) — Firebase Cloud Messaging (FCM) is used to deliver incoming call notifications on Android. If you haven't set up Firebase yet, follow the [official Firebase Flutter setup guide](https://firebase.google.com/docs/flutter/setup).
+- **A VoIP push certificate** (`.p12` file) from Apple (iOS only) — this is needed so Vonage can send incoming call pushes to iOS devices. You create this in the [Apple Developer Portal](https://developer.apple.com/account/resources/certificates) under "VoIP Services Certificate" for your app's Bundle ID. Export it as a `.p12` file.
 
-1. Go to the [Vonage API Dashboard](https://dashboard.nexmo.com/applications).
-2. Create a new application with **Voice** capability enabled.
-3. Note your **Application ID** (e.g. `c923113f-73c7-4022-acb8-7d47a7b9fb61`).
-4. Download the **private key** file — your backend needs this to sign JWTs.
+---
 
-### Step 2 — Generate JWT on Your Backend
+## 2. Installation
 
-Your backend generates a JWT for each user who needs to make or receive calls. The JWT contains:
+Add the plugin and Firebase packages to your `pubspec.yaml`:
 
-| Claim | Description |
-|-------|-------------|
-| `application_id` | Your Vonage Application ID |
-| `sub` | The Vonage user identity (e.g. `"alice"`, `"agent_42"`) |
-| `exp` | Token expiration timestamp |
-| `acl` | Access control — grant permissions for voice |
-
-Example JWT generation (Node.js backend):
-
-```js
-const Vonage = require('@vonage/server-sdk');
-
-const vonage = new Vonage({
-  applicationId: 'YOUR_APPLICATION_ID',
-  privateKey: './private.key',
-});
-
-// Generate JWT for a specific user
-const jwt = vonage.generateJwt({
-  sub: 'alice',
-  exp: Math.floor(Date.now() / 1000) + 86400, // 24 hours
-  acl: {
-    paths: {
-      '/*/users/**': {},
-      '/*/conversations/**': {},
-      '/*/sessions/**': {},
-      '/*/devices/**': {},
-      '/*/image/**': {},
-      '/*/media/**': {},
-      '/*/applications/**': {},
-      '/*/push/**': {},
-      '/*/knocking/**': {},
-      '/*/legs/**': {},
-    },
-  },
-});
+```yaml
+dependencies:
+  vonage_voice:
+  firebase_core:        
+  firebase_messaging:  
 ```
 
-Your Flutter app fetches this JWT from your backend and passes it to `setTokens()`.
+Then run:
 
-### Step 3 — Upload Push Credentials to Vonage Dashboard
-
-- **Android**: Upload your **Firebase Server Key** (or FCM v1 service account JSON) to the Vonage Dashboard under your application's push credentials.
-- **iOS**: Upload your **VoIP Services push certificate** (`.p12` or `.pem`) to the Vonage Dashboard.
+```bash
+flutter pub get
+```
 
 ---
 
-## 2. Android Setup
+## 3. Android Setup
 
-### 2.1 — Firebase Cloud Messaging (FCM)
+### 3.1 — Add Firebase to Your Android App
 
-> **FCM is mandatory on Android.** It delivers incoming call push notifications when the app is in the background or killed. Without FCM, incoming calls will not work.
-
-#### Step 1 — Create a Firebase Project
-
-1. Go to the [Firebase Console](https://console.firebase.google.com/).
-2. Create a new project (or use an existing one).
-3. Add an Android app with your package name (e.g. `com.example.myapp`).
-4. Download `google-services.json` and place it in your app's `android/app/` directory.
-
-#### Step 2 — Add the Google Services Plugin
-
-In your **app-level** `android/app/build.gradle.kts`:
+1. Place your `google-services.json` file inside `android/app/`.
+2. Add the Google Services plugin to your **app-level** `android/app/build.gradle.kts`:
 
 ```kotlin
 plugins {
     id("com.android.application")
     id("kotlin-android")
     id("dev.flutter.flutter-gradle-plugin")
-    id("com.google.gms.google-services") // ← Add this
+    id("com.google.gms.google-services") // Add this line
 }
 ```
 
-Make sure the Google Services classpath is available. In your **project-level** `android/build.gradle` or `settings.gradle.kts`, the plugin must be resolvable. If using the `plugins` block in `settings.gradle.kts`:
+3. Make sure the Google Services plugin is available in your **project-level** `settings.gradle.kts`:
 
 ```kotlin
 plugins {
@@ -136,76 +94,21 @@ plugins {
 }
 ```
 
-#### Step 3 — Add Firebase Messaging Dependency
+### 3.2 — Permissions (Automatic)
 
-Add `firebase_messaging` and `firebase_core` to your Flutter project:
+You do **not** need to add any permissions to your `AndroidManifest.xml`. The plugin declares all the permissions it needs (microphone, phone state, foreground service, notifications, etc.) and they get merged into your app automatically at build time.
 
-```yaml
-dependencies:
-  firebase_core: ^3.0.0
-  firebase_messaging: ^15.0.0
-```
+### 3.3 — ProGuard / R8 (Automatic)
 
-### 2.2 — AndroidManifest Permissions
-
-The plugin's own `AndroidManifest.xml` declares all required permissions, which are **automatically merged** into your app at build time. For reference, these are the permissions the plugin uses:
-
-```xml
-<!-- Voice call (microphone) -->
-<uses-permission android:name="android.permission.RECORD_AUDIO" />
-
-<!-- Telecom ConnectionService -->
-<uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
-<uses-permission android:name="android.permission.CALL_PHONE" />
-<uses-permission android:name="android.permission.READ_PHONE_STATE" />
-<uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
-
-<!-- Foreground service for active calls -->
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-
-<!-- Push delivery when device restarts -->
-<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-<!-- Notifications (Android 13+) -->
-<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-<!-- Network -->
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-<uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-<uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-
-<!-- Keep connection alive during call -->
-<uses-permission android:name="android.permission.WAKE_LOCK" />
-```
-
-You do **not** need to add these manually — they are merged automatically from the plugin.
-
-### 2.3 — ProGuard / R8
-
-The plugin ships its own `consumerProguardFiles` that are automatically included when you build with R8 minification enabled. No extra ProGuard rules needed.
-
-```kotlin
-// In your app's build.gradle.kts — this just works:
-buildTypes {
-    release {
-        isMinifyEnabled = true
-        isShrinkResources = true
-        proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-        // Plugin's consumer rules are merged automatically
-    }
-}
-```
+If you use code minification (`isMinifyEnabled = true`) in your release build, the plugin's ProGuard rules are also merged automatically. No extra setup needed.
 
 ---
 
-## 3. iOS Setup
+## 4. iOS Setup
 
-### 3.1 — Podfile
+### 4.1 — Set Minimum iOS Version
 
-Ensure your iOS deployment target is at least **13.0**. In `ios/Podfile`:
+In your `ios/Podfile`, make sure the platform target is at least 13.0:
 
 ```ruby
 platform :ios, '13.0'
@@ -217,16 +120,16 @@ Then run:
 cd ios && pod install
 ```
 
-### 3.2 — Info.plist
+### 4.2 — Update Info.plist
 
-Add the following keys to your `ios/Runner/Info.plist`:
+Add these entries to `ios/Runner/Info.plist`:
 
 ```xml
-<!-- Required: Microphone permission description -->
+<!-- Microphone permission — shown to the user when the app asks for mic access -->
 <key>NSMicrophoneUsageDescription</key>
 <string>This app needs microphone access to make and receive voice calls.</string>
 
-<!-- Required: Background modes for VoIP and push -->
+<!-- Background modes — lets the app receive VoIP pushes and play audio in the background -->
 <key>UIBackgroundModes</key>
 <array>
     <string>audio</string>
@@ -236,87 +139,76 @@ Add the following keys to your `ios/Runner/Info.plist`:
 </array>
 ```
 
-### 3.3 — Xcode Capabilities
+### 4.3 — Enable Xcode Capabilities
 
-Open your project in Xcode and enable the following capabilities under **Signing & Capabilities**:
+Open your project in Xcode (`ios/Runner.xcworkspace`) and go to **Signing & Capabilities**. Add:
 
-| Capability | Details |
-|-----------|---------|
-| **Push Notifications** | Required for VoIP push delivery |
-| **Background Modes** | Check: Audio, AirPlay and Picture in Picture · Voice over IP · Background fetch · Remote notifications |
-
-### 3.4 — VoIP Push Certificate
-
-1. Go to the [Apple Developer Portal](https://developer.apple.com/account/resources/certificates).
-2. Create a **VoIP Services Certificate** for your app's Bundle ID.
-3. Export it as `.p12`.
-4. Upload the `.p12` to the **Vonage Dashboard** under your application's iOS push credentials.
-
-### 3.5 — APNs Environment (Sandbox vs Production)
-
-When calling `setTokens()`, the `isSandbox` parameter controls which Apple Push Notification environment is used:
-
-| Build Type | `isSandbox` Value | APNs Environment |
-|-----------|-------------------|------------------|
-| Debug / Development | `true` | Sandbox |
-| Release / Production | `false` (default) | Production |
-
-> **Important:** If `isSandbox` is set incorrectly, VoIP pushes will not be delivered and incoming calls won't ring. Use `true` for debug builds and `false` for release builds.
+| Capability | What to Check |
+|-----------|---------------|
+| **Push Notifications** | Just enable it — no extra checkboxes |
+| **Background Modes** | Check: **Audio, AirPlay and Picture in Picture**, **Voice over IP**, **Background fetch**, **Remote notifications** |
 
 ---
 
-## 4. Importing
+## 5. Upload Push Credentials to Vonage
+
+For incoming calls to work, Vonage needs your push credentials so it can send notifications to your users' devices.
+
+Go to the [Vonage Dashboard](https://dashboard.nexmo.com/applications) → your application → **Push Credentials**:
+
+- **For Android:** Upload your Firebase **Server Key** (or FCM v1 service account JSON).
+- **For iOS:** Upload your VoIP push certificate (`.p12` file).
+
+Without this step, incoming calls will **not** work.
+
+---
+
+## 6. Import & Access the Plugin
 
 ```dart
 import 'package:vonage_voice/vonage_voice.dart';
 ```
 
-This single import gives you access to:
+This gives you access to everything:
 
-- `VonageVoice` — the main plugin class
-- `VonageCall` — active call controls
-- `CallEvent` — enum of all call events
-- `ActiveCall` — model representing the current call
-- `CallDirection` — enum (`incoming` / `outgoing`)
+| Class | What It Does |
+|-------|-------------|
+| `VonageVoice` | Main plugin — login, permissions, push handling, caller registry |
+| `VonageCall` | Call controls — place, answer, hang up, mute, speaker, hold, bluetooth, DTMF |
+| `CallEvent` | All possible call events (incoming, connected, callEnded, mute, speakerOn, etc.) |
+| `ActiveCall` | Details of the current call (from, to, direction, custom params) |
+| `CallDirection` | Either `.incoming` or `.outgoing` |
 
-### Singleton Pattern
+### How to Access
 
-The plugin uses a **singleton** pattern. All access goes through two entry points:
+The plugin uses a **singleton** — you access everything through `VonageVoice.instance`:
 
 ```dart
-// Session management (login, permissions, push, etc.)
+// For login, permissions, push handling:
 VonageVoice.instance
 
-// Active call controls (place, hangUp, mute, hold, etc.)
+// For call controls (place, answer, mute, speaker, etc.):
 VonageVoice.instance.call
 ```
 
-If you're migrating from the TwilioVoice Flutter plugin:
-
-```dart
-// Before (Twilio)
-TwilioVoice.instance.setTokens(accessToken: jwt);
-TwilioVoice.instance.call.hangUp();
-
-// After (Vonage) — same API shape
-VonageVoice.instance.setTokens(accessToken: jwt);
-VonageVoice.instance.call.hangUp();
-```
-
 ---
 
-## 5. Authentication & Session
+## 7. Login
 
-### Register JWT and Device Token
-
-Call `setTokens()` to authenticate with Vonage and register for incoming calls:
+To log in, you need two things:
+1. **A JWT string** — get this from your backend API.
+2. **An FCM token** (Android only) — this lets Vonage send incoming call notifications to the device.
 
 ```dart
-import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:vonage_voice/vonage_voice.dart';
 
-Future<void> login(String jwtFromBackend) async {
-  // Get FCM token (Android only — required for incoming calls)
+Future<void> login() async {
+  // Make sure Firebase is initialized first
+  await Firebase.initializeApp();
+
+  // Get your JWT from your backend
+  final String jwt = await yourBackendApi.getVonageJwt();
+
+  // Get FCM token (Android only — needed for incoming calls)
   String? fcmToken;
   if (Platform.isAndroid) {
     fcmToken = await FirebaseMessaging.instance.getToken();
@@ -324,194 +216,261 @@ Future<void> login(String jwtFromBackend) async {
 
   // Register with Vonage
   final success = await VonageVoice.instance.setTokens(
-    accessToken: jwtFromBackend,    // JWT from your backend
-    deviceToken: fcmToken,          // FCM token (Android) or null (iOS)
-    isSandbox: false,               // true for iOS debug builds
+    accessToken: jwt,           // Your JWT from backend
+    deviceToken: fcmToken,      // FCM token (Android) — pass null on iOS
+    isSandbox: false,           // iOS only: true for debug builds, false for release
   );
 
   if (success == true) {
-    print('Logged in successfully');
+    print('Logged in!');
   }
 }
 ```
 
-> **iOS Note:** On iOS, the plugin automatically handles VoIP push token registration via PushKit. You do **not** need to pass a device token — just pass `null` or omit it.
+### What Each Parameter Means
 
-### Logout / Unregister
-
-```dart
-await VonageVoice.instance.unregister();
-```
-
-### Refresh Session
-
-If your JWT is about to expire, refresh it without destroying the session:
-
-```dart
-await VonageVoice.instance.refreshSession(
-  accessToken: newJwtFromBackend,
-);
-```
-
-### Handle Device Token Refresh
-
-When the FCM token is refreshed (Android), re-register it with your backend:
-
-```dart
-VonageVoice.instance.setOnDeviceTokenChanged((newToken) {
-  // Send newToken to your backend, then call setTokens() again
-  print('Device token refreshed: $newToken');
-});
-```
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `accessToken` | Yes | The Vonage JWT string from your backend |
+| `deviceToken` | Android only | The FCM token. On iOS, leave it as `null` — the plugin handles VoIP push tokens automatically via PushKit |
+| `isSandbox` | iOS only | Set to `true` when running debug/development builds, `false` for release. This tells the plugin which Apple Push environment to use. If set wrong, incoming calls won't work on iOS |
 
 ---
 
-## 6. Permissions
+## 8. Permissions
 
-### 6.1 — Microphone (Both Platforms)
+Before making or receiving calls, you need to request some permissions. The plugin gives you methods for each one.
+
+### 8.1 — Microphone (Both Platforms)
+
+This is the only permission needed on iOS. On Android, you need a few more.
 
 ```dart
-final hasMic = await VonageVoice.instance.hasMicAccess();
-if (!hasMic) {
+if (!await VonageVoice.instance.hasMicAccess()) {
   await VonageVoice.instance.requestMicAccess();
 }
 ```
 
-### 6.2 — Android-Only Permissions
+### 8.2 — Android Permissions
 
-Request all required Android permissions before making or receiving calls:
+On Android, several permissions are needed for the call system to work properly:
 
 ```dart
 import 'dart:io';
 
-Future<void> requestAllPermissions() async {
+Future<void> requestAndroidPermissions() async {
   if (!Platform.isAndroid) return;
 
-  // Phone state
+  // Microphone — needed to capture voice during calls
+  if (!await VonageVoice.instance.hasMicAccess()) {
+    await VonageVoice.instance.requestMicAccess();
+  }
+
+  // Phone state — needed by Android's call system
   if (!await VonageVoice.instance.hasReadPhoneStatePermission()) {
     await VonageVoice.instance.requestReadPhoneStatePermission();
   }
 
-  // Call phone
+  // Call phone — needed to place outgoing calls
   if (!await VonageVoice.instance.hasCallPhonePermission()) {
     await VonageVoice.instance.requestCallPhonePermission();
   }
 
-  // Manage own calls (Telecom)
+  // Manage own calls — needed for Android's Telecom framework
   if (!await VonageVoice.instance.hasManageOwnCallsPermission()) {
     await VonageVoice.instance.requestManageOwnCallsPermission();
   }
 
-  // Read phone numbers
+  // Read phone numbers — needed by some phone manufacturers
   if (!await VonageVoice.instance.hasReadPhoneNumbersPermission()) {
     await VonageVoice.instance.requestReadPhoneNumbersPermission();
   }
 
-  // Notifications (Android 13+)
+  // Notifications (Android 13+) — needed to show call notifications
   if (!await VonageVoice.instance.hasNotificationPermission()) {
     await VonageVoice.instance.requestNotificationPermission();
-  }
-
-  // Microphone
-  if (!await VonageVoice.instance.hasMicAccess()) {
-    await VonageVoice.instance.requestMicAccess();
   }
 }
 ```
 
-### 6.3 — Phone Account Registration (Android)
+### 8.3 — Phone Account (Android)
 
-Android requires your app to register as a **Telecom PhoneAccount** to handle calls through the system:
+Android needs your app to be registered as a "phone account" in the system before it can handle calls:
 
 ```dart
-// Check if phone account is registered
-final hasAccount = await VonageVoice.instance.hasRegisteredPhoneAccount();
-
-if (!hasAccount) {
+// Register the phone account (do this once, like on first launch)
+if (!await VonageVoice.instance.hasRegisteredPhoneAccount()) {
   await VonageVoice.instance.registerPhoneAccount();
 }
 
-// Check if the user has enabled the phone account in system settings
-final isEnabled = await VonageVoice.instance.isPhoneAccountEnabled();
-
-if (!isEnabled) {
-  // Open system settings so the user can enable it
+// Check if the user has enabled it in system settings
+if (!await VonageVoice.instance.isPhoneAccountEnabled()) {
+  // This opens the system settings screen where the user can enable it
   await VonageVoice.instance.openPhoneAccountSettings();
 }
 ```
 
-### 6.4 — Full-Screen Intent (Android 14+)
+### 8.4 — Full-Screen Incoming Call (Android 14+)
 
-On Android 14 (API 34) and above, `USE_FULL_SCREEN_INTENT` is a special permission. Without it, the incoming call notification won't show as a full-screen overlay on the lock screen.
+On Android 14 and newer, you need a special permission to show the incoming call as a full-screen notification on the lock screen. Without it, it will only appear as a small notification.
 
 ```dart
-final canShow = await VonageVoice.instance.canUseFullScreenIntent();
-
-if (!canShow) {
+if (!await VonageVoice.instance.canUseFullScreenIntent()) {
   await VonageVoice.instance.openFullScreenIntentSettings();
 }
 ```
 
-### 6.5 — Battery Optimization (Android)
+### 8.5 — Battery Optimization (Android — Important!)
 
-On OEMs like **Vivo**, **Xiaomi**, **OPPO**, and **Samsung**, aggressive battery optimization can kill the app process and prevent FCM from delivering incoming call pushes.
+Phone manufacturers like **Vivo, Xiaomi, OPPO, and Samsung** have aggressive battery management that can kill your app in the background. When this happens, incoming call notifications won't arrive.
+
+**This is the #1 reason incoming calls fail on these devices.** Always request this during your app's setup:
 
 ```dart
-final isOptimized = await VonageVoice.instance.isBatteryOptimized();
-
-if (isOptimized) {
-  // Opens system dialog to exempt the app
+if (await VonageVoice.instance.isBatteryOptimized()) {
   await VonageVoice.instance.requestBatteryOptimizationExemption();
 }
 ```
 
-> **Highly recommended:** Always check and request battery optimization exemption during onboarding. This is the #1 reason incoming calls fail on Chinese OEM devices.
+### 8.6 — Auto-Reject Calls on Missing Permissions (Android, Optional)
 
-### 6.6 — Auto-Reject Calls on Missing Permissions (Android)
-
-Automatically reject incoming calls when required permissions are not granted:
+You can tell the plugin to automatically reject incoming calls if the user hasn't granted the required permissions (like microphone). This prevents calls from connecting with no audio.
 
 ```dart
-// Enable auto-rejection
 await VonageVoice.instance.rejectCallOnNoPermissions(shouldReject: true);
 
-// Check current setting
+// Check the current setting:
 final isRejecting = await VonageVoice.instance.isRejectingCallOnNoPermissions();
 ```
 
 ---
 
-## 7. Push Notification Handling
+## 9. Making Outgoing Calls
 
-On Android, incoming calls arrive as FCM push notifications. Flutter's `firebase_messaging` plugin intercepts these messages **before** the native Vonage SDK can process them. You must forward them manually.
-
-### Background Handler (Top-Level Function)
+### Place a Call
 
 ```dart
+final success = await VonageVoice.instance.call.place(
+  from: 'alice',             // Your Vonage user identity
+  to: '+14155551234',        // Who you're calling (phone number or Vonage user)
+  extraOptions: {            // Optional — custom data sent to your backend
+    'displayName': 'Alice',
+  },
+);
+
+if (success == true) {
+  print('Call placed!');
+}
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `from` | Yes | Your Vonage user identity (the caller) |
+| `to` | Yes | The destination — a phone number like `+14155551234` or another Vonage user identity |
+| `extraOptions` | No | A map of key-value pairs that gets forwarded to your Vonage backend. Use it to pass things like display names, recording flags, or any custom data |
+
+### What Happens After You Place a Call
+
+The plugin fires events as the call progresses. Listen to them to update your UI:
+
+```dart
+VonageVoice.instance.callEventsListener.listen((event) {
+  switch (event) {
+    case CallEvent.ringing:
+      // The other person's phone is ringing
+      print('Ringing...');
+      break;
+    case CallEvent.connected:
+      // Both sides are connected — you can talk now
+      print('Connected!');
+      break;
+    case CallEvent.callEnded:
+      // The call is over
+      print('Call ended');
+      break;
+    default:
+      break;
+  }
+});
+```
+
+**Outgoing call flow:**
+1. You call `place()` → the call starts
+2. `CallEvent.ringing` → the other side is ringing
+3. `CallEvent.connected` → call connected, both sides can talk
+4. `CallEvent.callEnded` → call ended (either side hung up)
+
+### Get Active Call Details
+
+Once a call starts, you can access its details anytime:
+
+```dart
+final call = VonageVoice.instance.call.activeCall;
+
+if (call != null) {
+  print(call.from);           // Who's calling (e.g. "alice")
+  print(call.to);             // Who's being called (e.g. "+14155551234")
+  print(call.fromFormatted);  // Formatted nicely: "(415) 555-1234"
+  print(call.toFormatted);    // Formatted nicely
+  print(call.callDirection);  // CallDirection.outgoing
+  print(call.initiated);      // DateTime when call connected (null until connected)
+  print(call.customParams);   // Custom data from your backend (if any)
+}
+```
+
+---
+
+## 10. Receiving Incoming Calls
+
+Incoming calls work differently on each platform:
+
+- **Android:** Vonage sends a Firebase push notification → the plugin's native code picks it up → shows a system call notification (or full-screen UI on lock screen).
+- **iOS:** Vonage sends a VoIP push via Apple's PushKit → the plugin handles it automatically → CallKit shows the native incoming call screen.
+
+### 10.1 — Forward Firebase Push to Vonage (Android — Required)
+
+On Android, Flutter's `firebase_messaging` package intercepts push messages **before** the native Vonage SDK can see them. You need to forward these messages so the plugin can process incoming calls.
+
+You need **two** handlers — one for when the app is in the background/killed, and one for when it's in the foreground:
+
+#### Background Handler
+
+This must be a **top-level function** (not inside any class). Add it to your `main.dart`:
+
+```dart
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:vonage_voice/vonage_voice.dart';
 
-// Must be a top-level function (not inside a class)
+// Must be top-level — not inside a class
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await VonageVoice.instance.processVonagePush(message.data);
+  if (message.data.isNotEmpty) {
+    await VonageVoice.instance.processVonagePush(message.data);
+  }
 }
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+
+  // Register the background handler — must be before runApp()
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
   runApp(MyApp());
 }
 ```
 
-### Foreground Handler
+#### Foreground Handler
+
+Add this in your main screen's `initState()`:
 
 ```dart
 @override
 void initState() {
   super.initState();
 
-  // Forward FCM messages received while app is in foreground
+  // Forward push messages received while app is open
   FirebaseMessaging.onMessage.listen((RemoteMessage message) {
     if (message.data.isNotEmpty) {
       VonageVoice.instance.processVonagePush(message.data);
@@ -520,265 +479,207 @@ void initState() {
 }
 ```
 
-> **Why both handlers?** The background handler processes incoming call pushes when the app is backgrounded or killed. The foreground handler ensures pushes received while the app is active also reach the Vonage SDK.
+> **Why do you need both?** The background handler runs when the app is closed or in the background. The foreground handler runs when the app is open. Without both, you'll miss incoming calls in some situations.
 
-> **iOS Note:** On iOS, incoming call pushes are delivered via **PushKit** directly to the native layer. The plugin handles this automatically — you do **not** need FCM on iOS.
+> **iOS:** You don't need any of this on iOS. The plugin handles VoIP pushes automatically through PushKit. No Firebase code needed for iOS incoming calls.
 
----
+### 10.2 — Listen for Incoming Calls
 
-## 8. Call Events
-
-### Listening to Events
-
-```dart
-VonageVoice.instance.callEventsListener.listen((CallEvent event) {
-  switch (event) {
-    case CallEvent.incoming:
-      final call = VonageVoice.instance.call.activeCall;
-      print('Incoming call from ${call?.fromFormatted}');
-      break;
-    case CallEvent.ringing:
-      print('Outgoing call is ringing');
-      break;
-    case CallEvent.connected:
-      print('Call connected');
-      break;
-    case CallEvent.callEnded:
-      print('Call ended');
-      break;
-    case CallEvent.hold:
-      print('Call on hold');
-      break;
-    case CallEvent.unhold:
-      print('Call resumed');
-      break;
-    case CallEvent.mute:
-      print('Microphone muted');
-      break;
-    case CallEvent.unmute:
-      print('Microphone unmuted');
-      break;
-    case CallEvent.speakerOn:
-      print('Speaker enabled');
-      break;
-    case CallEvent.speakerOff:
-      print('Speaker disabled');
-      break;
-    case CallEvent.bluetoothOn:
-      print('Bluetooth audio connected');
-      break;
-    case CallEvent.bluetoothOff:
-      print('Bluetooth audio disconnected');
-      break;
-    case CallEvent.missedCall:
-      print('Missed call');
-      break;
-    case CallEvent.declined:
-      print('Call declined');
-      break;
-    case CallEvent.reconnecting:
-      print('Reconnecting...');
-      break;
-    case CallEvent.reconnected:
-      print('Reconnected');
-      break;
-    default:
-      break;
-  }
-});
-```
-
-### All Call Events
-
-| Event | Description |
-|-------|-------------|
-| `incoming` | Incoming call invite received |
-| `ringing` | Outbound call is ringing on the remote side |
-| `connected` | Call media connected — both parties can speak |
-| `reconnecting` | Call media is reconnecting after a network interruption |
-| `reconnected` | Call media reconnected after a network interruption |
-| `callEnded` | Call ended — local hangup or remote disconnect |
-| `hold` | Call placed on hold |
-| `unhold` | Call resumed from hold |
-| `mute` | Microphone muted |
-| `unmute` | Microphone unmuted |
-| `speakerOn` | Audio routed to speakerphone |
-| `speakerOff` | Audio routed away from speakerphone |
-| `bluetoothOn` | Audio routed to Bluetooth headset |
-| `bluetoothOff` | Audio routed away from Bluetooth headset |
-| `declined` | Call was declined by remote party |
-| `answer` | Incoming call was answered |
-| `missedCall` | Incoming call was missed (cancelled before answered) |
-| `returningCall` | Returning call event |
-| `audioRouteChanged` | Audio route changed (iOS only) |
-| `log` | Diagnostic / informational log event |
-| `permission` | A runtime permission result was received |
-
----
-
-## 9. Making Outgoing Calls
-
-```dart
-final success = await VonageVoice.instance.call.place(
-  from: 'alice',           // Your Vonage user identity
-  to: '+14155551234',      // Destination phone number or Vonage user
-  extraOptions: {          // Optional: custom params sent to your backend
-    'custom_key': 'value',
-  },
-);
-
-if (success == true) {
-  print('Call placed successfully');
-}
-```
-
-The call flow after placing:
-
-1. `CallEvent.ringing` — the remote side is ringing
-2. `CallEvent.connected` — the call is answered and media is flowing
-3. `CallEvent.callEnded` — the call ends
-
----
-
-## 10. Handling Incoming Calls
-
-When an incoming call arrives:
-
-1. A `CallEvent.incoming` event is emitted.
-2. On **iOS**, CallKit automatically shows the native incoming call screen.
-3. On **Android**, the Telecom ConnectionService shows the incoming call notification.
+When an incoming call arrives, the plugin fires `CallEvent.incoming`. Listen for it:
 
 ```dart
 VonageVoice.instance.callEventsListener.listen((event) {
   if (event == CallEvent.incoming) {
-    // Get caller information
-    final activeCall = VonageVoice.instance.call.activeCall;
-    print('Incoming from: ${activeCall?.fromFormatted}');
-    print('To: ${activeCall?.toFormatted}');
-    print('Direction: ${activeCall?.callDirection}');
-    print('Custom params: ${activeCall?.customParams}');
+    // An incoming call is here!
+    final call = VonageVoice.instance.call.activeCall;
+
+    print('Incoming call from: ${call?.fromFormatted}');
+    print('To: ${call?.toFormatted}');
+    print('Direction: ${call?.callDirection}');   // CallDirection.incoming
+    print('Custom params: ${call?.customParams}'); // Data from your backend
+
+    // At this point, the native call screen is already showing
+    // (CallKit on iOS, system notification on Android).
+    // You can also build your own in-app incoming call UI if you want.
   }
 });
 ```
 
-### Answer an Incoming Call
+### 10.3 — Answer or Decline
+
+#### Answer the Call
 
 ```dart
 await VonageVoice.instance.call.answer();
 ```
 
-### Decline an Incoming Call
+After answering, the plugin fires `CallEvent.answer` followed by `CallEvent.connected` once both sides can talk.
+
+#### Decline the Call
 
 ```dart
 await VonageVoice.instance.call.hangUp();
 ```
+
+After declining, the plugin fires `CallEvent.callEnded`.
+
+> **Note:** The user can also answer or decline from the native call screen (CallKit / system notification) without any Flutter code. The plugin handles that automatically.
+
+### 10.4 — Incoming Call Event Flow
+
+Here's the full sequence of events for an incoming call:
+
+1. `CallEvent.incoming` → a call invite arrived
+2. User answers → `CallEvent.answer` → `CallEvent.connected` → both sides can talk
+3. Call ends → `CallEvent.callEnded`
+
+Or if the user doesn't answer:
+1. `CallEvent.incoming` → a call invite arrived
+2. Caller gives up → `CallEvent.missedCall`
+
+Or if the user declines:
+1. `CallEvent.incoming` → a call invite arrived
+2. User declines → `CallEvent.callEnded`
 
 ---
 
-## 11. Call Controls
+## 11. In-Call Controls
 
-All call controls are accessed via `VonageVoice.instance.call`.
+Once a call is connected, you can control it using `VonageVoice.instance.call`. Every action below fires a corresponding `CallEvent` so you can update your UI.
 
-### Hang Up
+### 11.1 — Mute / Unmute
 
-```dart
-await VonageVoice.instance.call.hangUp();
-```
-
-### Mute / Unmute
+Stop or start sending your voice to the other person.
 
 ```dart
-// Mute the microphone
+// Mute your microphone
 await VonageVoice.instance.call.toggleMute(true);
 
-// Unmute the microphone
+// Unmute your microphone
 await VonageVoice.instance.call.toggleMute(false);
 
-// Check if currently muted
-final muted = await VonageVoice.instance.call.isMuted();
+// Check if you're currently muted
+final isMuted = await VonageVoice.instance.call.isMuted();
 ```
 
-### Speaker
+**Events fired:**
+- `CallEvent.mute` — when microphone is muted
+- `CallEvent.unmute` — when microphone is unmuted
+
+### 11.2 — Speaker On / Off
+
+Switch between the earpiece (default) and the loudspeaker.
 
 ```dart
-// Enable speakerphone
+// Turn on speaker
 await VonageVoice.instance.call.toggleSpeaker(true);
 
-// Disable speakerphone (back to earpiece)
+// Turn off speaker (back to earpiece)
 await VonageVoice.instance.call.toggleSpeaker(false);
 
-// Check if speaker is on
-final speaker = await VonageVoice.instance.call.isOnSpeaker();
+// Check if speaker is currently on
+final isOnSpeaker = await VonageVoice.instance.call.isOnSpeaker();
 ```
 
-### Hold / Resume
+**Events fired:**
+- `CallEvent.speakerOn` — when audio switches to speaker
+- `CallEvent.speakerOff` — when audio switches away from speaker
+
+### 11.3 — Hold / Resume
+
+Put the call on hold or resume it. The other person will hear silence (or hold music if your backend is set up for that).
 
 ```dart
-// Put call on hold
+// Put the call on hold
 await VonageVoice.instance.call.holdCall(holdCall: true);
 
-// Resume call
+// Resume the call
 await VonageVoice.instance.call.holdCall(holdCall: false);
 
-// Check if on hold
-final holding = await VonageVoice.instance.call.isHolding();
+// Check if the call is currently on hold
+final isHolding = await VonageVoice.instance.call.isHolding();
 ```
 
-### Bluetooth Audio
+**Events fired:**
+- `CallEvent.hold` — when call is placed on hold
+- `CallEvent.unhold` — when call is resumed
+
+### 11.4 — Bluetooth Audio
+
+Route the call audio to a connected Bluetooth headset or speaker. This section covers the full flow — from checking if Bluetooth is available to actually routing the audio.
+
+#### Basic Usage
 
 ```dart
-// Route audio to Bluetooth headset
+// Route audio to Bluetooth device
 await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: true);
 
-// Route audio away from Bluetooth
+// Route audio back to earpiece/speaker
 await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: false);
 
-// Check current Bluetooth state
-final btOn = await VonageVoice.instance.call.isBluetoothOn();
+// Check if audio is currently going through Bluetooth
+final isBtOn = await VonageVoice.instance.call.isBluetoothOn();
+```
 
-// Check if a Bluetooth audio device is connected and available
-final btAvailable = await VonageVoice.instance.call.isBluetoothAvailable();
+**Events fired:**
+- `CallEvent.bluetoothOn` — when audio routes to Bluetooth
+- `CallEvent.bluetoothOff` — when audio routes away from Bluetooth
 
-// Check if the device's Bluetooth adapter is enabled
-final btEnabled = await VonageVoice.instance.call.isBluetoothEnabled();
+#### Helper Methods
 
-// Show native "Turn on Bluetooth?" dialog
-final userEnabled = await VonageVoice.instance.call.showBluetoothEnablePrompt();
+Before routing to Bluetooth, you might want to check a few things:
 
-// Open system Bluetooth settings to pair/connect devices
+```dart
+// Is a Bluetooth audio device connected and ready?
+final isAvailable = await VonageVoice.instance.call.isBluetoothAvailable();
+
+// Is the device's Bluetooth adapter turned on?
+final isEnabled = await VonageVoice.instance.call.isBluetoothEnabled();
+
+// Ask the user to turn on Bluetooth (Android only — does nothing on iOS)
+final userSaidYes = await VonageVoice.instance.call.showBluetoothEnablePrompt();
+
+// Open system Bluetooth settings so user can pair/connect a device
 await VonageVoice.instance.call.openBluetoothSettings();
 ```
 
-#### Full Bluetooth Flow Example
+#### Full Bluetooth Flow (Recommended)
+
+Here's how to handle Bluetooth properly in a real app — checking each step before proceeding:
 
 ```dart
-Future<void> toggleBluetooth(bool enable) async {
+Future<void> handleBluetoothToggle(bool enable) async {
+  // Turning off is simple
   if (!enable) {
     await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: false);
     return;
   }
 
-  // 1. Check if Bluetooth adapter is enabled
+  // Step 1: Is Bluetooth turned on?
   final btEnabled = await VonageVoice.instance.call.isBluetoothEnabled() ?? false;
   if (!btEnabled) {
+    // Ask the user to turn it on (Android only)
     final userEnabled = await VonageVoice.instance.call.showBluetoothEnablePrompt() ?? false;
-    if (!userEnabled) return;
-    await Future.delayed(const Duration(seconds: 2)); // Wait for devices to connect
+    if (!userEnabled) return; // User said no
+    // Wait a moment for paired devices to auto-connect
+    await Future.delayed(const Duration(seconds: 2));
   }
 
-  // 2. Check if a Bluetooth audio device is available
+  // Step 2: Is a Bluetooth audio device connected?
   final btAvailable = await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
   if (btAvailable) {
+    // Device is connected — route audio to it
     await VonageVoice.instance.call.toggleBluetooth(bluetoothOn: true);
   } else {
+    // No device connected — open settings so user can pair one
     await VonageVoice.instance.call.openBluetoothSettings();
   }
 }
 ```
 
-### DTMF (Dial Tones)
+### 11.5 — DTMF Tones (Dial Pad)
 
-Send DTMF tones during an active call (e.g. for IVR menus):
+Send dial tones during an active call. This is used for things like navigating phone menus ("Press 1 for sales...").
 
 ```dart
 // Send a single digit
@@ -791,54 +692,170 @@ await VonageVoice.instance.call.sendDigits('1234');
 await VonageVoice.instance.call.sendDigits('*#');
 ```
 
-### Call Status
+### 11.6 — Hang Up
 
 ```dart
-// Check if there is an active call
+await VonageVoice.instance.call.hangUp();
+```
+
+**Event fired:** `CallEvent.callEnded`
+
+### 11.7 — Check Call Status
+
+```dart
+// Is there an active call right now?
 final onCall = await VonageVoice.instance.call.isOnCall();
 
-// Get the Vonage call ID
+// Get the Vonage call ID (useful for logging or debugging)
 final callId = await VonageVoice.instance.call.getSid();
 
-// Get the active call object
+// Get the full active call object
 final activeCall = VonageVoice.instance.call.activeCall;
+```
+
+### 11.8 — Sync Your UI with Audio State
+
+When a call connects (or reconnects), it's a good idea to check the current audio state so your UI buttons show the correct state. For example, if the user answered from a Bluetooth headset, your Bluetooth button should show as "on" right away.
+
+```dart
+VonageVoice.instance.callEventsListener.listen((event) {
+  if (event == CallEvent.connected || event == CallEvent.reconnected) {
+    _syncAudioState();
+  }
+});
+
+Future<void> _syncAudioState() async {
+  final isMuted = await VonageVoice.instance.call.isMuted() ?? false;
+  final isOnSpeaker = await VonageVoice.instance.call.isOnSpeaker() ?? false;
+  final isBtOn = await VonageVoice.instance.call.isBluetoothOn() ?? false;
+  final isBtAvailable = await VonageVoice.instance.call.isBluetoothAvailable() ?? false;
+
+  // Update your UI state with these values
+  setState(() {
+    _muted = isMuted;
+    _speakerOn = isOnSpeaker;
+    _bluetoothOn = isBtOn;
+    _bluetoothAvailable = isBtAvailable;
+  });
+}
 ```
 
 ---
 
 ## 12. Caller Registry
 
-Map caller identities to human-readable display names. These names appear on the incoming call screen (CallKit on iOS, notification on Android).
+You can map caller IDs to human-readable names. These names show up on the native incoming call screen (CallKit on iOS, system notification on Android).
 
 ```dart
-// Register a caller name
+// Register display names for known callers
 await VonageVoice.instance.registerClient('user_123', 'John Doe');
 await VonageVoice.instance.registerClient('user_456', 'Jane Smith');
+await VonageVoice.instance.registerClient('+14155551234', 'Bob Jones');
 
 // Remove a registered name
 await VonageVoice.instance.unregisterClient('user_123');
 
-// Set a fallback name for unregistered callers
+// Set a fallback name for callers who are not registered
 await VonageVoice.instance.setDefaultCallerName('Unknown Caller');
 ```
 
+When someone calls, the plugin checks the registry:
+1. If the caller's ID matches a registered name → that name is shown.
+2. If no match → the default caller name is shown.
+3. If no default is set → "Unknown Caller" is shown.
+
 ---
 
-## 13. ActiveCall Model
+## 13. Token Refresh & Logout
 
-When a call is active (or pending), you can access its details:
+### Refresh JWT Before It Expires
+
+Vonage JWTs have an expiry time (usually 24 hours). Before it expires, refresh it so the session stays alive:
+
+```dart
+final freshJwt = await yourBackendApi.getNewVonageJwt();
+await VonageVoice.instance.refreshSession(accessToken: freshJwt);
+```
+
+If the JWT has already expired, `refreshSession` won't work — you'll need to call `setTokens()` again to start a new session.
+
+### Handle Device Token Changes
+
+The FCM token can change at any time (e.g., when the user reinstalls the app or restores from a backup). Listen for changes and re-register:
+
+```dart
+VonageVoice.instance.setOnDeviceTokenChanged((newToken) {
+  // Send this new token to your backend,
+  // then call setTokens() again with the new token
+  print('FCM token changed: $newToken');
+});
+```
+
+### Logout
+
+To log the user out and stop receiving incoming calls:
+
+```dart
+await VonageVoice.instance.unregister();
+```
+
+This unregisters the push token and ends the Vonage session. The device will no longer receive incoming call notifications until `setTokens()` is called again.
+
+---
+
+## 14. All Call Events
+
+Listen to call events to know what's happening at any time:
+
+```dart
+VonageVoice.instance.callEventsListener.listen((CallEvent event) {
+  // Handle the event
+});
+```
+
+Here's every possible event:
+
+| Event | When It Fires |
+|-------|--------------|
+| `incoming` | An incoming call invite arrived |
+| `ringing` | Your outgoing call is ringing on the other person's phone |
+| `connected` | Call is connected — both sides can talk |
+| `reconnecting` | Call lost network — trying to reconnect |
+| `reconnected` | Call reconnected after a network interruption |
+| `callEnded` | Call is over (either side hung up, or an error) |
+| `answer` | Incoming call was answered |
+| `declined` | The other side declined the call |
+| `missedCall` | Incoming call was not answered (caller gave up) |
+| `hold` | Call was placed on hold |
+| `unhold` | Call was resumed from hold |
+| `mute` | Microphone was muted |
+| `unmute` | Microphone was unmuted |
+| `speakerOn` | Audio switched to speaker |
+| `speakerOff` | Audio switched away from speaker |
+| `bluetoothOn` | Audio switched to Bluetooth device |
+| `bluetoothOff` | Audio switched away from Bluetooth |
+| `returningCall` | A return call was placed |
+| `audioRouteChanged` | Audio route changed (iOS only) |
+| `log` | A diagnostic log event (for debugging) |
+| `permission` | A permission result was received |
+
+---
+
+## 15. ActiveCall Model
+
+When a call is active, you can access its details through `VonageVoice.instance.call.activeCall`. It returns an `ActiveCall` object (or `null` if there's no call).
 
 ```dart
 final call = VonageVoice.instance.call.activeCall;
 
 if (call != null) {
-  print(call.from);           // Raw caller number/identity
-  print(call.fromFormatted);  // Formatted: "(415) 555-1234"
-  print(call.to);             // Raw destination number/identity
+  print(call.from);           // "alice" or "+14155551234"
+  print(call.fromFormatted);  // "(415) 555-1234" (nicely formatted)
+  print(call.to);             // The destination
   print(call.toFormatted);    // Formatted destination
   print(call.initiated);      // DateTime when connected (null until connected)
   print(call.callDirection);  // CallDirection.incoming or .outgoing
-  print(call.customParams);   // Map from your Vonage backend (nullable)
+  print(call.customParams);   // Map of custom data from your backend (can be null)
 }
 ```
 
@@ -846,133 +863,127 @@ if (call != null) {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `from` | `String` | Raw caller number or identity (`client:` prefix stripped) |
-| `fromFormatted` | `String` | Human-readable formatted caller number |
-| `to` | `String` | Raw destination number or identity |
-| `toFormatted` | `String` | Human-readable formatted destination |
-| `initiated` | `DateTime?` | Timestamp when call connected (null until `CallEvent.connected`) |
+| `from` | `String` | The caller's ID or phone number (with `client:` prefix removed) |
+| `fromFormatted` | `String` | Same, but formatted nicely (e.g. "(415) 555-1234") |
+| `to` | `String` | The destination ID or phone number |
+| `toFormatted` | `String` | Same, but formatted nicely |
+| `initiated` | `DateTime?` | When the call connected. `null` until `CallEvent.connected` fires |
 | `callDirection` | `CallDirection` | `.incoming` or `.outgoing` |
-| `customParams` | `Map<String, dynamic>?` | Custom parameters from your Vonage backend |
-
-### CallDirection Enum
-
-| Value | Description |
-|-------|-------------|
-| `CallDirection.incoming` | Call received from a remote party |
-| `CallDirection.outgoing` | Call placed by the local user |
+| `customParams` | `Map<String, dynamic>?` | Custom data from your Vonage backend. Can be `null` |
 
 ---
 
-## 14. Platform-Specific Features
+## 16. Platform-Specific Extras
 
-### iOS Only
+### Missed Call Notifications (Both Platforms)
 
-#### CallKit Icon
-
-Set a custom icon displayed in the native CallKit UI:
+Control whether the plugin shows a notification when a call is missed:
 
 ```dart
-await VonageVoice.instance.updateCallKitIcon(icon: 'CallKitIcon');
+// Show missed call notifications
+VonageVoice.instance.showMissedCallNotifications = true;
+
+// Don't show missed call notifications
+VonageVoice.instance.showMissedCallNotifications = false;
 ```
 
-> The icon must be a 40x40pt template image added to your iOS app's asset catalog.
+### CallKit Icon (iOS Only)
 
-#### isSandbox Parameter
-
-See [APNs Environment](#35--apns-environment-sandbox-vs-production) — controls whether VoIP pushes use Apple's sandbox or production environment.
-
-### Android Only
-
-#### Phone Account (Telecom ConnectionService)
-
-See [Phone Account Registration](#63--phone-account-registration-android).
-
-#### Battery Optimization Exemption
-
-See [Battery Optimization](#65--battery-optimization-android).
-
-#### Full-Screen Intent (Android 14+)
-
-See [Full-Screen Intent](#64--full-screen-intent-android-14).
-
-#### Missed Call Notifications
-
-Control whether the plugin shows a notification for missed calls:
+Show a custom icon on the iOS CallKit incoming call screen:
 
 ```dart
-VonageVoice.instance.showMissedCallNotifications = true;  // or false
+await VonageVoice.instance.updateCallKitIcon(icon: 'MyCallIcon');
 ```
+
+The icon must be a **40x40pt template image** (white content on transparent background) added to your iOS app's asset catalog in Xcode.
+
+### APNs Sandbox vs Production (iOS Only)
+
+The `isSandbox` parameter in `setTokens()` controls which Apple Push environment is used:
+
+| Build Type | `isSandbox` | What Happens |
+|-----------|-------------|-------------|
+| Debug / development | `true` | Uses Apple's sandbox push environment |
+| Release / production | `false` (default) | Uses Apple's production push environment |
+
+If this is set wrong, incoming calls won't work on iOS.
 
 ---
 
-## 15. API Reference
+## 17. Full API Reference
 
-### Session & Device Management — `VonageVoice.instance`
+### Session & Device — `VonageVoice.instance`
 
 | Method | Returns | Platform | Description |
 |--------|---------|----------|-------------|
-| `setTokens({accessToken, deviceToken?, isSandbox?})` | `Future<bool?>` | Both | Register JWT and optional FCM token |
-| `unregister({accessToken?})` | `Future<bool?>` | Both | End session and unregister push token |
-| `refreshSession({accessToken})` | `Future<bool?>` | Both | Refresh JWT without destroying session |
-| `callEventsListener` | `Stream<CallEvent>` | Both | Stream of typed call events |
-| `setOnDeviceTokenChanged(callback)` | `void` | Both | Listen for FCM token refresh |
-| `showMissedCallNotifications` (setter) | `void` | Both | Enable/disable missed call notifications |
-| `processVonagePush(data)` | `Future<String?>` | Both | Forward FCM push payload to Vonage SDK |
-| `registerClient(id, name)` | `Future<bool?>` | Both | Map caller ID to display name |
-| `unregisterClient(id)` | `Future<bool?>` | Both | Remove caller ID mapping |
-| `setDefaultCallerName(name)` | `Future<bool?>` | Both | Set fallback display name |
-| `updateCallKitIcon({icon})` | `Future<bool?>` | iOS | Set CallKit UI icon |
+| `setTokens({accessToken, deviceToken?, isSandbox?})` | `Future<bool?>` | Both | Log in — register JWT and optional FCM token |
+| `unregister({accessToken?})` | `Future<bool?>` | Both | Log out — end session and unregister push |
+| `refreshSession({accessToken})` | `Future<bool?>` | Both | Refresh JWT without dropping the session |
+| `callEventsListener` | `Stream<CallEvent>` | Both | Stream of all call events |
+| `setOnDeviceTokenChanged(callback)` | `void` | Both | Listen for FCM/VoIP token changes |
+| `showMissedCallNotifications` (setter) | `void` | Both | Enable or disable missed call notifications |
+| `processVonagePush(data)` | `Future<String?>` | Both | Forward FCM push data to Vonage SDK |
+| `registerClient(id, name)` | `Future<bool?>` | Both | Map a caller ID to a display name |
+| `unregisterClient(id)` | `Future<bool?>` | Both | Remove a caller ID mapping |
+| `setDefaultCallerName(name)` | `Future<bool?>` | Both | Set fallback name for unknown callers |
+| `updateCallKitIcon({icon})` | `Future<bool?>` | iOS | Set the icon on CallKit call screen |
 
 ### Permissions — `VonageVoice.instance`
 
 | Method | Returns | Platform | Description |
 |--------|---------|----------|-------------|
-| `hasMicAccess()` | `Future<bool>` | Both | Check microphone permission |
-| `requestMicAccess()` | `Future<bool?>` | Both | Request microphone permission |
-| `hasReadPhoneStatePermission()` | `Future<bool>` | Android | Check READ_PHONE_STATE |
-| `requestReadPhoneStatePermission()` | `Future<bool?>` | Android | Request READ_PHONE_STATE |
-| `hasCallPhonePermission()` | `Future<bool>` | Android | Check CALL_PHONE |
-| `requestCallPhonePermission()` | `Future<bool?>` | Android | Request CALL_PHONE |
-| `hasManageOwnCallsPermission()` | `Future<bool>` | Android | Check MANAGE_OWN_CALLS |
-| `requestManageOwnCallsPermission()` | `Future<bool?>` | Android | Request MANAGE_OWN_CALLS |
-| `hasReadPhoneNumbersPermission()` | `Future<bool>` | Android | Check READ_PHONE_NUMBERS |
-| `requestReadPhoneNumbersPermission()` | `Future<bool?>` | Android | Request READ_PHONE_NUMBERS |
-| `hasNotificationPermission()` | `Future<bool>` | Android | Check POST_NOTIFICATIONS (API 33+) |
-| `requestNotificationPermission()` | `Future<bool?>` | Android | Request POST_NOTIFICATIONS |
-| `hasRegisteredPhoneAccount()` | `Future<bool>` | Android | Check PhoneAccount registration |
-| `registerPhoneAccount()` | `Future<bool?>` | Android | Register Telecom PhoneAccount |
-| `isPhoneAccountEnabled()` | `Future<bool>` | Android | Check if PhoneAccount is enabled |
-| `openPhoneAccountSettings()` | `Future<bool?>` | Android | Open system phone account settings |
-| `canUseFullScreenIntent()` | `Future<bool>` | Android | Check full-screen intent permission (API 34+) |
-| `openFullScreenIntentSettings()` | `Future<bool?>` | Android | Open full-screen intent settings |
-| `isBatteryOptimized()` | `Future<bool>` | Android | Check if app is battery optimized |
-| `requestBatteryOptimizationExemption()` | `Future<bool?>` | Android | Request battery optimization exemption |
-| `rejectCallOnNoPermissions({shouldReject})` | `Future<bool>` | Android | Auto-reject calls on missing permissions |
-| `isRejectingCallOnNoPermissions()` | `Future<bool>` | Android | Check auto-reject setting |
+| `hasMicAccess()` | `Future<bool>` | Both | Is microphone permission granted? |
+| `requestMicAccess()` | `Future<bool?>` | Both | Ask for microphone permission |
+| `hasReadPhoneStatePermission()` | `Future<bool>` | Android | Is READ_PHONE_STATE granted? |
+| `requestReadPhoneStatePermission()` | `Future<bool?>` | Android | Ask for READ_PHONE_STATE |
+| `hasCallPhonePermission()` | `Future<bool>` | Android | Is CALL_PHONE granted? |
+| `requestCallPhonePermission()` | `Future<bool?>` | Android | Ask for CALL_PHONE |
+| `hasManageOwnCallsPermission()` | `Future<bool>` | Android | Is MANAGE_OWN_CALLS granted? |
+| `requestManageOwnCallsPermission()` | `Future<bool?>` | Android | Ask for MANAGE_OWN_CALLS |
+| `hasReadPhoneNumbersPermission()` | `Future<bool>` | Android | Is READ_PHONE_NUMBERS granted? |
+| `requestReadPhoneNumbersPermission()` | `Future<bool?>` | Android | Ask for READ_PHONE_NUMBERS |
+| `hasNotificationPermission()` | `Future<bool>` | Android | Is POST_NOTIFICATIONS granted? (API 33+) |
+| `requestNotificationPermission()` | `Future<bool?>` | Android | Ask for POST_NOTIFICATIONS |
+| `hasRegisteredPhoneAccount()` | `Future<bool>` | Android | Is the phone account registered? |
+| `registerPhoneAccount()` | `Future<bool?>` | Android | Register the app as a phone account |
+| `isPhoneAccountEnabled()` | `Future<bool>` | Android | Is the phone account enabled by user? |
+| `openPhoneAccountSettings()` | `Future<bool?>` | Android | Open system settings for phone accounts |
+| `canUseFullScreenIntent()` | `Future<bool>` | Android | Can show full-screen call UI? (API 34+) |
+| `openFullScreenIntentSettings()` | `Future<bool?>` | Android | Open settings for full-screen intent permission |
+| `isBatteryOptimized()` | `Future<bool>` | Android | Is the app battery-optimized (bad for calls)? |
+| `requestBatteryOptimizationExemption()` | `Future<bool?>` | Android | Ask to be exempt from battery optimization |
+| `rejectCallOnNoPermissions({shouldReject})` | `Future<bool>` | Android | Auto-reject calls if permissions are missing |
+| `isRejectingCallOnNoPermissions()` | `Future<bool>` | Android | Is auto-reject enabled? |
 
 ### Call Controls — `VonageVoice.instance.call`
 
 | Method | Returns | Platform | Description |
 |--------|---------|----------|-------------|
-| `place({from, to, extraOptions?})` | `Future<bool?>` | Both | Place an outbound call |
-| `answer()` | `Future<bool?>` | Both | Answer a pending incoming call |
-| `hangUp()` | `Future<bool?>` | Both | Hang up the active call |
-| `isOnCall()` | `Future<bool>` | Both | Check if a call is in progress |
-| `getSid()` | `Future<String?>` | Both | Get the active Vonage call ID |
-| `activeCall` (getter) | `ActiveCall?` | Both | Get the current call state |
-| `toggleMute(isMuted)` | `Future<bool?>` | Both | Mute/unmute microphone |
-| `isMuted()` | `Future<bool?>` | Both | Check mute state |
-| `toggleSpeaker(speakerIsOn)` | `Future<bool?>` | Both | Enable/disable speakerphone |
-| `isOnSpeaker()` | `Future<bool?>` | Both | Check speaker state |
-| `holdCall({holdCall})` | `Future<bool?>` | Both | Hold/resume the call |
-| `isHolding()` | `Future<bool?>` | Both | Check hold state |
+| `place({from, to, extraOptions?})` | `Future<bool?>` | Both | Place an outgoing call |
+| `answer()` | `Future<bool?>` | Both | Answer an incoming call |
+| `hangUp()` | `Future<bool?>` | Both | Hang up the current call |
+| `isOnCall()` | `Future<bool>` | Both | Is there an active call? |
+| `getSid()` | `Future<String?>` | Both | Get the Vonage call ID |
+| `activeCall` (getter) | `ActiveCall?` | Both | Get current call details |
+| `toggleMute(isMuted)` | `Future<bool?>` | Both | Mute or unmute the mic |
+| `isMuted()` | `Future<bool?>` | Both | Is the mic muted? |
+| `toggleSpeaker(speakerIsOn)` | `Future<bool?>` | Both | Turn speaker on or off |
+| `isOnSpeaker()` | `Future<bool?>` | Both | Is the speaker on? |
+| `holdCall({holdCall})` | `Future<bool?>` | Both | Hold or resume the call |
+| `isHolding()` | `Future<bool?>` | Both | Is the call on hold? |
 | `toggleBluetooth({bluetoothOn})` | `Future<bool?>` | Both | Route audio to/from Bluetooth |
-| `isBluetoothOn()` | `Future<bool?>` | Both | Check Bluetooth audio state |
-| `isBluetoothAvailable()` | `Future<bool?>` | Both | Check if Bluetooth device is connected |
-| `isBluetoothEnabled()` | `Future<bool?>` | Both | Check if Bluetooth adapter is on |
-| `showBluetoothEnablePrompt()` | `Future<bool?>` | Both | Show "Turn on Bluetooth?" dialog |
+| `isBluetoothOn()` | `Future<bool?>` | Both | Is audio going through Bluetooth? |
+| `isBluetoothAvailable()` | `Future<bool?>` | Both | Is a Bluetooth audio device connected? |
+| `isBluetoothEnabled()` | `Future<bool?>` | Both | Is the Bluetooth adapter turned on? |
+| `showBluetoothEnablePrompt()` | `Future<bool?>` | Android | Show "Turn on Bluetooth?" dialog |
 | `openBluetoothSettings()` | `Future<bool?>` | Both | Open system Bluetooth settings |
 | `sendDigits(digits)` | `Future<bool?>` | Both | Send DTMF tones |
+
+---
+
+## Example App
+
+A full working example with login, dialer, incoming call screen, and active call screen is available in the [`example/`](example/) folder.
 
 ---
 
