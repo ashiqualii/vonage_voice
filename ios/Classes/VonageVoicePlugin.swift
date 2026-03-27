@@ -1426,7 +1426,9 @@ extension VonageVoicePlugin: CXProviderDelegate {
 
         // Build call context
         var context: [String: String] = [:]
+        context["to"] = to
         context["To"] = to        // ✅ use local snapshot, not callTo
+        if !from.isEmpty { context["from"] = from }
         if !from.isEmpty { context["From"] = from }  // ✅ use local snapshot, not identity
 
         // Add any extra custom params
