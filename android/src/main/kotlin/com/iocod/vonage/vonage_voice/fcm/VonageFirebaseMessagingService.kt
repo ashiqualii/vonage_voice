@@ -213,6 +213,26 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                 }
             }
 
+            // ── Cancel listener for killed-app state ─────────────────────
+            // Without this, if the caller cancels or another device answers
+            // before the user opens the app, the notification persists.
+            client.setCallInviteCancelListener { callId, reason ->
+                android.util.Log.d("VonageFCM", "setCallInviteCancelListener FIRED -- callId: $callId, reason: $reason")
+                val cancelIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_CANCEL_CALL_INVITE
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        applicationContext.startForegroundService(cancelIntent)
+                    } else {
+                        applicationContext.startService(cancelIntent)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("VonageFCM", "Error sending cancel invite intent: ${e.message}", e)
+                }
+            }
+
             // ── Restore session from stored JWT ──────────────────────────
             // When the app was killed, the VoiceClient has no session.
             // Without a session, client.answer() will fail when the user
@@ -247,6 +267,10 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             try {
                 val callId = client.processPushCallInvite(dataString)
                 android.util.Log.d("VonageFCM", "processPushCallInvite returned: $callId")
+                // Deduplicate: if the plugin already processed this push via Dart forwarding, skip.
+                if (!callId.isNullOrEmpty() && !VonageClientHolder.markPushProcessed(callId)) {
+                    android.util.Log.d("VonageFCM", "callId=$callId already processed by plugin — skipping")
+                }
             } catch (e: Exception) {
                 android.util.Log.e("VonageFCM", "processPushCallInvite threw: ${e.message}", e)
             }

@@ -47,6 +47,7 @@ object Constants {
     const val ACTION_TOGGLE_BLUETOOTH   = "com.iocod.vonage.ACTION_TOGGLE_BLUETOOTH"
     const val ACTION_TOGGLE_MUTE        = "com.iocod.vonage.ACTION_TOGGLE_MUTE"
     const val ACTION_TOGGLE_HOLD        = "com.iocod.vonage.ACTION_TOGGLE_HOLD"
+    const val ACTION_CLEANUP            = "com.iocod.vonage.ACTION_CLEANUP"
 
     // ── Intent extra keys ─────────────────────────────────────────────────
     const val EXTRA_CALL_ID         = "EXTRA_CALL_ID"

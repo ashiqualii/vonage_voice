@@ -695,6 +695,23 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
     super.initState();
     _listenToCallEvents();
     _syncAudioState();
+    // If the call is already connected when this screen mounts
+    // (e.g. answered from notification before Flutter was ready),
+    // the 'connected' event was already consumed by DialerScreen.
+    // Set the correct state immediately.
+    _checkInitialCallState();
+  }
+
+  /// If the call is already active/connected when this screen is pushed,
+  /// update the UI right away instead of waiting for another event.
+  void _checkInitialCallState() {
+    final activeCall = VonageVoice.instance.call.activeCall;
+    if (activeCall != null) {
+      setState(() {
+        _callReady = true;
+        _callStatus = 'Connected';
+      });
+    }
   }
 
   /// Query the actual audio routing state from the native layer.
@@ -736,9 +753,9 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
           break;
         case CallEvent.callEnded:
           setState(() => _callStatus = 'Call ended');
-          Future.delayed(const Duration(seconds: 1), () {
-            if (mounted) Navigator.of(context).pop();
-          });
+          // Navigation is handled by DialerScreen's popUntil(isFirst).
+          // Do NOT pop here — a delayed pop() can race with popUntil()
+          // and accidentally pop the DialerScreen itself, leaving a blank screen.
           break;
         case CallEvent.mute:
           setState(() => _muted = true);

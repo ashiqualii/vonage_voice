@@ -23,12 +23,14 @@ import com.iocod.vonage.vonage_voice.AnswerCallTrampolineActivity
 import com.vonage.voice.api.VoiceClient
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
+import android.media.RingtoneManager
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.PowerManager
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import androidx.core.app.Person
 
 /**
  * TVConnectionService — TelecomVoice ConnectionService.
@@ -133,9 +135,10 @@ class TVConnectionService : ConnectionService() {
             buildIncomingCallNotification(entry.key, entry.value.from)
         } else if (isIncomingAction) {
             // Incoming call intent is about to be processed — use a
-            // placeholder incoming call notification on the HIGH channel
-            // so the system shows it immediately as heads-up.
-            buildIncomingCallNotification("", "Incoming Call...")
+            // placeholder notification on the HIGH channel WITHOUT action
+            // buttons. Real Answer/Decline buttons are added when
+            // handleIncomingCall() rebuilds with the actual callId.
+            buildPlaceholderIncomingNotification()
         } else if (activeConnections.isNotEmpty()) {
             buildActiveCallNotification()
         } else {
@@ -183,6 +186,7 @@ class TVConnectionService : ConnectionService() {
             Constants.ACTION_TOGGLE_BLUETOOTH -> handleToggleBluetooth(intent)
             Constants.ACTION_TOGGLE_MUTE -> handleToggleMute(intent)
             Constants.ACTION_TOGGLE_HOLD -> handleToggleHold(intent)
+            Constants.ACTION_CLEANUP -> handleCleanup()
         }
     }
 
@@ -204,6 +208,12 @@ class TVConnectionService : ConnectionService() {
                 ?: Constants.DEFAULT_UNKNOWN_CALLER
         val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
 
+        // Skip if we already have a pending invite for this callId (duplicate FCM processing)
+        if (pendingInvites.containsKey(callId)) {
+            android.util.Log.d("TVConnectionService", "Duplicate incoming call for callId=$callId — skipping")
+            return
+        }
+
         val connection = TVCallInviteConnection(this, callId, from, to)
         pendingInvites[callId] = connection
 
@@ -211,20 +221,47 @@ class TVConnectionService : ConnectionService() {
         createIncomingCallNotificationChannel()
         // Use PHONE_CALL type — RECORD_AUDIO is not yet granted before the user answers.
         // MICROPHONE type requires RECORD_AUDIO permission and will crash on API 34+.
+        val incomingNotification = buildIncomingCallNotification(callId, from)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 Constants.NOTIFICATION_ID,
-                buildIncomingCallNotification(callId, from),
+                incomingNotification,
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
             )
         } else {
-            startForeground(Constants.NOTIFICATION_ID,
-                buildIncomingCallNotification(callId, from))
+            startForeground(Constants.NOTIFICATION_ID, incomingNotification)
         }
+
+        // Also post via NotificationManager.notify() to ensure fullScreenIntent
+        // re-fires on devices where updating the foreground notification (same ID)
+        // does NOT re-trigger the full-screen intent (Samsung, Xiaomi, etc.)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(Constants.NOTIFICATION_ID, incomingNotification)
 
         // Acquire wake lock to ensure the screen turns on for incoming call
         if (incomingCallWakeLock == null) {
             acquireIncomingCallWakeLock()
+        }
+
+        // ── Fallback: directly launch IncomingCallActivity ────────────────
+        // On Android 14+ (API 34), USE_FULL_SCREEN_INTENT is a special permission
+        // that Samsung and some OEMs may not grant or may silently ignore.
+        // When fullScreenIntent can't fire, directly start IncomingCallActivity
+        // as a fallback so the user always sees the full-screen call UI.
+        val canFullScreen = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            notificationManager.canUseFullScreenIntent()
+        } else {
+            true
+        }
+        if (!canFullScreen) {
+            android.util.Log.w("TVConnectionService", "fullScreenIntent not permitted — launching IncomingCallActivity directly")
+            try {
+                val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
+                directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                applicationContext.startActivity(directIntent)
+            } catch (e: Exception) {
+                android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
+            }
         }
 
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
@@ -664,6 +701,13 @@ class TVConnectionService : ConnectionService() {
         if (pendingInvites.containsKey(callId)) {
             // Remove from pendingInvites immediately so cleanup runs correctly
             pendingInvites.remove(callId)
+
+            // Broadcast CALL_INVITE_CANCELLED so IncomingCallActivity dismisses
+            val cancelBroadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            broadcastManager.sendBroadcast(cancelBroadcast)
+
             client.reject(callId) { error ->
                 if (error != null) {
                     broadcastError("reject failed: ${error.message}")
@@ -686,6 +730,25 @@ class TVConnectionService : ConnectionService() {
         activeConnections.remove(callId)
 
         // Always cancel the notification and stop the service when no calls remain
+        if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
+            releaseAudioFocus()
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.cancel(Constants.NOTIFICATION_ID)
+            stopForeground(true)
+            stopSelf()
+        }
+    }
+
+    // ── Cleanup (remote hangup / external) ──────────────────────────────
+
+    /**
+     * Clean up notification and stop foreground service when no calls remain.
+     * Called by VonageVoicePlugin when the SDK reports a remote hangup
+     * and the local handleHangup() path was never invoked.
+     */
+    private fun handleCleanup() {
+        releaseIncomingCallWakeLock()
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
@@ -872,6 +935,11 @@ class TVConnectionService : ConnectionService() {
      */
     private fun createIncomingCallNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            val ringtoneAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
             val channel = NotificationChannel(
                 Constants.INCOMING_CALL_CHANNEL_ID,
                 Constants.INCOMING_CALL_CHANNEL_NAME,
@@ -880,10 +948,33 @@ class TVConnectionService : ConnectionService() {
                 description = "Incoming Vonage voice call alerts"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 setBypassDnd(true)
+                setSound(ringtoneUri, ringtoneAttrs)
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 1000, 1000)
             }
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
+    }
+
+    /**
+     * Build a minimal placeholder notification for the foreground service
+     * when we don't yet have a callId (FCM placeholder startup).
+     * No Answer/Decline buttons — those are added when the real callId arrives.
+     */
+    private fun buildPlaceholderIncomingNotification(): Notification {
+        createIncomingCallNotificationChannel()
+
+        return NotificationCompat.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID)
+            .setContentTitle("Incoming Call")
+            .setContentText("Processing incoming call...")
+            .setSmallIcon(android.R.drawable.ic_menu_call)
+            .setOngoing(true)
+            .setSilent(false)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
     }
 
     /**
@@ -936,6 +1027,14 @@ class TVConnectionService : ConnectionService() {
             )
         }
 
+        // Build a Person for the caller — Samsung One UI and stock Android
+        // use this to identify the notification as a real phone call and
+        // prioritize it for full-screen display on the lock screen.
+        val callerPerson = Person.Builder()
+            .setName(from)
+            .setImportant(true)
+            .build()
+
         return NotificationCompat.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID)
             .setContentTitle("Incoming Call")
             .setContentText("From: $from")
@@ -947,6 +1046,7 @@ class TVConnectionService : ConnectionService() {
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addPerson(callerPerson)
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_menu_call,
@@ -974,15 +1074,25 @@ class TVConnectionService : ConnectionService() {
         )
 
         // ── Hangup action ─────────────────────────────────────────────────────
-        val hangupIntent = PendingIntent.getBroadcast(
-            this,
-            3,
-            Intent(Constants.ACTION_NOTIFICATION_DECLINE).apply {
-                putExtra(Constants.EXTRA_CALL_ID, getActiveCallId() ?: "")
-                setPackage(packageName)
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val hangupServiceIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_HANGUP
+            putExtra(Constants.EXTRA_CALL_ID, getActiveCallId() ?: "")
+        }
+        val hangupIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this,
+                3,
+                hangupServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            PendingIntent.getService(
+                this,
+                3,
+                hangupServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
 
         return NotificationCompat.Builder(this, Constants.NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Vonage Voice Call")
@@ -1089,6 +1199,24 @@ object VonageClientHolder {
      */
     @Volatile
     var isAnsweringInProgress: Boolean = false
+
+    /**
+     * Set of callIds already processed by processPushCallInvite().
+     * Prevents duplicate processing when both Dart FCM forwarding
+     * and VonageFirebaseMessagingService handle the same push.
+     */
+    private val processedPushCallIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** Returns true if the callId was NOT already processed (first caller wins). */
+    fun markPushProcessed(callId: String): Boolean {
+        val added = processedPushCallIds.add(callId)
+        // Auto-clean old entries to prevent unbounded growth
+        if (processedPushCallIds.size > 20) {
+            val iterator = processedPushCallIds.iterator()
+            if (iterator.hasNext()) { iterator.next(); iterator.remove() }
+        }
+        return added
+    }
 
     private const val PREFS_NAME = "vonage_voice_prefs"
     private const val KEY_JWT = "vonage_jwt"

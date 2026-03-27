@@ -481,20 +481,27 @@ class VonageVoicePlugin :
         // incoming call push → VonageFirebaseMessagingService.createSession()),
         // DO NOT call createSession() again — it would invalidate the pending
         // call invite and cause "No invite found" when answering.
+        // HOWEVER: if no calls are in progress, the old session's JWT may be
+        // expired. In that case, re-create the session with the fresh JWT.
         if (VonageClientHolder.isSessionReady) {
-            android.util.Log.d("VonagePlugin", "Session already active (restored by FCM) -- skipping createSession")
+            val hasActiveCalls = TVConnectionService.activeConnections.isNotEmpty()
+                    || TVConnectionService.pendingInvites.isNotEmpty()
 
-            // Still persist the fresh JWT for future use
-            VonageClientHolder.storeJwt(ctx, jwt)
-
-            // Still register FCM token if provided
-            val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
-            if (!fcmToken.isNullOrEmpty()) {
-                registerFcmTokenWithCleanup(fcmToken)
+            if (hasActiveCalls) {
+                android.util.Log.d("VonagePlugin", "Session already active (restored by FCM) with active calls -- skipping createSession")
+                VonageClientHolder.storeJwt(ctx, jwt)
+                val fcmToken = call.argument<String>(Constants.PARAM_FCM_TOKEN)
+                if (!fcmToken.isNullOrEmpty()) {
+                    registerFcmTokenWithCleanup(fcmToken)
+                }
+                result.success(true)
+                return
             }
 
-            result.success(true)
-            return
+            // No active calls — re-create session with fresh JWT to avoid invalid-token errors
+            android.util.Log.d("VonagePlugin", "Session was restored by FCM but no active calls -- re-creating with fresh JWT")
+            VonageClientHolder.isSessionReady = false
+            // Fall through to createSession() below
         }
 
         // Create session with the JWT from Flutter — never hardcoded
@@ -631,6 +638,10 @@ class VonageVoicePlugin :
         try {
             val callId = client.processPushCallInvite(dataString)
             android.util.Log.d("VonagePlugin", "processVonagePush callId=$callId")
+            // Deduplicate: if VonageFirebaseMessagingService already processed this push, skip.
+            if (!callId.isNullOrEmpty() && !VonageClientHolder.markPushProcessed(callId)) {
+                android.util.Log.d("VonagePlugin", "processVonagePush: callId=$callId already processed — skipping")
+            }
             // Null callId is normal — SDK fires setCallInviteListener asynchronously.
             result.success(callId)
         } catch (e: Exception) {
@@ -1574,6 +1585,8 @@ class VonageVoicePlugin :
             // TVConnectionService already removes the connection and
             // broadcasts CALL_ENDED when the caller initiates hangup.
             val connection = TVConnectionService.activeConnections[callId]
+            val pendingInvite = TVConnectionService.pendingInvites[callId]
+
             if (connection != null) {
                 connection.disconnect()
                 TVConnectionService.activeConnections.remove(callId)
@@ -1582,6 +1595,25 @@ class VonageVoicePlugin :
                     putExtra(Constants.EXTRA_CALL_ID, callId)
                 }
                 LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
+            } else if (pendingInvite != null) {
+                // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
+                pendingInvite.cancel()
+                TVConnectionService.pendingInvites.remove(callId)
+            }
+
+            // Tell TVConnectionService to clean up notification & stop foreground
+            // when no calls remain. This handles the remote hangup case where
+            // handleHangup() was never called locally.
+            if (TVConnectionService.activeConnections.isEmpty() &&
+                TVConnectionService.pendingInvites.isEmpty()) {
+                try {
+                    val cleanupIntent = Intent(ctx, TVConnectionService::class.java).apply {
+                        action = Constants.ACTION_CLEANUP
+                    }
+                    ContextCompat.startForegroundService(ctx, cleanupIntent)
+                } catch (e: Exception) {
+                    android.util.Log.e("VonagePlugin", "Failed to send cleanup intent: ${e.message}")
+                }
             }
         }
 
