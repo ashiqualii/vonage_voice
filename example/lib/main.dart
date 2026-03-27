@@ -343,8 +343,9 @@ class _DialerScreenState extends State<DialerScreen> {
 
     try {
       final result = await VonageVoice.instance.call.place(
-        from: 'test user',
+        from: '13044622020',
         to: number,
+        // extraOptions: {"userID": "4514", "assignID": "4514", 'is_phone': 1},
       );
 
       if (result != true) {
@@ -364,9 +365,14 @@ class _DialerScreenState extends State<DialerScreen> {
               activeCall:
                   VonageVoice.instance.call.activeCall ??
                   ActiveCall(
-                    from: 'me',
+                    from: '13044622020',
                     to: number,
                     callDirection: CallDirection.outgoing,
+                    // customParams: {
+                    //   "userID": "4514",
+                    //   "assignID": "4514",
+                    //   'is_phone': 1,
+                    // },
                   ),
             ),
           ),

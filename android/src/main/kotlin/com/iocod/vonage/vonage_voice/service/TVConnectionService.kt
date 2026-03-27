@@ -284,10 +284,10 @@ class TVConnectionService : ConnectionService() {
                 as? HashMap<String, String> ?: HashMap()
 
         // Build context map for Vonage serverCall()
-        // "to" is the only required key — everything else is optional custom data
+        // Backend expects capitalized keys: "To" and "From"
         val callContext = HashMap<String, String>().apply {
-            put("to", callTo)
-            if (callFrom.isNotEmpty()) put("from", callFrom)
+            put("To", callTo)
+            if (callFrom.isNotEmpty()) put("From", callFrom)
             putAll(customParams)
         }
 

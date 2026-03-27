@@ -662,13 +662,28 @@ extension VonageVoicePlugin {
     /// - Parameter result: Returns `true` on success, `FlutterError` on failure.
 
     private func handleMakeCall(arguments: [String: Any], result: @escaping FlutterResult) {
+        sendPhoneCallEvents(description: "LOG|handleMakeCall arguments: \(arguments)")
+
+        let from = arguments["from"] as? String ?? ""
+        let callerName = arguments["CallerName"] as? String ?? ""
+
+        // Debug: log each argument key, value, and Swift type
+        for (key, value) in arguments {
+            sendPhoneCallEvents(description: "LOG|  arg[\(key)] = \(value) (type: \(type(of: value)))")
+        }
+
         guard let to = arguments["to"] as? String else {
+            sendPhoneCallEvents(description: "LOG|handleMakeCall FAILED — 'to' key not found or not String. Keys: \(arguments.keys.sorted())")
+            // Try to log what 'to' actually is
+            if let raw = arguments["to"] {
+                sendPhoneCallEvents(description: "LOG|  'to' raw value=\(raw), type=\(type(of: raw))")
+            }
             result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing 'to' parameter", details: nil))
             return
         }
 
-        let from = arguments["from"] as? String ?? identity
-        let callerName = arguments["CallerName"] as? String ?? ""
+        sendPhoneCallEvents(description: "LOG|handleMakeCall resolved: from=\(from) to=\(to) callerName=\(callerName)")
+        sendPhoneCallEvents(description: "LOG|handleMakeCall state: isSessionReady=\(isSessionReady) activeCalls=\(activeCalls.count) callInvites=\(callInvites.count)")
 
         callArgs = arguments
         callOutgoing = true
@@ -1227,6 +1242,7 @@ extension VonageVoicePlugin {
 
     /// Requests CallKit to start an outgoing call.
     private func performStartCallAction(uuid: UUID, handle: String) {
+        sendPhoneCallEvents(description: "LOG|performStartCallAction uuid=\(uuid) handle=\(handle)")
         let callHandle = CXHandle(type: .generic, value: handle)
         let startCallAction = CXStartCallAction(call: uuid, handle: callHandle)
         let transaction = CXTransaction(action: startCallAction)
@@ -1292,6 +1308,8 @@ extension VonageVoicePlugin {
     /// Resets all state associated with a call after it disconnects.
     private func callDisconnected(uuid: UUID) {
         let callId = activeCalls[uuid]
+        sendPhoneCallEvents(description: "LOG|callDisconnected uuid=\(uuid) callId=\(callId ?? "nil")")
+        sendPhoneCallEvents(description: "LOG|  before: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
         activeCalls.removeValue(forKey: uuid)
         callInvites.removeValue(forKey: uuid)
 
@@ -1312,7 +1330,9 @@ extension VonageVoicePlugin {
             desiredSpeakerState = false
             desiredBluetoothState = false
             userExplicitlyChangedAudioRoute = false
+            sendPhoneCallEvents(description: "LOG|  all per-call state reset (no remaining calls)")
         }
+        sendPhoneCallEvents(description: "LOG|  after: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
     }
 }
 
@@ -1346,20 +1366,18 @@ extension VonageVoicePlugin: CXProviderDelegate {
 
     /// CallKit activated the audio session — hook Vonage into it.
     public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        sendPhoneCallEvents(description: "LOG|provider:didActivateAudioSession")
+        sendPhoneCallEvents(description: "LOG|provider:didActivateAudioSession category=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue)")
+        sendPhoneCallEvents(description: "LOG|  currentRoute outputs=\(audioSession.currentRoute.outputs.map { "\($0.portType.rawValue)" })")
+        sendPhoneCallEvents(description: "LOG|  desiredSpeakerState=\(desiredSpeakerState) desiredBluetoothState=\(desiredBluetoothState)")
 
         // CRITICAL: Without this call, the call connects but no audio flows.
         // This hooks WebRTC into the CallKit-managed audio session.
+        // CRITICAL: Hook WebRTC into CallKit's audio session FIRST.
+        // Do NOT reconfigure the audio session (setCategory/setActive) after this —
+        // CallKit already provides a correctly configured session and changing it
+        // can disrupt the WebRTC media pipeline.
         VGVoiceClient.enableAudio(audioSession)
-
-        // Configure audio session for voice call.
-        do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat,
-                                         options: [.allowBluetooth, .allowBluetoothA2DP])
-            try audioSession.setActive(true)
-        } catch {
-            sendPhoneCallEvents(description: "LOG|Audio session configuration failed: \(error.localizedDescription)")
-        }
+        sendPhoneCallEvents(description: "LOG|VGVoiceClient.enableAudio called")
 
         // Apply the user's preferred audio route.
         // Priority: user-toggled speaker > Bluetooth > earpiece (default).
@@ -1378,6 +1396,8 @@ extension VonageVoicePlugin: CXProviderDelegate {
                 sendPhoneCallEvents(description: "LOG|Earpiece fallback failed: \(error.localizedDescription)")
             }
         }
+
+        sendPhoneCallEvents(description: "LOG|didActivateAudioSession complete, route=\(audioSession.currentRoute.outputs.map { $0.portType.rawValue })")
     }
 
     /// CallKit deactivated the audio session — unhook Vonage.
@@ -1396,24 +1416,39 @@ extension VonageVoicePlugin: CXProviderDelegate {
     // ─── Start Call (Outgoing) ───────────────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-        sendPhoneCallEvents(description: "LOG|provider:performStartCallAction")
+        let from = identity.isEmpty ? (callArgs["from"] as? String ?? "") : identity
+        let to = callTo.isEmpty ? (callArgs["to"] as? String ?? "") : callTo
+
+        sendPhoneCallEvents(description: "LOG|provider:performStartCallAction uuid=\(action.callUUID)")
 
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
+        sendPhoneCallEvents(description: "LOG|reportOutgoingCall startedConnectingAt sent")
 
-        // Build call context from stored arguments (exclude "from" — Vonage infers it from JWT).
+        // Build call context
         var context: [String: String] = [:]
-        for (key, value) in callArgs where key != "from" {
+        context["To"] = to        // ✅ use local snapshot, not callTo
+        if !from.isEmpty { context["From"] = from }  // ✅ use local snapshot, not identity
+
+        // Add any extra custom params
+        for (key, value) in callArgs {
+            if key == "from" || key == "to" || key == "CallerName" { continue }
             context[key] = "\(value)"
         }
 
-        let from = identity
-        let to = callTo
+        sendPhoneCallEvents(description: "LOG|serverCall context (\(context.count) keys): \(context)")
+        for (key, value) in context {
+            sendPhoneCallEvents(description: "LOG|  context[\(key)] = '\(value)' (len=\(value.count))")
+        }
+
+        // ✅ from and to already declared above — use them directly
         sendPhoneCallEvents(description: "Ringing|\(from)|\(to)|Outgoing")
+        sendPhoneCallEvents(description: "LOG|Calling voiceClient.serverCall() now...")
 
         voiceClient.serverCall(context) { [weak self] error, callId in
             guard let self = self else { return }
             if let error = error {
-                self.sendPhoneCallEvents(description: "LOG|serverCall failed: \(error.localizedDescription)")
+                self.sendPhoneCallEvents(description: "LOG|serverCall FAILED: \(error.localizedDescription)")
+                self.sendPhoneCallEvents(description: "LOG|serverCall error type: \(type(of: error)) — \(error)")
                 provider.reportCall(with: action.callUUID, endedAt: Date(), reason: .failed)
                 self.sendPhoneCallEvents(description: "Call Ended")
                 action.fail()
@@ -1421,7 +1456,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
             }
 
             guard let callId = callId else {
-                self.sendPhoneCallEvents(description: "LOG|serverCall returned nil callId")
+                self.sendPhoneCallEvents(description: "LOG|serverCall returned nil callId (no error, but no callId)")
                 action.fail()
                 return
             }
@@ -1433,9 +1468,13 @@ extension VonageVoicePlugin: CXProviderDelegate {
             self.userExplicitlyChangedAudioRoute = false
 
             provider.reportOutgoingCall(with: action.callUUID, connectedAt: Date())
+            self.sendPhoneCallEvents(description: "LOG|reportOutgoingCall connectedAt sent")
+            // ✅ from/to are captured from the outer scope — correct values guaranteed
             self.sendPhoneCallEvents(description: "Connected|\(from)|\(to)|Outgoing")
+            self.sendPhoneCallEvents(description: "LOG|activeCalls=\(self.activeCalls.count) activeCallUUID=\(String(describing: self.activeCallUUID))")
 
             action.fulfill()
+            self.sendPhoneCallEvents(description: "LOG|CXStartCallAction fulfilled")
         }
     }
 
@@ -1904,32 +1943,51 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
                             didReceiveHangupForCall callId: String,
                             withQuality callQuality: VGRTCQuality,
                             reason: VGHangupReason) {
-        sendPhoneCallEvents(description: "LOG|didReceiveHangupForCall callId=\(callId), reason=\(reason)")
+        let reasonName: String
+        switch reason {
+        case .localHangup:   reasonName = "localHangup(0)"
+        case .remoteReject:  reasonName = "remoteReject(1)"
+        case .remoteHangup:  reasonName = "remoteHangup(2)"
+        case .mediaTimeout:  reasonName = "mediaTimeout(3)"
+        @unknown default:    reasonName = "unknown(\(reason.rawValue))"
+        }
+        sendPhoneCallEvents(description: "LOG|didReceiveHangupForCall callId=\(callId)")
+        sendPhoneCallEvents(description: "LOG|  reason=\(reasonName)")
+        sendPhoneCallEvents(description: "LOG|  callQuality: \(callQuality)")
+        sendPhoneCallEvents(description: "LOG|  state: userInitiatedDisconnect=\(userInitiatedDisconnect) activeCalls=\(activeCalls.count) callOutgoing=\(callOutgoing)")
+        sendPhoneCallEvents(description: "LOG|  uuid lookup: \(callIdToUUID[callId]?.uuidString ?? "NOT FOUND")")
 
         if let uuid = callIdToUUID[callId] {
             if !userInitiatedDisconnect {
                 callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+                sendPhoneCallEvents(description: "LOG|  reported remoteEnded to CallKit")
+            } else {
+                sendPhoneCallEvents(description: "LOG|  userInitiatedDisconnect=true, skipping CallKit report")
             }
             callDisconnected(uuid: uuid)
 
             if activeCalls.isEmpty {
                 sendPhoneCallEvents(description: "Call Ended")
             }
+        } else {
+            sendPhoneCallEvents(description: "LOG|  WARNING: No UUID found for callId=\(callId) — orphan hangup")
         }
     }
 
     // ─── Media State Changes ─────────────────────────────────────────
 
     public func voiceClient(_ client: VGVoiceClient, didReceiveMediaReconnectingForCall callId: String) {
+        sendPhoneCallEvents(description: "LOG|didReceiveMediaReconnecting callId=\(callId)")
         sendPhoneCallEvents(description: "Reconnecting")
     }
 
     public func voiceClient(_ client: VGVoiceClient, didReceiveMediaReconnectionForCall callId: String) {
+        sendPhoneCallEvents(description: "LOG|didReceiveMediaReconnection callId=\(callId)")
         sendPhoneCallEvents(description: "Reconnected")
     }
 
     public func voiceClient(_ client: VGVoiceClient, didReceiveMediaErrorForCall callId: String, error: VGError) {
-        sendPhoneCallEvents(description: "LOG|didReceiveMediaError callId=\(callId), error=\(error.localizedDescription)")
+        sendPhoneCallEvents(description: "LOG|didReceiveMediaError callId=\(callId), error=\(error.localizedDescription), code=\(error.code)")
     }
 
     public func voiceClient(_ client: VGVoiceClient,

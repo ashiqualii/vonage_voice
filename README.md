@@ -351,7 +351,7 @@ final isRejecting = await VonageVoice.instance.isRejectingCallOnNoPermissions();
 
 ```dart
 final success = await VonageVoice.instance.call.place(
-  from: 'alice',             // Your Vonage user identity
+  from: 'alice',             // Your Vonage user identity as per backend
   to: '+14155551234',        // Who you're calling (phone number or Vonage user)
   extraOptions: {            // Optional — custom data sent to your backend
     'displayName': 'Alice',
