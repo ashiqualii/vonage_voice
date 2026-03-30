@@ -369,6 +369,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             }
             result(true)
 
+        // ── Audio Device Management ──────────────────────────────────
+        case "getAudioDevices":
+            result(getAudioDevicesList())
+        case "selectAudioDevice":
+            handleSelectAudioDevice(arguments: arguments, result: result)
+
         // ── DTMF ─────────────────────────────────────────────────────
         case "sendDigits":
             handleSendDigits(arguments: arguments, result: result)
@@ -664,6 +670,16 @@ extension VonageVoicePlugin {
     private func handleMakeCall(arguments: [String: Any], result: @escaping FlutterResult) {
         sendPhoneCallEvents(description: "LOG|handleMakeCall arguments: \(arguments)")
 
+        // ── Reset audio state for new outgoing call ──────────────────────
+        // Without this, a stale `desiredSpeakerState = true` from a
+        // previous call could cause the loudspeaker to activate during the
+        // outgoing ringing phase when `didActivateAudioSession` fires.
+        // Every new call starts with the default audio priority:
+        //   Bluetooth (if connected) → Earpiece → never Speaker.
+        desiredSpeakerState = false
+        desiredBluetoothState = false
+        userExplicitlyChangedAudioRoute = false
+
         let from = arguments["from"] as? String ?? ""
         let callerName = arguments["CallerName"] as? String ?? ""
 
@@ -740,6 +756,15 @@ extension VonageVoicePlugin {
     private func handleAnswer(result: @escaping FlutterResult) {
         if let (uuid, _) = callInvites.first {
             sendPhoneCallEvents(description: "LOG|answer: answering invite uuid=\(uuid)")
+
+            // ── Reset audio state for answered call ──────────────────────
+            // Ensures the answered call starts with the correct audio priority
+            // (Bluetooth → Earpiece) and doesn't inherit speaker state from
+            // a previous call.
+            desiredSpeakerState = false
+            desiredBluetoothState = false
+            userExplicitlyChangedAudioRoute = false
+
             let answerAction = CXAnswerCallAction(call: uuid)
             let transaction = CXTransaction(action: answerAction)
             callKitCallController.request(transaction) { [weak self] error in
@@ -1068,6 +1093,180 @@ extension VonageVoicePlugin {
         if let match = inputs.first(where: { portTypes.contains($0.portType) }) {
             try AVAudioSession.sharedInstance().setPreferredInput(match)
         }
+    }
+
+    // ─── Audio Device Listing ────────────────────────────────────────
+
+    /// Returns all available audio output devices as a list of dictionaries.
+    ///
+    /// Each dictionary contains:
+    ///   - id: String (port UID)
+    ///   - type: String ("earpiece", "speaker", "bluetooth", "wiredHeadset", "unknown")
+    ///   - name: String (port name, e.g. "AirPods Pro")
+    ///   - isActive: Bool (true if currently routing audio)
+    private func getAudioDevicesList() -> [[String: Any]] {
+        let session = AVAudioSession.sharedInstance()
+        let currentOutputs = session.currentRoute.outputs
+        let activePortUIDs = Set(currentOutputs.map { $0.uid })
+
+        var devices: [[String: Any]] = []
+        var seenUIDs: Set<String> = []
+
+        // 1) Current outputs (active devices)
+        for output in currentOutputs {
+            let type = mapPortType(output.portType)
+            if seenUIDs.insert(output.uid).inserted {
+                devices.append([
+                    "id": output.uid,
+                    "type": type,
+                    "name": output.portName,
+                    "isActive": true
+                ])
+            }
+        }
+
+        // 2) Available inputs — surfaces additional Bluetooth and wired devices
+        if let inputs = session.availableInputs {
+            for input in inputs {
+                let type = mapPortType(input.portType)
+                if type == "unknown" { continue }
+                if seenUIDs.insert(input.uid).inserted {
+                    devices.append([
+                        "id": input.uid,
+                        "type": type,
+                        "name": input.portName,
+                        "isActive": false
+                    ])
+                }
+            }
+        }
+
+        // 3) Ensure earpiece is always listed (builtInReceiver via output when no input match)
+        if !devices.contains(where: { ($0["type"] as? String) == "earpiece" }) {
+            devices.insert([
+                "id": "earpiece",
+                "type": "earpiece",
+                "name": "Earpiece",
+                "isActive": !isSpeakerOn() && !isBluetoothOn()
+            ], at: 0)
+        }
+
+        // 4) Ensure speaker is always listed
+        if !devices.contains(where: { ($0["type"] as? String) == "speaker" }) {
+            devices.append([
+                "id": "speaker",
+                "type": "speaker",
+                "name": "Speaker",
+                "isActive": isSpeakerOn()
+            ])
+        }
+
+        return devices
+    }
+
+    /// Maps an AVAudioSession.Port to our device type string.
+    private func mapPortType(_ portType: AVAudioSession.Port) -> String {
+        switch portType {
+        case .builtInReceiver, .builtInMic:
+            return "earpiece"
+        case .builtInSpeaker:
+            return "speaker"
+        case _ where Self.bluetoothPorts.contains(portType):
+            return "bluetooth"
+        case .headphones, .headsetMic:
+            return "wiredHeadset"
+        case .usbAudio:
+            return "wiredHeadset"
+        default:
+            return "unknown"
+        }
+    }
+
+    /// Selects a specific audio output device by its UID.
+    private func handleSelectAudioDevice(arguments: [String: Any], result: @escaping FlutterResult) {
+        guard let deviceId = arguments["deviceId"] as? String else {
+            result(false)
+            return
+        }
+
+        let session = AVAudioSession.sharedInstance()
+
+        userExplicitlyChangedAudioRoute = true
+
+        // Handle built-in devices by type
+        if deviceId == "speaker" || isBuiltInSpeaker(uid: deviceId, session: session) {
+            desiredSpeakerState = true
+            desiredBluetoothState = false
+            applySpeakerSetting(toSpeaker: true)
+            result(true)
+            return
+        }
+
+        if deviceId == "earpiece" || isBuiltInEarpiece(uid: deviceId, session: session) {
+            desiredSpeakerState = false
+            desiredBluetoothState = false
+            applySpeakerSetting(toSpeaker: false)
+            result(true)
+            return
+        }
+
+        // Try to find matching input by UID (Bluetooth / wired)
+        if let inputs = session.availableInputs,
+           let match = inputs.first(where: { $0.uid == deviceId }) {
+            let isBluetooth = Self.bluetoothPorts.contains(match.portType)
+            do {
+                if isBluetooth {
+                    try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                            options: [.allowBluetooth, .allowBluetoothA2DP])
+                }
+                try session.setPreferredInput(match)
+                try session.overrideOutputAudioPort(.none)
+
+                desiredBluetoothState = isBluetooth
+                desiredSpeakerState = false
+
+                if isBluetooth {
+                    sendPhoneCallEvents(description: "Bluetooth On")
+                }
+                result(true)
+            } catch {
+                sendPhoneCallEvents(description: "LOG|selectAudioDevice failed: \(error.localizedDescription)")
+                result(false)
+            }
+            return
+        }
+
+        // Check current outputs (for speaker UID match)
+        for output in session.currentRoute.outputs {
+            if output.uid == deviceId {
+                if output.portType == .builtInSpeaker {
+                    desiredSpeakerState = true
+                    desiredBluetoothState = false
+                    applySpeakerSetting(toSpeaker: true)
+                    result(true)
+                    return
+                }
+            }
+        }
+
+        result(false)
+    }
+
+    /// Checks if a UID corresponds to the built-in speaker.
+    private func isBuiltInSpeaker(uid: String, session: AVAudioSession) -> Bool {
+        session.currentRoute.outputs.contains { $0.uid == uid && $0.portType == .builtInSpeaker }
+    }
+
+    /// Checks if a UID corresponds to the built-in earpiece (receiver).
+    private func isBuiltInEarpiece(uid: String, session: AVAudioSession) -> Bool {
+        // Earpiece appears as builtInReceiver in outputs or builtInMic in inputs
+        if session.currentRoute.outputs.contains(where: { $0.uid == uid && $0.portType == .builtInReceiver }) {
+            return true
+        }
+        if let inputs = session.availableInputs {
+            return inputs.contains { $0.uid == uid && $0.portType == .builtInMic }
+        }
+        return false
     }
 }
 

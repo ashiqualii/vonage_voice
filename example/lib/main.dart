@@ -687,6 +687,7 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
   bool _showDialpad = false;
   bool _callReady = false;
   String _callStatus = 'Connecting...';
+  List<AudioDevice> _audioDevices = [];
   final TextEditingController _dtmfController = TextEditingController();
   StreamSubscription<CallEvent>? _eventSub;
 
@@ -872,6 +873,124 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
     setState(() => _dtmfController.text += digit);
   }
 
+  /// Fetches the current list of available audio output devices from the
+  /// native platform and updates the local state.
+  Future<void> _refreshAudioDevices() async {
+    try {
+      final devices = await VonageVoice.instance.call.getAudioDevices();
+      if (!mounted) return;
+      setState(() => _audioDevices = devices);
+    } catch (e) {
+      log('Failed to refresh audio devices: $e');
+    }
+  }
+
+  /// Selects an audio device by its platform-specific [deviceId] and
+  /// refreshes the device list + audio state indicators.
+  Future<void> _selectAudioDevice(String deviceId) async {
+    try {
+      await VonageVoice.instance.call.selectAudioDevice(deviceId);
+      // Allow the OS a moment to complete the route change, then
+      // refresh both the device list and the top-level audio indicators.
+      await Future.delayed(const Duration(milliseconds: 300));
+      await Future.wait([_refreshAudioDevices(), _syncAudioState()]);
+    } catch (e) {
+      log('Failed to select audio device: $e');
+    }
+  }
+
+  /// Opens a bottom sheet listing all available audio output devices.
+  /// The user can tap a device to switch audio routing.
+  void _showAudioDevicePicker() {
+    _refreshAudioDevices().then((_) {
+      if (!mounted) return;
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: const Color(0xFF1E1E1E),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (sheetContext) {
+          return StatefulBuilder(
+            builder: (context, setSheetState) {
+              return SafeArea(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // ── Header ────────────────────────────────────────
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.speaker_group,
+                            color: Colors.white70,
+                            size: 22,
+                          ),
+                          const SizedBox(width: 10),
+                          const Expanded(
+                            child: Text(
+                              'Audio Output',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                          // Refresh button
+                          IconButton(
+                            icon: const Icon(
+                              Icons.refresh,
+                              color: Colors.white54,
+                              size: 20,
+                            ),
+                            onPressed: () async {
+                              await _refreshAudioDevices();
+                              setSheetState(() {});
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(color: Colors.white12, height: 1),
+
+                    // ── Device list ──────────────────────────────────
+                    if (_audioDevices.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 32),
+                        child: Text(
+                          'No audio devices found',
+                          style: TextStyle(color: Colors.white38),
+                        ),
+                      )
+                    else
+                      ListView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: _audioDevices.length,
+                        itemBuilder: (_, index) {
+                          final device = _audioDevices[index];
+                          return _AudioDeviceTile(
+                            device: device,
+                            onTap: () async {
+                              Navigator.of(sheetContext).pop();
+                              await _selectAudioDevice(device.id);
+                            },
+                          );
+                        },
+                      ),
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              );
+            },
+          );
+        },
+      );
+    });
+  }
+
   @override
   void dispose() {
     _eventSub?.cancel();
@@ -1019,10 +1138,16 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                   ),
                   const SizedBox(height: 16),
 
-                  // Row 2 — Dialpad toggle
+                  // Row 2 — Audio Devices, Dialpad toggle
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
+                      _CallControlButton(
+                        icon: Icons.speaker_group,
+                        label: 'Audio',
+                        active: false,
+                        onTap: _callReady ? _showAudioDevicePicker : null,
+                      ),
                       _CallControlButton(
                         icon: Icons.dialpad,
                         label: 'Keypad',
@@ -1175,6 +1300,76 @@ class _CallControlButton extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// A single row in the audio device picker bottom sheet.
+///
+/// Shows the device icon, name, type badge, and a checkmark for the
+/// currently active output device.
+class _AudioDeviceTile extends StatelessWidget {
+  final AudioDevice device;
+  final VoidCallback onTap;
+
+  const _AudioDeviceTile({required this.device, required this.onTap});
+
+  /// Maps each [AudioDeviceType] to a descriptive icon.
+  IconData _iconForType(AudioDeviceType type) {
+    switch (type) {
+      case AudioDeviceType.earpiece:
+        return Icons.hearing;
+      case AudioDeviceType.speaker:
+        return Icons.volume_up;
+      case AudioDeviceType.bluetooth:
+        return Icons.bluetooth_audio;
+      case AudioDeviceType.wiredHeadset:
+        return Icons.headset;
+      case AudioDeviceType.unknown:
+        return Icons.device_unknown;
+    }
+  }
+
+  /// Returns a human-readable label for the device type.
+  String _labelForType(AudioDeviceType type) {
+    switch (type) {
+      case AudioDeviceType.earpiece:
+        return 'Earpiece';
+      case AudioDeviceType.speaker:
+        return 'Speaker';
+      case AudioDeviceType.bluetooth:
+        return 'Bluetooth';
+      case AudioDeviceType.wiredHeadset:
+        return 'Wired';
+      case AudioDeviceType.unknown:
+        return 'Unknown';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isActive = device.isActive;
+    return ListTile(
+      leading: Icon(
+        _iconForType(device.type),
+        color: isActive ? Colors.greenAccent : Colors.white54,
+        size: 24,
+      ),
+      title: Text(
+        device.name,
+        style: TextStyle(
+          color: isActive ? Colors.greenAccent : Colors.white,
+          fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+        ),
+      ),
+      subtitle: Text(
+        _labelForType(device.type),
+        style: const TextStyle(color: Colors.white38, fontSize: 12),
+      ),
+      trailing: isActive
+          ? const Icon(Icons.check_circle, color: Colors.greenAccent, size: 22)
+          : const Icon(Icons.circle_outlined, color: Colors.white24, size: 22),
+      onTap: onTap,
     );
   }
 }

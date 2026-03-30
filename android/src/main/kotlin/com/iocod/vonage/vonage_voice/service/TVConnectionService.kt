@@ -85,6 +85,12 @@ class TVConnectionService : ConnectionService() {
          * Returns the callId of the first active connection, or null.
          */
         fun getActiveCallId(): String? = activeConnections.keys.firstOrNull()
+
+        /**
+         * Returns the first active TVCallConnection, or null.
+         * Used by VonageVoicePlugin for direct state updates (e.g. selectAudioDevice).
+         */
+        fun getActiveConnection(): TVCallConnection? = activeConnections.values.firstOrNull()
     }
 
     // ── Service lifecycle ─────────────────────────────────────────────────

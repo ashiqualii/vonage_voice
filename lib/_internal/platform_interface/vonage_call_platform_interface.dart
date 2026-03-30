@@ -332,6 +332,48 @@ abstract class VonageCallPlatform extends SharedPlatformInterface {
   /// **Platform:** Android & iOS.
   Future<bool?> openBluetoothSettings();
 
+  // ── Audio Device Management ──────────────────────────────────────────
+
+  /// Returns a list of all available audio output devices.
+  ///
+  /// The list includes built-in devices (earpiece, speaker) and any
+  /// connected external devices (Bluetooth headsets, wired headphones).
+  /// Multiple Bluetooth devices will appear as separate entries if more
+  /// than one is paired and connected.
+  ///
+  /// Each [AudioDevice] has:
+  /// - [AudioDevice.type] — the category (earpiece, speaker, bluetooth, wiredHeadset)
+  /// - [AudioDevice.name] — human-readable name (e.g. "AirPods Pro")
+  /// - [AudioDevice.isActive] — whether it is the current audio output
+  /// - [AudioDevice.id] — platform-specific identifier for [selectAudioDevice]
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// final devices = await VonageVoice.instance.call.getAudioDevices();
+  /// for (final device in devices) {
+  ///   print('${device.name} (${device.type}) — active: ${device.isActive}');
+  /// }
+  /// ```
+  Future<List<AudioDevice>> getAudioDevices();
+
+  /// Selects a specific audio output device by its [AudioDevice.id].
+  ///
+  /// Use this to switch audio to a specific Bluetooth device, the earpiece,
+  /// or the speaker. The [deviceId] should come from an [AudioDevice]
+  /// previously returned by [getAudioDevices].
+  ///
+  /// Returns `true` if the device was successfully selected.
+  ///
+  /// **Platform:** Android & iOS.
+  ///
+  /// ```dart
+  /// final devices = await VonageVoice.instance.call.getAudioDevices();
+  /// final bt = devices.firstWhere((d) => d.type == AudioDeviceType.bluetooth);
+  /// await VonageVoice.instance.call.selectAudioDevice(bt.id);
+  /// ```
+  Future<bool?> selectAudioDevice(String deviceId);
+
   // ── DTMF (Dual-Tone Multi-Frequency) ──────────────────────────────────
 
   /// Sends DTMF tones on the active call.

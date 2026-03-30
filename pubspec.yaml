@@ -1,5 +1,5 @@
 name: vonage_voice
-description: "Plugin for vonage voice"
+description: "A Flutter plugin for making and receiving voice calls using the Vonage Client SDK, with native call screens (CallKit on iOS, ConnectionService on Android), background call delivery, and full in-call controls."
 version: 0.0.1
 homepage:
 

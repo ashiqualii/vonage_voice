@@ -45,6 +45,7 @@ import '_internal/method_channel/vonage_voice_method_channel.dart';
 import '_internal/platform_interface/vonage_voice_platform_interface.dart';
 
 part 'models/active_call.dart';
+part 'models/audio_device.dart';
 part 'models/call_event.dart';
 
 /// Main entry point for the Vonage Voice Flutter plugin.

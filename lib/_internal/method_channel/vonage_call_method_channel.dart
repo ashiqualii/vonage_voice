@@ -223,6 +223,36 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     return _channel.invokeMethod('openBluetoothSettings', <String, dynamic>{});
   }
 
+  // ── Audio Device Management ─────────────────────────────────────────
+
+  /// Returns all available audio output devices with their active state.
+  ///
+  /// The native layer returns a List<Map> which is parsed into
+  /// [AudioDevice] objects. Includes earpiece, speaker, and all
+  /// connected Bluetooth devices.
+  @override
+  Future<List<AudioDevice>> getAudioDevices() async {
+    final result = await _channel.invokeMethod<List<dynamic>>(
+      'getAudioDevices',
+      <String, dynamic>{},
+    );
+    if (result == null) return [];
+    return result
+        .whereType<Map>()
+        .map((m) => AudioDevice.fromMap(Map<String, dynamic>.from(m)))
+        .toList();
+  }
+
+  /// Selects a specific audio output device by its platform identifier.
+  ///
+  /// [deviceId] — the [AudioDevice.id] from [getAudioDevices].
+  @override
+  Future<bool?> selectAudioDevice(String deviceId) {
+    return _channel.invokeMethod('selectAudioDevice', <String, dynamic>{
+      "deviceId": deviceId,
+    });
+  }
+
   // ── DTMF ──────────────────────────────────────────────────────────────
 
   /// Sends DTMF tones on the active call for IVR navigation.

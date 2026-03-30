@@ -18,6 +18,7 @@ object Constants {
     const val PARAM_CLIENT_NAME  = "name"
     const val PARAM_SHOW         = "show"
     const val PARAM_SHOULD_REJECT = "shouldReject"
+    const val PARAM_DEVICE_ID      = "deviceId"
 
     // ── SharedPreferences ─────────────────────────────────────────────────
     const val PREFS_NAME                  = "com.iocod.vonage.vonage_voicePreferences"

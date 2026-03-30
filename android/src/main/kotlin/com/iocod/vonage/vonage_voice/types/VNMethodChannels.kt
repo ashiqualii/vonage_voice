@@ -65,6 +65,12 @@ enum class VNMethodChannels(val methodName: String) {
     /** Opens Bluetooth settings to pair/connect devices. */
     OPEN_BLUETOOTH_SETTINGS("openBluetoothSettings"),
 
+    /** Returns a list of all available audio output devices. */
+    GET_AUDIO_DEVICES("getAudioDevices"),
+
+    /** Selects a specific audio output device by platform ID. */
+    SELECT_AUDIO_DEVICE("selectAudioDevice"),
+
     // ── Mute ─────────────────────────────────────────────────────────────
 
     /** Mute or unmute the microphone. */

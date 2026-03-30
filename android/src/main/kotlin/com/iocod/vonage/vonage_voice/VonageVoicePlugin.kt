@@ -307,6 +307,8 @@ class VonageVoicePlugin :
             VNMethodChannels.IS_BLUETOOTH_ENABLED -> handleIsBluetoothEnabled(result)
             VNMethodChannels.SHOW_BLUETOOTH_ENABLE_PROMPT -> handleShowBluetoothEnablePrompt(result)
             VNMethodChannels.OPEN_BLUETOOTH_SETTINGS -> handleOpenBluetoothSettings(result)
+            VNMethodChannels.GET_AUDIO_DEVICES -> handleGetAudioDevices(result)
+            VNMethodChannels.SELECT_AUDIO_DEVICE -> handleSelectAudioDevice(call, result)
 
             // ── Mute ──────────────────────────────────────────────────────
             VNMethodChannels.TOGGLE_MUTE -> handleToggleMute(call, result)
@@ -1017,6 +1019,252 @@ class VonageVoicePlugin :
             result.success(isBt)
         } else {
             result.success(audioManager.isBluetoothScoOn)
+        }
+    }
+
+    // ── Audio Device Management ───────────────────────────────────────────
+
+    /**
+     * getAudioDevices() — returns all available audio output devices.
+     *
+     * Each device is returned as a Map with keys:
+     *   id       — platform device ID (AudioDeviceInfo.id as String)
+     *   type     — "earpiece", "speaker", "bluetooth", "wiredHeadset", "unknown"
+     *   name     — human-readable product name
+     *   isActive — true if this device is the current audio output
+     *
+     * On API 31+: uses availableCommunicationDevices + communicationDevice.
+     * On pre-31: uses getDevices(GET_DEVICES_OUTPUTS) + isSpeakerphoneOn/isBluetoothScoOn.
+     */
+    private fun handleGetAudioDevices(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            result.success(emptyList<Map<String, Any>>())
+            return
+        }
+
+        val devices = mutableListOf<Map<String, Any>>()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val commDevices = audioManager.availableCommunicationDevices
+            val activeDevice = audioManager.communicationDevice
+
+            for (device in commDevices) {
+                val type = mapDeviceType(device.type) ?: continue
+                devices.add(mapOf(
+                    "id" to device.id.toString(),
+                    "type" to type,
+                    "name" to (device.productName?.toString()?.ifEmpty { null }
+                        ?: getDefaultDeviceName(type)),
+                    "isActive" to (activeDevice != null && activeDevice.id == device.id)
+                ))
+            }
+        } else {
+            // Pre-API 31: enumerate output devices
+            val outputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val activeSpeaker = audioManager.isSpeakerphoneOn
+            val activeBt = audioManager.isBluetoothScoOn
+            val seen = mutableSetOf<String>()
+
+            for (device in outputDevices) {
+                val type = mapDeviceType(device.type) ?: continue
+                val id = device.id.toString()
+                if (!seen.add("$type:$id")) continue
+
+                val isActive = when (type) {
+                    "speaker" -> activeSpeaker
+                    "bluetooth" -> activeBt
+                    "earpiece" -> !activeSpeaker && !activeBt
+                    else -> false
+                }
+
+                devices.add(mapOf(
+                    "id" to id,
+                    "type" to type,
+                    "name" to (device.productName?.toString()?.ifEmpty { null }
+                        ?: getDefaultDeviceName(type)),
+                    "isActive" to isActive
+                ))
+            }
+        }
+
+        // Ensure earpiece and speaker are always in the list
+        if (devices.none { it["type"] == "earpiece" }) {
+            val isActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val d = audioManager.communicationDevice
+                d != null && d.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            } else {
+                !audioManager.isSpeakerphoneOn && !audioManager.isBluetoothScoOn
+            }
+            devices.add(0, mapOf(
+                "id" to "earpiece",
+                "type" to "earpiece",
+                "name" to "Earpiece",
+                "isActive" to isActive
+            ))
+        }
+
+        if (devices.none { it["type"] == "speaker" }) {
+            val isActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val d = audioManager.communicationDevice
+                d != null && d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            } else {
+                audioManager.isSpeakerphoneOn
+            }
+            devices.add(mapOf(
+                "id" to "speaker",
+                "type" to "speaker",
+                "name" to "Speaker",
+                "isActive" to isActive
+            ))
+        }
+
+        result.success(devices)
+    }
+
+    /**
+     * selectAudioDevice() — routes audio to a specific device by ID.
+     *
+     * Flutter args:
+     *   deviceId : String — platform device ID from getAudioDevices()
+     *
+     * On API 31+: uses setCommunicationDevice() for precise routing.
+     * On pre-31: falls back to setSpeakerphoneOn / startBluetoothSco
+     * based on the target device type.
+     */
+    private fun handleSelectAudioDevice(call: MethodCall, result: Result) {
+        val deviceId = call.argument<String>(Constants.PARAM_DEVICE_ID)
+        if (deviceId.isNullOrEmpty()) {
+            result.error(FlutterErrorCodes.INVALID_PARAMS, "deviceId is required", null)
+            return
+        }
+
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "AudioManager not available", null)
+            return
+        }
+
+        // Handle synthetic IDs for built-in devices
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val commDevices = audioManager.availableCommunicationDevices
+
+            // Try numeric ID first
+            val numericId = deviceId.toIntOrNull()
+            val target = if (numericId != null) {
+                commDevices.firstOrNull { it.id == numericId }
+            } else {
+                // Handle synthetic IDs: "earpiece", "speaker"
+                when (deviceId) {
+                    "earpiece" -> commDevices.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                    }
+                    "speaker" -> commDevices.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                    }
+                    else -> null
+                }
+            }
+
+            if (target != null) {
+                audioManager.isSpeakerphoneOn = false
+                val success = audioManager.setCommunicationDevice(target)
+
+                // Update connection state so events stay in sync
+                val conn = TVConnectionService.getActiveConnection()
+                if (conn != null) {
+                    val isBt = target.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                               target.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                    val isSpk = target.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                    conn.isSpeakerOn = isSpk
+                    conn.isBluetoothOn = isBt
+                    if (isSpk) audioManager.isSpeakerphoneOn = true
+                }
+
+                result.success(success)
+            } else {
+                result.error(FlutterErrorCodes.INVALID_PARAMS, "Device not found: $deviceId", null)
+            }
+        } else {
+            // Pre-API 31 — use legacy audio routing
+            val outputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val numericId = deviceId.toIntOrNull()
+            val targetDevice = if (numericId != null) {
+                outputDevices.firstOrNull { it.id == numericId }
+            } else null
+
+            val targetType = targetDevice?.type?.let { mapDeviceType(it) } ?: deviceId
+
+            when (targetType) {
+                "earpiece" -> {
+                    audioManager.isSpeakerphoneOn = false
+                    if (audioManager.isBluetoothScoOn) {
+                        audioManager.stopBluetoothSco()
+                        audioManager.isBluetoothScoOn = false
+                    }
+                }
+                "speaker" -> {
+                    if (audioManager.isBluetoothScoOn) {
+                        audioManager.stopBluetoothSco()
+                        audioManager.isBluetoothScoOn = false
+                    }
+                    audioManager.isSpeakerphoneOn = true
+                }
+                "bluetooth" -> {
+                    audioManager.isSpeakerphoneOn = false
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                }
+                else -> {
+                    result.error(FlutterErrorCodes.INVALID_PARAMS, "Unknown device type: $targetType", null)
+                    return
+                }
+            }
+
+            // Update connection state
+            val conn = TVConnectionService.getActiveConnection()
+            if (conn != null) {
+                conn.isSpeakerOn = (targetType == "speaker")
+                conn.isBluetoothOn = (targetType == "bluetooth")
+            }
+
+            result.success(true)
+        }
+    }
+
+    /**
+     * Maps an Android AudioDeviceInfo.type constant to our device type string.
+     * Returns null for device types we don't expose to Flutter.
+     */
+    private fun mapDeviceType(type: Int): String? {
+        return when (type) {
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "wiredHeadset"
+            else -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    "bluetooth"
+                } else {
+                    null
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns a default human-readable name for a device type.
+     */
+    private fun getDefaultDeviceName(type: String): String {
+        return when (type) {
+            "earpiece" -> "Earpiece"
+            "speaker" -> "Speaker"
+            "bluetooth" -> "Bluetooth"
+            "wiredHeadset" -> "Wired Headset"
+            else -> "Unknown"
         }
     }
 
