@@ -406,6 +406,12 @@ class TVConnectionService : ConnectionService() {
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
                 audioManager.isSpeakerphoneOn = false
 
+                // Broadcast speaker=off so Flutter UI starts in the correct state
+                val speakerOffBroadcast = Intent(Constants.BROADCAST_SPEAKER_STATE).apply {
+                    putExtra("state", false)
+                }
+                broadcastManager.sendBroadcast(speakerOffBroadcast)
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     // API 31+ — prefer Bluetooth if connected, otherwise earpiece
                     val devices = audioManager.availableCommunicationDevices
