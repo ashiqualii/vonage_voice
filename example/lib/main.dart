@@ -45,7 +45,7 @@ class VonageExampleApp extends StatelessWidget {
     return MaterialApp(
       title: 'Vonage Voice Example',
       theme: ThemeData(useMaterial3: true),
-      home: const LoginScreen(),
+      home: const LoginScreen(isFromSplashScreen: true),
     );
   }
 }
@@ -55,7 +55,8 @@ class VonageExampleApp extends StatelessWidget {
 // ══════════════════════════════════════════════════════════════════════════
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  final bool isFromSplashScreen;
+  const LoginScreen({super.key, this.isFromSplashScreen = false});
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -125,6 +126,14 @@ class _LoginScreenState extends State<LoginScreen> {
       setState(() => _status = 'Error: $e');
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isFromSplashScreen) {
+      _login();
     }
   }
 
