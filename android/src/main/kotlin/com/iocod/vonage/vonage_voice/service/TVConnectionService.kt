@@ -405,12 +405,18 @@ class TVConnectionService : ConnectionService() {
                 // Set audio mode to voice call — critical for microphone to work
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
                 audioManager.isSpeakerphoneOn = false
+                audioManager.isMicrophoneMute = false
 
-                // Broadcast speaker=off so Flutter UI starts in the correct state
+                // Broadcast speaker=off and mute=off so Flutter UI starts in the correct state
                 val speakerOffBroadcast = Intent(Constants.BROADCAST_SPEAKER_STATE).apply {
                     putExtra("state", false)
                 }
                 broadcastManager.sendBroadcast(speakerOffBroadcast)
+
+                val muteOffBroadcast = Intent(Constants.BROADCAST_MUTE_STATE).apply {
+                    putExtra("state", false)
+                }
+                broadcastManager.sendBroadcast(muteOffBroadcast)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     // API 31+ — prefer Bluetooth if connected, otherwise earpiece
@@ -462,6 +468,7 @@ class TVConnectionService : ConnectionService() {
 
         audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = false
+        audioManager.isMicrophoneMute = false
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.clearCommunicationDevice()

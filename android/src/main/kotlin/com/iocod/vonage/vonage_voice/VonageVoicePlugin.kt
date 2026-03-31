@@ -1680,7 +1680,8 @@ class VonageVoicePlugin :
                 VonageClientHolder.isAnsweringInProgress = false
 
                 // Reset audio state events so Flutter UI doesn't carry stale
-                // speaker/bluetooth state into the next call
+                // mute/speaker/bluetooth state into the next call
+                emitEvent(VNNativeCallEvents.EVENT_UNMUTE)
                 emitEvent(VNNativeCallEvents.EVENT_SPEAKER_OFF)
                 emitEvent(VNNativeCallEvents.EVENT_BT_OFF)
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
@@ -1759,7 +1760,8 @@ class VonageVoicePlugin :
                 VonageClientHolder.isAnsweringInProgress = false
 
                 // Reset audio state events so Flutter UI doesn't carry stale
-                // speaker/bluetooth state into the next call
+                // mute/speaker/bluetooth state into the next call
+                emitEvent(VNNativeCallEvents.EVENT_UNMUTE)
                 emitEvent(VNNativeCallEvents.EVENT_SPEAKER_OFF)
                 emitEvent(VNNativeCallEvents.EVENT_BT_OFF)
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)

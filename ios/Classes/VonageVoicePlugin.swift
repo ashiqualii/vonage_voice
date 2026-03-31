@@ -1128,6 +1128,8 @@ extension VonageVoicePlugin {
         // 2) Available inputs — surfaces additional Bluetooth and wired devices
         if let inputs = session.availableInputs {
             for input in inputs {
+                // Skip input-only ports — only list output devices
+                if input.portType == .builtInMic || input.portType == .headsetMic { continue }
                 let type = mapPortType(input.portType)
                 if type == "unknown" { continue }
                 if seenUIDs.insert(input.uid).inserted {
@@ -1529,6 +1531,10 @@ extension VonageVoicePlugin {
             desiredSpeakerState = false
             desiredBluetoothState = false
             userExplicitlyChangedAudioRoute = false
+            // Notify Flutter that speaker/bluetooth are off so the next call
+            // starts with a clean UI — prevents the brief speaker flash.
+            sendPhoneCallEvents(description: "Speaker Off")
+            sendPhoneCallEvents(description: "Bluetooth Off")
             sendPhoneCallEvents(description: "LOG|  all per-call state reset (no remaining calls)")
         }
         sendPhoneCallEvents(description: "LOG|  after: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
@@ -1591,6 +1597,8 @@ extension VonageVoicePlugin: CXProviderDelegate {
             do {
                 try audioSession.overrideOutputAudioPort(.none)
                 try setPreferredInput(portType: .builtInMic)
+                // Confirm earpiece is active so Flutter UI doesn't briefly show speaker
+                sendPhoneCallEvents(description: "Speaker Off")
             } catch {
                 sendPhoneCallEvents(description: "LOG|Earpiece fallback failed: \(error.localizedDescription)")
             }
@@ -2112,7 +2120,15 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         }
 
         // ── NORMAL PATH ──
-        guard let uuid = callIdToUUID[callId] else { return }
+        guard let uuid = callIdToUUID[callId] else {
+            // Cancel arrived before the invite was delivered (e.g. caller hung up
+            // very quickly while app was in foreground). No UUID exists, so there's
+            // nothing to clean up in CallKit — but we still notify Flutter so the
+            // UI can show a missed-call indicator.
+            sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
+            sendPhoneCallEvents(description: "Missed Call")
+            return
+        }
 
         // GUARD: If the call was already answered and moved to activeCalls,
         // do NOT process the cancel — the SDK may fire cancel as cleanup
