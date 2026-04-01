@@ -5,18 +5,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.media.AudioAttributes
-import android.media.AudioManager
-import android.media.Ringtone
-import android.media.RingtoneManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.util.Log
-import android.view.View
 import android.view.WindowManager
 import android.widget.ImageButton
 import android.widget.TextView
@@ -80,9 +72,6 @@ class IncomingCallActivity : AppCompatActivity() {
     private var wasDeviceLockedOnCreate = false
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private var ringtone: Ringtone? = null
-    private var vibrator: Vibrator? = null
-    private var isRinging = false
 
     // Receiver to detect when the call is cancelled/ended remotely
     private val callEndedReceiver = object : BroadcastReceiver() {
@@ -91,7 +80,6 @@ class IncomingCallActivity : AppCompatActivity() {
             Log.d(TAG, "callEndedReceiver: action=${intent.action}, callId=$endedCallId, our callId=$callId")
             if (endedCallId == callId || intent.action == Constants.BROADCAST_CALL_INVITE_CANCELLED) {
                 Log.d(TAG, "Call ended/cancelled — finishing IncomingCallActivity")
-                stopRinging()
                 finish()
             }
         }
@@ -146,8 +134,7 @@ class IncomingCallActivity : AppCompatActivity() {
         answerButton.setOnClickListener { handleAnswer() }
         declineButton.setOnClickListener { handleDecline() }
 
-        // Start ringtone and vibration
-        startRinging()
+        // Ringing is managed by TVConnectionService — no startRinging() here
 
         // Listen for call cancelled / ended events
         val filter = IntentFilter().apply {
@@ -166,7 +153,6 @@ class IncomingCallActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         isActivityAlive = false
-        stopRinging()
         releaseWakeLock()
         try {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(callEndedReceiver)
@@ -218,84 +204,10 @@ class IncomingCallActivity : AppCompatActivity() {
         }
     }
 
-    // ── Ringtone & vibration ──────────────────────────────────────────────
-
-    private fun startRinging() {
-        if (isRinging) return
-        isRinging = true
-
-        // Play default ringtone
-        try {
-            val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-            ringtone = RingtoneManager.getRingtone(applicationContext, ringtoneUri)
-            ringtone?.let { ring ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    val audioAttributes = AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                    ring.audioAttributes = audioAttributes
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    ring.isLooping = true
-                }
-                ring.play()
-                Log.d(TAG, "Ringtone started")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting ringtone: ${e.message}")
-        }
-
-        // Start vibration
-        try {
-            vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val vibratorManager = getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager
-                vibratorManager.defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                getSystemService(VIBRATOR_SERVICE) as Vibrator
-            }
-            vibrator?.let { vib ->
-                if (vib.hasVibrator()) {
-                    val pattern = longArrayOf(0, 1000, 1000)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        vib.vibrate(VibrationEffect.createWaveform(pattern, 0))
-                    } else {
-                        @Suppress("DEPRECATION")
-                        vib.vibrate(pattern, 0)
-                    }
-                    Log.d(TAG, "Vibration started")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting vibration: ${e.message}")
-        }
-    }
-
-    private fun stopRinging() {
-        if (!isRinging) return
-        isRinging = false
-
-        try {
-            ringtone?.let { if (it.isPlaying) it.stop() }
-            ringtone = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping ringtone: ${e.message}")
-        }
-
-        try {
-            vibrator?.cancel()
-            vibrator = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping vibration: ${e.message}")
-        }
-    }
-
     // ── Button handlers ───────────────────────────────────────────────────
 
     private fun handleAnswer() {
         Log.d(TAG, "handleAnswer: callId=$callId, wasDeviceLockedOnCreate=$wasDeviceLockedOnCreate")
-        stopRinging()
 
         // Send answer intent to TVConnectionService
         val answerIntent = Intent(this, TVConnectionService::class.java).apply {
@@ -344,7 +256,6 @@ class IncomingCallActivity : AppCompatActivity() {
 
     private fun handleDecline() {
         Log.d(TAG, "handleDecline: callId=$callId")
-        stopRinging()
 
         // Send hangup/reject intent to TVConnectionService
         val declineIntent = Intent(this, TVConnectionService::class.java).apply {

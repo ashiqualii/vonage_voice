@@ -103,6 +103,11 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         }
         android.util.Log.d("VonageFCM", "Vonage push detected (has 'nexmo' key)")
 
+        // Record timestamp so the Dart fallback path (processVonagePush)
+        // can detect that a native FCM service is already processing this push
+        // and skip to avoid double-processing.
+        VonageClientHolder.lastNativePushTimestamp = System.currentTimeMillis()
+
         // ── Acquire WakeLock IMMEDIATELY ──────────────────────────────────
         // The SDK processes the push asynchronously. Without a WakeLock the
         // CPU may go back to sleep before the callback fires — especially

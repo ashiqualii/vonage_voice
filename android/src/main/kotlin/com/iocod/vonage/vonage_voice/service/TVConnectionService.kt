@@ -23,11 +23,15 @@ import com.iocod.vonage.vonage_voice.AnswerCallTrampolineActivity
 import com.vonage.voice.api.VoiceClient
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
+import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
 import androidx.core.app.Person
@@ -62,6 +66,14 @@ class TVConnectionService : ConnectionService() {
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var scoReceiver: BroadcastReceiver? = null
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
+
+    // ── Service-level ringtone & vibration ────────────────────────────────
+    // Ringing is managed by the service (not IncomingCallActivity) so it
+    // works reliably in background and locked states where the activity
+    // may fail to launch due to BAL restrictions.
+    private var serviceRingtone: Ringtone? = null
+    private var serviceVibrator: Vibrator? = null
+    private var isServiceRinging = false
 
     companion object {
         /**
@@ -98,6 +110,15 @@ class TVConnectionService : ConnectionService() {
     override fun onCreate() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
+
+        // Clean up the old notification channel that had sound/vibration.
+        // Must happen here (before any startForeground call) because
+        // Android throws SecurityException if you delete a channel while
+        // a foreground service is using it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.deleteNotificationChannel(Constants.INCOMING_CALL_CHANNEL_ID_OLD)
+        }
     }
 
     /**
@@ -249,18 +270,20 @@ class TVConnectionService : ConnectionService() {
             acquireIncomingCallWakeLock()
         }
 
-        // ── Fallback: directly launch IncomingCallActivity ────────────────
-        // On Android 14+ (API 34), USE_FULL_SCREEN_INTENT is a special permission
-        // that Samsung and some OEMs may not grant or may silently ignore.
-        // When fullScreenIntent can't fire, directly start IncomingCallActivity
-        // as a fallback so the user always sees the full-screen call UI.
-        val canFullScreen = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            notificationManager.canUseFullScreenIntent()
-        } else {
-            true
-        }
-        if (!canFullScreen) {
-            android.util.Log.w("TVConnectionService", "fullScreenIntent not permitted — launching IncomingCallActivity directly")
+        // ── Start ringing from the service ─────────────────────────────
+        // Ringing is managed by the service so it works reliably in all
+        // app states (foreground, background, locked, killed). The service
+        // is always alive at this point because onStartCommand → ensureForeground
+        // has already been called.
+        startServiceRinging()
+
+        // ── Launch IncomingCallActivity only when Flutter is NOT attached ──
+        // When Flutter is alive (foreground), Flutter's own IncomingCallScreen
+        // handles the UI via the BROADCAST_CALL_INVITE event below.
+        // When Flutter is NOT attached (background/killed/locked), the native
+        // IncomingCallActivity provides answer/decline buttons over the lock
+        // screen. The activity no longer handles ringing — the service does.
+        if (!VonageClientHolder.isFlutterEngineAttached) {
             try {
                 val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
                 directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -268,6 +291,8 @@ class TVConnectionService : ConnectionService() {
             } catch (e: Exception) {
                 android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
             }
+        } else {
+            android.util.Log.d("TVConnectionService", "Flutter attached — skipping native IncomingCallActivity")
         }
 
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
@@ -287,6 +312,9 @@ class TVConnectionService : ConnectionService() {
      */
     private fun handleCancelCallInvite(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+
+        // Stop ringing — call is being cancelled
+        stopServiceRinging()
 
         // Release the incoming call wake lock — call is being cancelled
         releaseIncomingCallWakeLock()
@@ -624,6 +652,9 @@ class TVConnectionService : ConnectionService() {
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Stop ringing — call is being answered
+        stopServiceRinging()
+
         // Release the incoming call wake lock — call is being answered
         releaseIncomingCallWakeLock()
 
@@ -708,6 +739,9 @@ class TVConnectionService : ConnectionService() {
     private fun handleHangup(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Stop ringing — call is being declined/ended
+        stopServiceRinging()
+
         // Release the incoming call wake lock — call is being declined/ended
         releaseIncomingCallWakeLock()
 
@@ -767,6 +801,7 @@ class TVConnectionService : ConnectionService() {
      * and the local handleHangup() path was never invoked.
      */
     private fun handleCleanup() {
+        stopServiceRinging()
         releaseIncomingCallWakeLock()
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
@@ -954,11 +989,11 @@ class TVConnectionService : ConnectionService() {
      */
     private fun createIncomingCallNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-            val ringtoneAttrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            // Silent channel — IncomingCallActivity is the sole source of
+            // ringtone and vibration. No sound on the notification channel
+            // prevents duplicate/overlapping ringtones.
             val channel = NotificationChannel(
                 Constants.INCOMING_CALL_CHANNEL_ID,
                 Constants.INCOMING_CALL_CHANNEL_NAME,
@@ -967,11 +1002,9 @@ class TVConnectionService : ConnectionService() {
                 description = "Incoming Vonage voice call alerts"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 setBypassDnd(true)
-                setSound(ringtoneUri, ringtoneAttrs)
-                enableVibration(true)
-                vibrationPattern = longArrayOf(0, 1000, 1000)
+                setSound(null, null)
+                enableVibration(false)
             }
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
@@ -989,7 +1022,7 @@ class TVConnectionService : ConnectionService() {
             .setContentText("Processing incoming call...")
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setOngoing(true)
-            .setSilent(false)
+            .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -1061,7 +1094,7 @@ class TVConnectionService : ConnectionService() {
             .setContentIntent(fullScreenPendingIntent)
             .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
-            .setSilent(false)
+            .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -1166,6 +1199,85 @@ class TVConnectionService : ConnectionService() {
         }
     }
 
+    // ── Service-level ringtone & vibration ────────────────────────────────
+
+    /**
+     * Start playing the default ringtone and vibrating.
+     * Called from [handleIncomingCall] so ringing starts immediately
+     * regardless of whether IncomingCallActivity manages to launch.
+     */
+    private fun startServiceRinging() {
+        if (isServiceRinging) return
+        isServiceRinging = true
+
+        // Play default ringtone
+        try {
+            val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            serviceRingtone = RingtoneManager.getRingtone(applicationContext, ringtoneUri)
+            serviceRingtone?.let { ring ->
+                val audioAttributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+                ring.audioAttributes = audioAttributes
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    ring.isLooping = true
+                }
+                ring.play()
+                android.util.Log.d("TVConnectionService", "Service ringtone started")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error starting service ringtone: ${e.message}")
+        }
+
+        // Start vibration
+        try {
+            serviceVibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                vibratorManager.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            }
+            serviceVibrator?.let { vib ->
+                if (vib.hasVibrator()) {
+                    val pattern = longArrayOf(0, 1000, 1000) // 1s on, 1s off
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vib.vibrate(VibrationEffect.createWaveform(pattern, 0))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        vib.vibrate(pattern, 0)
+                    }
+                    android.util.Log.d("TVConnectionService", "Service vibration started")
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error starting service vibration: ${e.message}")
+        }
+    }
+
+    /**
+     * Stop ringtone and vibration. Safe to call multiple times.
+     */
+    private fun stopServiceRinging() {
+        if (!isServiceRinging) return
+        isServiceRinging = false
+
+        try {
+            serviceRingtone?.let { if (it.isPlaying) it.stop() }
+            serviceRingtone = null
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error stopping service ringtone: ${e.message}")
+        }
+
+        try {
+            serviceVibrator?.cancel()
+            serviceVibrator = null
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error stopping service vibration: ${e.message}")
+        }
+    }
+
     // ── Broadcast helpers ─────────────────────────────────────────────────
 
     private fun broadcastCallEnded(callId: String) {
@@ -1200,6 +1312,24 @@ object VonageClientHolder {
     /** True once createSession() has succeeded on the current VoiceClient. */
     @Volatile
     var isSessionReady: Boolean = false
+
+    /**
+     * True when the Flutter engine is attached to VonageVoicePlugin.
+     * Used by TVConnectionService to decide whether to launch the native
+     * IncomingCallActivity (background/killed) or let Flutter handle the
+     * incoming call UI (foreground).
+     * Set in VonageVoicePlugin.onAttachedToEngine/onDetachedFromEngine.
+     */
+    @Volatile
+    var isFlutterEngineAttached: Boolean = false
+
+    /**
+     * Timestamp (millis) of the last FCM push processed by the native
+     * VonageFirebaseMessagingService. The Dart fallback path
+     * (handleProcessPush) checks this to avoid double-processing.
+     */
+    @Volatile
+    var lastNativePushTimestamp: Long = 0L
 
     /**
      * True when a call was answered via the native path (notification Answer button

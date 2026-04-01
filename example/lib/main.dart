@@ -12,11 +12,12 @@ import 'package:vonage_voice_example/keys.dart';
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   // This runs in a separate isolate when app is killed/backgrounded.
-  // Forward push data to the native Vonage SDK so it can process
-  // incoming call invites even when VonageFirebaseMessagingService
-  // did not receive the FCM message.
+  // On Android, VonageFirebaseMessagingService handles push processing
+  // natively — calling processVonagePush here would double-process the
+  // push and can confuse the Vonage SDK's invite state.
+  // On iOS, there is no native FCM service so Dart must forward the push.
   log('FCM background message received: ${message.data}');
-  if (message.data.isNotEmpty) {
+  if (Platform.isIOS && message.data.isNotEmpty) {
     try {
       await VonageVoice.instance.processVonagePush(message.data);
     } catch (e) {
@@ -198,12 +199,16 @@ class _DialerScreenState extends State<DialerScreen> {
   }
 
   /// Forward foreground FCM messages to the native Vonage SDK.
+  /// On Android, VonageFirebaseMessagingService already processes the
+  /// push natively — calling processVonagePush from Dart would
+  /// double-process it and can break the invite state.
+  /// On iOS, there is no native FCM service so Dart must forward.
   void _listenToFcmForeground() {
     _fcmForegroundSub = FirebaseMessaging.onMessage.listen((
       RemoteMessage message,
     ) {
       log('FCM foreground message: ${message.data}');
-      if (message.data.isNotEmpty) {
+      if (Platform.isIOS && message.data.isNotEmpty) {
         VonageVoice.instance.processVonagePush(message.data);
       }
     });

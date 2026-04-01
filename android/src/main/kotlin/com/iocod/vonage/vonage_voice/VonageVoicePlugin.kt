@@ -137,9 +137,17 @@ class VonageVoicePlugin :
         // (app killed → FCM → user taps notification → engine starts)
         // will re-emit the pending call state to Flutter.
         pendingCallReEmitted = null
+
+        // Mark Flutter engine as attached so TVConnectionService knows
+        // to skip the native IncomingCallActivity in favour of Flutter UI.
+        VonageClientHolder.isFlutterEngineAttached = true
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        // Mark Flutter engine as detached so TVConnectionService uses
+        // the native IncomingCallActivity for incoming calls.
+        VonageClientHolder.isFlutterEngineAttached = false
+
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
 
@@ -608,6 +616,16 @@ class VonageVoicePlugin :
         // Vonage pushes always contain a "nexmo" key.
         if (!data.containsKey("nexmo")) {
             android.util.Log.d("VonagePlugin", "processVonagePush: no 'nexmo' key — not a Vonage push")
+            result.success(null)
+            return
+        }
+
+        // Guard: if VonageFirebaseMessagingService already started processing
+        // this push within the last 5 seconds, skip to avoid double-processing
+        // which can corrupt the Vonage SDK's invite state.
+        val timeSinceNativePush = System.currentTimeMillis() - VonageClientHolder.lastNativePushTimestamp
+        if (timeSinceNativePush < 5000) {
+            android.util.Log.d("VonagePlugin", "processVonagePush: native FCM service processed ${timeSinceNativePush}ms ago — skipping")
             result.success(null)
             return
         }
