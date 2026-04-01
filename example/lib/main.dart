@@ -1023,11 +1023,17 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final contact = widget.activeCall.fromFormatted.isNotEmpty
-        ? widget.activeCall.fromFormatted
-        : widget.activeCall.from.isNotEmpty
-        ? widget.activeCall.from
-        : widget.activeCall.to;
+    final isOutgoing =
+        widget.activeCall.callDirection == CallDirection.outgoing;
+    final contact = isOutgoing
+        ? (widget.activeCall.toFormatted.isNotEmpty
+              ? widget.activeCall.toFormatted
+              : widget.activeCall.to)
+        : (widget.activeCall.fromFormatted.isNotEmpty
+              ? widget.activeCall.fromFormatted
+              : widget.activeCall.from.isNotEmpty
+              ? widget.activeCall.from
+              : widget.activeCall.to);
 
     return Scaffold(
       backgroundColor: Colors.black87,
