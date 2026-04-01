@@ -37,6 +37,9 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.os.Handler
 import android.os.Looper
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 
 /**
  * VonageVoicePlugin — main Flutter plugin entry point.
@@ -111,6 +114,22 @@ class VonageVoicePlugin :
         private const val REQUEST_CODE_BT_ENABLE     = 2001
     }
 
+    // ── Application foreground/background observer ────────────────────────
+    // ProcessLifecycleOwner fires onStart when ANY activity becomes visible
+    // and onStop when ALL activities are in the background (with a ~700ms delay
+    // to account for config changes / activity transitions).
+    private val appLifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            VonageClientHolder.isFlutterInForeground = true
+            android.util.Log.d("VonagePlugin", "App moved to FOREGROUND")
+        }
+
+        override fun onStop(owner: LifecycleOwner) {
+            VonageClientHolder.isFlutterInForeground = false
+            android.util.Log.d("VonagePlugin", "App moved to BACKGROUND")
+        }
+    }
+
     // ── FlutterPlugin — engine lifecycle ──────────────────────────────────
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -138,8 +157,12 @@ class VonageVoicePlugin :
         // will re-emit the pending call state to Flutter.
         pendingCallReEmitted = null
 
-        // Mark Flutter engine as attached so TVConnectionService knows
-        // to skip the native IncomingCallActivity in favour of Flutter UI.
+        // Track app foreground/background state so TVConnectionService
+        // knows whether to show the native IncomingCallActivity (background)
+        // or let Flutter handle the incoming call UI (foreground).
+        // ProcessLifecycleOwner is the most reliable way to detect this —
+        // it fires onStart/onStop for the entire Application, not per-Activity.
+        ProcessLifecycleOwner.get().lifecycle.addObserver(appLifecycleObserver)
         VonageClientHolder.isFlutterEngineAttached = true
     }
 
@@ -147,6 +170,8 @@ class VonageVoicePlugin :
         // Mark Flutter engine as detached so TVConnectionService uses
         // the native IncomingCallActivity for incoming calls.
         VonageClientHolder.isFlutterEngineAttached = false
+        VonageClientHolder.isFlutterInForeground = false
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(appLifecycleObserver)
 
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null

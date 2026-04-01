@@ -277,13 +277,14 @@ class TVConnectionService : ConnectionService() {
         // has already been called.
         startServiceRinging()
 
-        // ── Launch IncomingCallActivity only when Flutter is NOT attached ──
-        // When Flutter is alive (foreground), Flutter's own IncomingCallScreen
+        // ── Launch IncomingCallActivity only when Flutter is NOT in foreground ──
+        // When Flutter is in the foreground, Flutter's own IncomingCallScreen
         // handles the UI via the BROADCAST_CALL_INVITE event below.
-        // When Flutter is NOT attached (background/killed/locked), the native
-        // IncomingCallActivity provides answer/decline buttons over the lock
-        // screen. The activity no longer handles ringing — the service does.
-        if (!VonageClientHolder.isFlutterEngineAttached) {
+        // When Flutter is NOT in the foreground (background/killed/locked), the
+        // native IncomingCallActivity provides answer/decline buttons. On
+        // lock screen, Android also auto-launches it via the notification's
+        // fullScreenIntent. The activity no longer handles ringing — the service does.
+        if (!VonageClientHolder.isFlutterInForeground) {
             try {
                 val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
                 directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -292,7 +293,7 @@ class TVConnectionService : ConnectionService() {
                 android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
             }
         } else {
-            android.util.Log.d("TVConnectionService", "Flutter attached — skipping native IncomingCallActivity")
+            android.util.Log.d("TVConnectionService", "Flutter in foreground — skipping native IncomingCallActivity")
         }
 
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
@@ -991,9 +992,9 @@ class TVConnectionService : ConnectionService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-            // Silent channel — IncomingCallActivity is the sole source of
-            // ringtone and vibration. No sound on the notification channel
-            // prevents duplicate/overlapping ringtones.
+            // Silent channel — TVConnectionService.startServiceRinging() is the
+            // sole source of ringtone and vibration. No sound on the notification
+            // channel prevents duplicate/overlapping ringtones.
             val channel = NotificationChannel(
                 Constants.INCOMING_CALL_CHANNEL_ID,
                 Constants.INCOMING_CALL_CHANNEL_NAME,
@@ -1022,7 +1023,6 @@ class TVConnectionService : ConnectionService() {
             .setContentText("Processing incoming call...")
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setOngoing(true)
-            .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -1094,7 +1094,6 @@ class TVConnectionService : ConnectionService() {
             .setContentIntent(fullScreenPendingIntent)
             .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
-            .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -1315,13 +1314,26 @@ object VonageClientHolder {
 
     /**
      * True when the Flutter engine is attached to VonageVoicePlugin.
-     * Used by TVConnectionService to decide whether to launch the native
-     * IncomingCallActivity (background/killed) or let Flutter handle the
-     * incoming call UI (foreground).
      * Set in VonageVoicePlugin.onAttachedToEngine/onDetachedFromEngine.
      */
     @Volatile
     var isFlutterEngineAttached: Boolean = false
+
+    /**
+     * True when the Flutter app Activity is in the foreground (resumed/started).
+     * Tracked via ProcessLifecycleOwner in VonageVoicePlugin.
+     *
+     * Used by TVConnectionService.handleIncomingCall() to decide whether to
+     * launch the native IncomingCallActivity (background/killed/locked) or
+     * let Flutter handle the incoming call UI (foreground).
+     *
+     * Key distinction from [isFlutterEngineAttached]:
+     *   - Engine attached + foreground → Flutter handles UI, skip native screen
+     *   - Engine attached + background → Native screen needed (Flutter can't show UI)
+     *   - Engine detached → Native screen needed (app process killed/restarted)
+     */
+    @Volatile
+    var isFlutterInForeground: Boolean = false
 
     /**
      * Timestamp (millis) of the last FCM push processed by the native
