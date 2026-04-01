@@ -671,6 +671,32 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// **Platform:** Android only.
   Future<bool?> openFullScreenIntentSettings();
 
+  // ── Overlay / "Display over other apps" permission ──────────────────
+
+  /// Checks if the app has `SYSTEM_ALERT_WINDOW` ("Display over other apps")
+  /// permission granted.
+  ///
+  /// On **Samsung** and many OEMs, this must be explicitly enabled for the
+  /// native incoming call screen to launch from background/locked state.
+  /// This is what **WhatsApp** and **Botim** use to show calls reliably.
+  ///
+  /// Returns `true` on iOS and on Android < 6.0 (auto-granted).
+  ///
+  /// ```dart
+  /// if (!await VonageVoice.instance.canDrawOverlays()) {
+  ///   await VonageVoice.instance.openOverlaySettings();
+  /// }
+  /// ```
+  ///
+  /// See also: [openOverlaySettings].
+  Future<bool> canDrawOverlays();
+
+  /// Opens the system settings screen where the user can grant
+  /// `SYSTEM_ALERT_WINDOW` ("Display over other apps" / "Appear on top").
+  ///
+  /// **Platform:** Android only — no-op on iOS.
+  Future<bool?> openOverlaySettings();
+
   // ── Deprecated — Background Call UI ─────────────────────────────────
   //
   // This method showed a custom floating overlay UI when a call was active

@@ -415,6 +415,26 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     return _channel.invokeMethod('openFullScreenIntentSettings', {});
   }
 
+  // ── Overlay / "Display over other apps" permission ──────────────────
+
+  @override
+  Future<bool> canDrawOverlays() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel
+        .invokeMethod<bool?>('canDrawOverlays', {})
+        .then<bool>((bool? value) => value ?? false);
+  }
+
+  @override
+  Future<bool?> openOverlaySettings() {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return Future.value(true);
+    }
+    return _channel.invokeMethod('openOverlaySettings', {});
+  }
+
   // ── Deprecated — Background Call UI ──────────────────────────────────
   //
   // Kept for backward compatibility. This method is a no-op.

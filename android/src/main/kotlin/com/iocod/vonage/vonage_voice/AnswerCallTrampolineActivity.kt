@@ -23,7 +23,7 @@ import com.iocod.vonage.vonage_voice.service.TVConnectionService
  *   4. Launches MainActivity from an Activity context (bypasses background start restriction)
  *   5. Finishes immediately
  *
- * Uses Theme.Vonage.Transparent so the user sees no screen transition.
+ * Uses Theme.Vonage.Transparent so the user sees no screen transition. 
  */
 class AnswerCallTrampolineActivity : AppCompatActivity() {
 
