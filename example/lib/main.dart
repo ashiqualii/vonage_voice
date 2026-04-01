@@ -98,6 +98,15 @@ class _LoginScreenState extends State<LoginScreen> {
         await VonageVoice.instance.openFullScreenIntentSettings();
       }
 
+      // ── "Display over other apps" (SYSTEM_ALERT_WINDOW) ────────────────
+      // Required on Samsung and many OEMs for the native incoming call
+      // screen to launch from background/locked state via startActivity().
+      // This is what WhatsApp and Botim use to show calls reliably.
+      final canOverlay = await VonageVoice.instance.canDrawOverlays();
+      if (!canOverlay) {
+        await VonageVoice.instance.openOverlaySettings();
+      }
+
       // Get FCM token for incoming call push notifications
       String? fcmToken;
       if (Platform.isAndroid) {

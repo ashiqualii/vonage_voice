@@ -185,7 +185,15 @@ enum class VNMethodChannels(val methodName: String) {
     CAN_USE_FULL_SCREEN_INTENT("canUseFullScreenIntent"),
 
     /** Opens system settings for USE_FULL_SCREEN_INTENT permission. */
-    OPEN_FULL_SCREEN_INTENT_SETTINGS("openFullScreenIntentSettings");
+    OPEN_FULL_SCREEN_INTENT_SETTINGS("openFullScreenIntentSettings"),
+
+    // ── Overlay / "Display over other apps" permission ───────────────────
+
+    /** Returns true if SYSTEM_ALERT_WINDOW (draw over other apps) is granted. */
+    CAN_DRAW_OVERLAYS("canDrawOverlays"),
+
+    /** Opens system settings for SYSTEM_ALERT_WINDOW permission. */
+    OPEN_OVERLAY_SETTINGS("openOverlaySettings");
 
     companion object {
         /**

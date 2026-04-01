@@ -447,6 +447,10 @@ class VonageVoicePlugin :
             VNMethodChannels.CAN_USE_FULL_SCREEN_INTENT -> handleCanUseFullScreenIntent(result)
             VNMethodChannels.OPEN_FULL_SCREEN_INTENT_SETTINGS -> handleOpenFullScreenIntentSettings(result)
 
+            // ── Overlay / "Display over other apps" permission ────────────
+            VNMethodChannels.CAN_DRAW_OVERLAYS -> handleCanDrawOverlays(result)
+            VNMethodChannels.OPEN_OVERLAY_SETTINGS -> handleOpenOverlaySettings(result)
+
             // ── Notification permission (API 33+) ──────────────────────
             VNMethodChannels.HAS_NOTIFICATION_PERMISSION -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1637,6 +1641,55 @@ class VonageVoicePlugin :
             result.success(true)
         } catch (e: Exception) {
             android.util.Log.e("VonagePlugin", "Failed to open full-screen intent settings: ${e.message}")
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Cannot open settings: ${e.message}", null)
+        }
+    }
+
+    // ── Overlay / "Display over other apps" permission handlers ──────────
+
+    /**
+     * Returns true if SYSTEM_ALERT_WINDOW is granted.
+     * On API < 23 this is auto-granted at install time.
+     * On Samsung and many OEMs, this must be explicitly enabled by the user
+     * for startActivity() from a foreground service to show the incoming
+     * call screen reliably — this is what WhatsApp and Botim use.
+     */
+    private fun handleCanDrawOverlays(result: Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            result.success(true)
+            return
+        }
+        val ctx = context ?: run {
+            result.success(false)
+            return
+        }
+        result.success(android.provider.Settings.canDrawOverlays(ctx))
+    }
+
+    /**
+     * Opens system settings where the user can grant SYSTEM_ALERT_WINDOW
+     * ("Display over other apps" / "Appear on top").
+     */
+    private fun handleOpenOverlaySettings(result: Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            result.success(true)
+            return
+        }
+        val ctx = context ?: run {
+            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
+            return
+        }
+        try {
+            val intent = Intent(
+                android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                android.net.Uri.parse("package:${ctx.packageName}")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(intent)
+            result.success(true)
+        } catch (e: Exception) {
+            android.util.Log.e("VonagePlugin", "Failed to open overlay settings: ${e.message}")
             result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Cannot open settings: ${e.message}", null)
         }
     }
