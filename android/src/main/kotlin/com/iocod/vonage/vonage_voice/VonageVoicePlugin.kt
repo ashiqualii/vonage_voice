@@ -92,9 +92,6 @@ class VonageVoicePlugin :
     /** Local mute state — Vonage SDK has no getMuteState() so we track it here. */
     private var isMuted: Boolean = false
 
-    /** Local hold state — tracked here since hold is via Telecom layer. */
-    private var isHolding: Boolean = false
-
     // ── Permission request tracking ───────────────────────────────────────
 
     private val permissionResultHandlers = HashMap<Int, (Boolean) -> Unit>()
@@ -346,10 +343,6 @@ class VonageVoicePlugin :
             // ── Mute ──────────────────────────────────────────────────────
             VNMethodChannels.TOGGLE_MUTE -> handleToggleMute(call, result)
             VNMethodChannels.IS_MUTED -> result.success(isMuted)
-
-            // ── Hold ──────────────────────────────────────────────────────
-            VNMethodChannels.HOLD_CALL -> handleHoldCall(call, result)
-            VNMethodChannels.IS_HOLDING -> result.success(isHolding)
 
             // ── Call state queries ────────────────────────────────────────
             VNMethodChannels.IS_ON_CALL -> result.success(TVConnectionService.hasActiveCall())
@@ -1349,40 +1342,6 @@ class VonageVoicePlugin :
         result.success(true)
     }
 
-    // ── Hold handler ──────────────────────────────────────────────────────
-
-    /**
-     * holdCall() — place the call on hold or resume it.
-     *
-     * Flutter args:
-     *   shouldHold : Boolean — true to hold, false to resume
-     */
-    private fun handleHoldCall(call: MethodCall, result: Result) {
-        val shouldHold = call.argument<Boolean>(Constants.PARAM_SHOULD_HOLD) ?: false
-
-        val callId = activeCallId ?: TVConnectionService.getActiveCallId()
-        if (callId.isNullOrEmpty()) {
-            result.error(FlutterErrorCodes.NO_ACTIVE_CALL, "No active call", null)
-            return
-        }
-
-        val ctx = context ?: run {
-            result.error(FlutterErrorCodes.UNAVAILABLE_ERROR, "Context not available", null)
-            return
-        }
-
-        val intent = Intent(ctx, TVConnectionService::class.java).apply {
-            action = Constants.ACTION_TOGGLE_HOLD
-            putExtra(Constants.EXTRA_CALL_ID, callId)
-            putExtra(Constants.EXTRA_HOLD_STATE, shouldHold)
-        }
-        ctx.startService(intent)
-
-        // Update local state immediately
-        isHolding = shouldHold
-        result.success(true)
-    }
-
     // ── Caller registry handlers ──────────────────────────────────────────
 
     private fun handleRegisterClient(call: MethodCall, result: Result) {
@@ -1760,7 +1719,7 @@ class VonageVoicePlugin :
             // ── Call ended ────────────────────────────────────────────────
             Constants.BROADCAST_CALL_ENDED -> {
                 // Guard against duplicate broadcasts (hangup + SDK listener)
-                if (activeCallId == null && !isMuted && !isHolding) return
+                if (activeCallId == null && !isMuted) return
 
                 // If invite listeners were skipped during registerVoiceClientListeners()
                 // because the call was answered natively, register them now so the
@@ -1769,7 +1728,6 @@ class VonageVoicePlugin :
 
                 activeCallId = null
                 isMuted = false
-                isHolding = false
                 pendingCallReEmitted = null
                 // Clear native-answer flags so future incoming calls work normally
                 VonageClientHolder.isCallAnsweredNatively = false
@@ -1810,16 +1768,6 @@ class VonageVoicePlugin :
                 )
             }
 
-            // ── Hold state ────────────────────────────────────────────────
-            Constants.BROADCAST_HOLD_STATE -> {
-                val holding = intent.getBooleanExtra("state", false)
-                isHolding = holding
-                emitEvent(
-                    if (holding) VNNativeCallEvents.EVENT_HOLD
-                    else VNNativeCallEvents.EVENT_UNHOLD
-                )
-            }
-
             // ── Speaker state ─────────────────────────────────────────────
             Constants.BROADCAST_SPEAKER_STATE -> {
                 val speakerOn = intent.getBooleanExtra("state", false)
@@ -1851,7 +1799,6 @@ class VonageVoicePlugin :
                 TVConnectionService.activeConnections.remove(callId)
                 activeCallId = null
                 isMuted = false
-                isHolding = false
                 VonageClientHolder.isCallAnsweredNatively = false
                 VonageClientHolder.isAnsweringInProgress = false
 

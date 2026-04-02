@@ -612,10 +612,6 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       case 'Declined':
         call.activeCall = null;
         return CallEvent.declined;
-      case 'Unhold':
-        return CallEvent.unhold;
-      case 'Hold':
-        return CallEvent.hold;
       case 'Unmute':
         return CallEvent.unmute;
       case 'Mute':

@@ -294,28 +294,6 @@ void main() {
     });
   });
 
-  // ── holdCall ────────────────────────────────────────────────────────────
-
-  group('holdCall()', () {
-    test('invokes holdCall with shouldHold=true', () async {
-      handler.setResponse('holdCall', true);
-
-      await call.holdCall(holdCall: true);
-
-      final recorded = handler.lastCallFor('holdCall');
-      expect(recorded!.arguments['shouldHold'], isTrue);
-    });
-
-    test('invokes holdCall with shouldHold=false', () async {
-      handler.setResponse('holdCall', true);
-
-      await call.holdCall(holdCall: false);
-
-      final recorded = handler.lastCallFor('holdCall');
-      expect(recorded!.arguments['shouldHold'], isFalse);
-    });
-  });
-
   // ── toggleSpeaker ────────────────────────────────────────────────────────
 
   group('toggleSpeaker()', () {
@@ -523,14 +501,6 @@ void main() {
       expect(voice.parseCallEvent('Unmute'), equals(CallEvent.unmute));
     });
 
-    test('parses Hold event', () {
-      expect(voice.parseCallEvent('Hold'), equals(CallEvent.hold));
-    });
-
-    test('parses Unhold event', () {
-      expect(voice.parseCallEvent('Unhold'), equals(CallEvent.unhold));
-    });
-
     test('parses Speaker On event', () {
       expect(voice.parseCallEvent('Speaker On'), equals(CallEvent.speakerOn));
     });
@@ -609,8 +579,7 @@ void main() {
     test('LOG with "Rejecting invite" does NOT return declined', () {
       voice.parseCallEvent('Incoming|+1234|+5678|Incoming');
 
-      final event =
-          voice.parseCallEvent('LOG|Rejecting invite id=abc-123');
+      final event = voice.parseCallEvent('LOG|Rejecting invite id=abc-123');
       expect(event, equals(CallEvent.log));
       // activeCall should still be set — this is a harmless native log
       expect(voice.call.activeCall, isNotNull);
@@ -622,9 +591,7 @@ void main() {
     });
 
     test('parses ReturningCall event', () {
-      final event = voice.parseCallEvent(
-        'ReturningCall|+1234|+5678|Outgoing',
-      );
+      final event = voice.parseCallEvent('ReturningCall|+1234|+5678|Outgoing');
       expect(event, equals(CallEvent.returningCall));
       expect(
         voice.call.activeCall!.callDirection,

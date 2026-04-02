@@ -20,7 +20,6 @@ import com.iocod.vonage.vonage_voice.constants.Constants
  *
  * Responsibilities:
  *   - Mute / unmute microphone via AudioManager
- *   - Hold / resume call via Telecom state machine
  *   - Route audio to speaker or Bluetooth
  *   - Broadcast all state changes back to VonageVoicePlugin via LocalBroadcast
  *
@@ -44,9 +43,6 @@ class TVCallConnection(
     var isMuted: Boolean = false
         private set
 
-    var isOnHold: Boolean = false
-        private set
-
     var isSpeakerOn: Boolean = false
         internal set
 
@@ -65,25 +61,6 @@ class TVCallConnection(
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroy()
         broadcastEvent(Constants.BROADCAST_SYSTEM_DISCONNECT)
-    }
-
-    /**
-     * Called when the system requests the call be placed on hold.
-     * e.g. when another call comes in or the user taps hold in the system UI.
-     */
-    override fun onHold() {
-        setOnHold()
-        isOnHold = true
-        broadcastStateEvent(Constants.BROADCAST_HOLD_STATE, isOnHold)
-    }
-
-    /**
-     * Called when the system requests the call be resumed from hold.
-     */
-    override fun onUnhold() {
-        setActive()
-        isOnHold = false
-        broadcastStateEvent(Constants.BROADCAST_HOLD_STATE, isOnHold)
     }
 
     /**
@@ -120,21 +97,6 @@ class TVCallConnection(
         isMuted = muted
         audioManager.isMicrophoneMute = muted
         broadcastStateEvent(Constants.BROADCAST_MUTE_STATE, muted)
-    }
-
-    /**
-     * Put the call on hold or resume it programmatically
-     * (from Flutter, not from system UI).
-     */
-    fun setHold(hold: Boolean) {
-        if (hold) {
-            setOnHold()
-            isOnHold = true
-        } else {
-            setActive()
-            isOnHold = false
-        }
-        broadcastStateEvent(Constants.BROADCAST_HOLD_STATE, isOnHold)
     }
 
     /**

@@ -12,7 +12,6 @@ object Constants {
     const val PARAM_SPEAKER_IS_ON = "speakerIsOn"
     const val PARAM_BLUETOOTH_ON  = "bluetoothOn"
     const val PARAM_MUTED        = "muted"
-    const val PARAM_SHOULD_HOLD  = "shouldHold"
     const val PARAM_DEFAULT_CALLER = "defaultCaller"
     const val PARAM_CLIENT_ID    = "id"
     const val PARAM_CLIENT_NAME  = "name"
@@ -49,7 +48,6 @@ object Constants {
     const val ACTION_TOGGLE_SPEAKER     = "com.iocod.vonage.ACTION_TOGGLE_SPEAKER"
     const val ACTION_TOGGLE_BLUETOOTH   = "com.iocod.vonage.ACTION_TOGGLE_BLUETOOTH"
     const val ACTION_TOGGLE_MUTE        = "com.iocod.vonage.ACTION_TOGGLE_MUTE"
-    const val ACTION_TOGGLE_HOLD        = "com.iocod.vonage.ACTION_TOGGLE_HOLD"
     const val ACTION_CLEANUP            = "com.iocod.vonage.ACTION_CLEANUP"
 
     // ── Intent extra keys ─────────────────────────────────────────────────
@@ -62,7 +60,6 @@ object Constants {
     const val EXTRA_SPEAKER_STATE   = "EXTRA_SPEAKER_STATE"
     const val EXTRA_BLUETOOTH_STATE = "EXTRA_BLUETOOTH_STATE"
     const val EXTRA_MUTE_STATE      = "EXTRA_MUTE_STATE"
-    const val EXTRA_HOLD_STATE      = "EXTRA_HOLD_STATE"
     const val EXTRA_FCM_DATA        = "EXTRA_FCM_DATA"
     const val EXTRA_CALL_DIRECTION   = "EXTRA_CALL_DIRECTION"
 
@@ -76,7 +73,6 @@ object Constants {
     const val BROADCAST_CALL_RECONNECTED       = "com.iocod.vonage.CALL_RECONNECTED"
     const val BROADCAST_CALL_FAILED            = "com.iocod.vonage.CALL_FAILED"
     const val BROADCAST_MUTE_STATE             = "com.iocod.vonage.MUTE_STATE"
-    const val BROADCAST_HOLD_STATE             = "com.iocod.vonage.HOLD_STATE"
     const val BROADCAST_SPEAKER_STATE          = "com.iocod.vonage.SPEAKER_STATE"
     const val BROADCAST_BLUETOOTH_STATE        = "com.iocod.vonage.BLUETOOTH_STATE"
     const val BROADCAST_SYSTEM_DISCONNECT      = "com.iocod.vonage.SYSTEM_DISCONNECT"

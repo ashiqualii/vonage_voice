@@ -115,25 +115,6 @@ class MethodChannelVonageCall extends VonageCallPlatform {
     return _channel.invokeMethod('answer', <String, dynamic>{});
   }
 
-  // ── Hold ──────────────────────────────────────────────────────────────
-
-  /// Puts the active call on hold or resumes it.
-  ///
-  /// [holdCall] — `true` to hold, `false` to resume.
-  /// On iOS, triggers `CXSetHeldCallAction` in CallKit.
-  @override
-  Future<bool?> holdCall({bool holdCall = true}) {
-    return _channel.invokeMethod('holdCall', <String, dynamic>{
-      "shouldHold": holdCall,
-    });
-  }
-
-  /// Returns `true` if the current call is on hold.
-  @override
-  Future<bool?> isHolding() {
-    return _channel.invokeMethod('isHolding', <String, dynamic>{});
-  }
-
   // ── Mute ──────────────────────────────────────────────────────────────
 
   /// Mutes or unmutes the local microphone.
@@ -211,7 +192,10 @@ class MethodChannelVonageCall extends VonageCallPlatform {
   /// **Android only** — returns `false` on iOS (not supported by Apple).
   @override
   Future<bool?> showBluetoothEnablePrompt() {
-    return _channel.invokeMethod('showBluetoothEnablePrompt', <String, dynamic>{});
+    return _channel.invokeMethod(
+      'showBluetoothEnablePrompt',
+      <String, dynamic>{},
+    );
   }
 
   /// Opens the system Bluetooth settings screen.

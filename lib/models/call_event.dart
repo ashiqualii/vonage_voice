@@ -40,12 +40,6 @@ enum CallEvent {
   /// Call ended — local hangup or remote disconnect
   callEnded,
 
-  /// Call resumed from hold
-  unhold,
-
-  /// Call placed on hold
-  hold,
-
   /// Microphone unmuted
   unmute,
 

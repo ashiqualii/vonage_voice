@@ -212,7 +212,6 @@ class TVConnectionService : ConnectionService() {
             Constants.ACTION_TOGGLE_SPEAKER -> handleToggleSpeaker(intent)
             Constants.ACTION_TOGGLE_BLUETOOTH -> handleToggleBluetooth(intent)
             Constants.ACTION_TOGGLE_MUTE -> handleToggleMute(intent)
-            Constants.ACTION_TOGGLE_HOLD -> handleToggleHold(intent)
             Constants.ACTION_CLEANUP -> handleCleanup()
         }
     }
@@ -893,20 +892,6 @@ class TVConnectionService : ConnectionService() {
                 activeConnections[callId]?.setMuted(false)
             }
         }
-    }
-
-    /**
-     * Toggle call hold on / off.
-     * Vonage SDK has no native hold API — handled via Telecom layer.
-     *
-     * Intent extras required:
-     *   EXTRA_CALL_ID   — active callId
-     *   EXTRA_HOLD_STATE — Boolean true = on hold
-     */
-    private fun handleToggleHold(intent: Intent) {
-        val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
-        val shouldHold = intent.getBooleanExtra(Constants.EXTRA_HOLD_STATE, false)
-        activeConnections[callId]?.setHold(shouldHold)
     }
 
     // ── Telecom ConnectionService overrides ───────────────────────────────

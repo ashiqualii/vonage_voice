@@ -9,7 +9,7 @@ import 'shared_platform_interface.dart';
 /// Abstract platform interface for all active call controls.
 ///
 /// Defines every method that operates on an in-progress call:
-/// answer, hangup, mute, hold, speaker, bluetooth, DTMF.
+/// answer, hangup, mute, speaker, bluetooth, DTMF.
 ///
 /// The concrete implementation is [MethodChannelVonageCall] which
 /// delegates each method to the native layer (Android & iOS) via MethodChannel.
@@ -186,34 +186,6 @@ abstract class VonageCallPlatform extends SharedPlatformInterface {
   /// await VonageVoice.instance.call.answer();
   /// ```
   Future<bool?> answer();
-
-  // ── Hold ──────────────────────────────────────────────────────────────
-
-  /// Puts the active call on hold or resumes it.
-  ///
-  /// When [holdCall] is `true`, the call audio is paused and the remote
-  /// party hears silence (or hold music if configured on your backend).
-  /// When `false`, the call resumes.
-  ///
-  /// On **Android**, this triggers `onStateChanged(STATE_HOLDING)` /
-  /// `onStateChanged(STATE_ACTIVE)` on the `Connection`. On **iOS**, this
-  /// triggers `CXSetHeldCallAction` in CallKit.
-  ///
-  /// **Platform:** Android & iOS.
-  ///
-  /// ```dart
-  /// // Put on hold
-  /// await VonageVoice.instance.call.holdCall(holdCall: true);
-  ///
-  /// // Resume
-  /// await VonageVoice.instance.call.holdCall(holdCall: false);
-  /// ```
-  Future<bool?> holdCall({bool holdCall = true});
-
-  /// Returns `true` if the current call is on hold.
-  ///
-  /// **Platform:** Android & iOS.
-  Future<bool?> isHolding();
 
   // ── Mute ──────────────────────────────────────────────────────────────
 

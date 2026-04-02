@@ -78,7 +78,6 @@ class TVBroadcastReceiver(
 
             // ── Audio state events ────────────────────────────────────────
             addAction(Constants.BROADCAST_MUTE_STATE)
-            addAction(Constants.BROADCAST_HOLD_STATE)
             addAction(Constants.BROADCAST_SPEAKER_STATE)
             addAction(Constants.BROADCAST_BLUETOOTH_STATE)
             addAction(Constants.BROADCAST_SYSTEM_DISCONNECT)

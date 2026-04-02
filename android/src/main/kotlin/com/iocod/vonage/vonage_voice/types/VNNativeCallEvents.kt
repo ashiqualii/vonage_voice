@@ -77,12 +77,6 @@ object VNNativeCallEvents {
     /** Network reconnect succeeded. */
     const val EVENT_RECONNECTED = "Reconnected"
 
-    /** Call placed on hold. */
-    const val EVENT_HOLD = "Hold"
-
-    /** Call taken off hold. */
-    const val EVENT_UNHOLD = "Unhold"
-
     /**
      * Call-level error. Build full string as:
      *   "Call Error: $message"

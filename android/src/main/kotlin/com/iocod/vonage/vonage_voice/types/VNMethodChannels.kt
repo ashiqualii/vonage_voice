@@ -79,14 +79,6 @@ enum class VNMethodChannels(val methodName: String) {
     /** Returns true if the microphone is currently muted. */
     IS_MUTED("isMuted"),
 
-    // ── Hold ─────────────────────────────────────────────────────────────
-
-    /** Place the call on hold or resume it. */
-    HOLD_CALL("holdCall"),
-
-    /** Returns true if the call is currently on hold. */
-    IS_HOLDING("isHolding"),
-
     // ── Call state queries ────────────────────────────────────────────────
 
     /** Returns true if there is an active call in progress. */

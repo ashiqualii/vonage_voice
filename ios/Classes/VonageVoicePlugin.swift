@@ -119,7 +119,6 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     // ─── Audio State ─────────────────────────────────────────────────
     private var isMuted = false
-    private var isHolding = false
     private var desiredSpeakerState = false
     private var desiredBluetoothState = false
 
@@ -331,12 +330,6 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             } else {
                 result(nil)
             }
-
-        // ── Hold ─────────────────────────────────────────────────────
-        case "holdCall":
-            handleHoldCall(arguments: arguments, result: result)
-        case "isHolding":
-            result(isHolding)
 
         // ── Mute ─────────────────────────────────────────────────────
         case "toggleMute":
@@ -778,47 +771,7 @@ extension VonageVoicePlugin {
         }
         result(true)
     }
-
-    // ─── Hold ────────────────────────────────────────────────────────
-
-    /// Handles the `holdCall` method from Flutter.
-    ///
-    /// The Vonage iOS SDK doesn't have a native hold/unhold API.
-    /// Hold is simulated by muting the microphone.
-    /// Events `"Hold"` / `"Unhold"` are sent to Flutter accordingly.
-    ///
-    /// - Parameter arguments: `["shouldHold": Bool]`
-    /// - Parameter result: Returns `true` if toggled, `false` if no active call.
-
-    private func handleHoldCall(arguments: [String: Any], result: @escaping FlutterResult) {
-        guard let shouldHold = arguments["shouldHold"] as? Bool,
-              let uuid = activeCallUUID,
-              let callId = activeCalls[uuid] else {
-            result(false)
-            return
-        }
-
-        if shouldHold && !isHolding {
-            isHolding = true
-            // Vonage SDK doesn't have a native hold — mute audio as hold behavior.
-            voiceClient.mute(callId) { [weak self] error in
-                if let error = error {
-                    self?.sendPhoneCallEvents(description: "LOG|Hold (mute) failed: \(error.localizedDescription)")
-                }
-            }
-            sendPhoneCallEvents(description: "Hold")
-        } else if !shouldHold && isHolding {
-            isHolding = false
-            voiceClient.unmute(callId) { [weak self] error in
-                if let error = error {
-                    self?.sendPhoneCallEvents(description: "LOG|Unhold (unmute) failed: \(error.localizedDescription)")
-                }
-            }
-            sendPhoneCallEvents(description: "Unhold")
-        }
-        result(true)
-    }
-
+    
     // ─── Mute ────────────────────────────────────────────────────────
 
     /// Handles the `toggleMute` method from Flutter.
@@ -1462,7 +1415,7 @@ extension VonageVoicePlugin {
             callUpdate.remoteHandle = callHandle
             callUpdate.localizedCallerName = self.outgoingCallerName.isEmpty ? handle : self.outgoingCallerName
             callUpdate.supportsDTMF = true
-            callUpdate.supportsHolding = true
+            callUpdate.supportsHolding = false
             callUpdate.supportsGrouping = false
             callUpdate.supportsUngrouping = false
             callUpdate.hasVideo = false
@@ -1479,7 +1432,7 @@ extension VonageVoicePlugin {
         callUpdate.remoteHandle = callHandle
         callUpdate.localizedCallerName = clients[from] ?? from
         callUpdate.supportsDTMF = true
-        callUpdate.supportsHolding = true
+        callUpdate.supportsHolding = false
         callUpdate.supportsGrouping = false
         callUpdate.supportsUngrouping = false
         callUpdate.hasVideo = false
@@ -1527,7 +1480,6 @@ extension VonageVoicePlugin {
             callOutgoing = false
             userInitiatedDisconnect = false
             isMuted = false
-            isHolding = false
             desiredSpeakerState = false
             desiredBluetoothState = false
             userExplicitlyChangedAudioRoute = false
@@ -1777,27 +1729,7 @@ extension VonageVoicePlugin: CXProviderDelegate {
         action.fulfill()
     }
 
-    // ─── Hold / Mute (from native CallKit UI) ───────────────────────
-
-    public func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
-        sendPhoneCallEvents(description: "LOG|provider:performSetHeldAction uuid=\(action.callUUID) isOnHold=\(action.isOnHold)")
-
-        if let callId = activeCalls[action.callUUID] {
-            if action.isOnHold {
-                isHolding = true
-                voiceClient.mute(callId) { _ in }
-                sendPhoneCallEvents(description: "Hold")
-            } else {
-                isHolding = false
-                voiceClient.unmute(callId) { _ in }
-                activeCallUUID = action.callUUID
-                sendPhoneCallEvents(description: "Unhold")
-            }
-            action.fulfill()
-        } else {
-            action.fail()
-        }
-    }
+    // ─── Mute (from native CallKit UI) ─────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performSetMutedAction uuid=\(action.callUUID) isMuted=\(action.isMuted)")
