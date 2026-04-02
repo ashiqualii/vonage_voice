@@ -229,10 +229,21 @@ class TVConnectionService : ConnectionService() {
      *   EXTRA_CALL_TO   — callee (this device's identity)
      */
     private fun handleIncomingCall(intent: Intent) {
-        val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+        val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID)
         val from = intent.getStringExtra(Constants.EXTRA_CALL_FROM)
                 ?: Constants.DEFAULT_UNKNOWN_CALLER
         val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+
+        // Placeholder intent (no callId) — FCM sends this immediately while
+        // createSession() is still running. Start ringing now so the user
+        // hears audio ~2 seconds earlier than waiting for the real intent.
+        if (callId.isNullOrEmpty()) {
+            android.util.Log.d("TVConnectionService", "[INCOMING-PLACEHOLDER] No callId yet — starting ringtone early (from=$from)")
+            startServiceRinging()
+            return
+        }
+
+        android.util.Log.d("TVConnectionService", "[INCOMING-REAL] callId=$callId, from=$from")
 
         // Skip if we already have a pending invite for this callId (duplicate FCM processing)
         if (pendingInvites.containsKey(callId)) {

@@ -164,20 +164,23 @@
         </receiver>
 
         <!-- ── BootCompletedReceiver ──────────────────────────────────────
-             Fires after device reboot to ensure the app process is alive
-             for FCM delivery. directBootAware=true ensures it fires even
-             before the user unlocks (LOCKED_BOOT_COMPLETED).
-             Also handles vendor-specific quickboot actions (Vivo, Xiaomi, HTC).
+             Initializes Firebase Messaging after device reboot so the device
+             can receive FCM push messages for incoming calls.
+             directBootAware=true ensures it also fires on LOCKED_BOOT_COMPLETED
+             (before the user unlocks). Also handles vendor-specific quickboot
+             actions (Vivo, Xiaomi, HTC).
         -->
         <receiver
             android:name="com.iocod.vonage.vonage_voice.receivers.BootCompletedReceiver"
             android:exported="true"
+            android:enabled="true"
             android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
 

@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import android.graphics.drawable.Icon
+import android.telecom.PhoneAccount
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import androidx.core.app.ActivityCompat
@@ -704,9 +706,12 @@ class VonageVoicePlugin :
             return
         }
 
-        val deviceId = call.argument<String>(Constants.PARAM_FCM_TOKEN)
-        if (!deviceId.isNullOrEmpty()) {
-            client.unregisterDevicePushToken(deviceId) { error ->
+        // Use the stored Vonage device ID (returned by registerDevicePushToken),
+        // not the Dart-side accessToken which is incorrectly passed as "deviceToken".
+        val ctx = context
+        val storedDeviceId = ctx?.let { VonageClientHolder.getStoredDeviceId(it) }
+        if (!storedDeviceId.isNullOrEmpty()) {
+            client.unregisterDevicePushToken(storedDeviceId) { error ->
                 if (error != null) logEvent("unregisterDevicePushToken failed: ${error.message}")
             }
         }
@@ -1391,15 +1396,42 @@ class VonageVoicePlugin :
             ctx, TVConnectionService::class.java
         )
         val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
-        val account = telecomManager.getPhoneAccount(handle)
-        result.success(account != null)
+        try {
+            val account = telecomManager.getPhoneAccount(handle)
+            result.success(account != null)
+        } catch (e: SecurityException) {
+            android.util.Log.w("VonageVoice", "hasRegisteredPhoneAccount: ${e.message}")
+            result.success(false)
+        }
     }
 
     private fun handleRegisterPhoneAccount(result: Result) {
-        // PhoneAccount registration is handled automatically by the
-        // ConnectionService declaration in AndroidManifest.xml.
-        // This method exists for API compatibility with the Twilio plugin.
-        result.success(true)
+        val ctx = context ?: run {
+            result.success(false)
+            return
+        }
+        val telecomManager = ctx.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        if (telecomManager == null) {
+            result.success(false)
+            return
+        }
+        try {
+            val componentName = android.content.ComponentName(ctx, TVConnectionService::class.java)
+            val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
+            val label = ctx.applicationInfo.loadLabel(ctx.packageManager).toString()
+            val phoneAccount = PhoneAccount.builder(handle, label)
+                .setCapabilities(PhoneAccount.CAPABILITY_SELF_MANAGED)
+                .setShortDescription("Provides calling services for $label")
+                .setIcon(Icon.createWithResource(ctx, ctx.applicationInfo.icon))
+                .addSupportedUriScheme(PhoneAccount.SCHEME_TEL)
+                .build()
+            telecomManager.registerPhoneAccount(phoneAccount)
+            android.util.Log.d("VonageVoice", "registerPhoneAccount: registered successfully")
+            result.success(true)
+        } catch (e: Exception) {
+            android.util.Log.e("VonageVoice", "registerPhoneAccount: failed — ${e.message}", e)
+            result.error("PHONE_ACCOUNT_ERROR", e.message, null)
+        }
     }
 
     private fun handleIsPhoneAccountEnabled(result: Result) {
@@ -1416,8 +1448,14 @@ class VonageVoicePlugin :
             ctx, TVConnectionService::class.java
         )
         val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
-        val account = telecomManager.getPhoneAccount(handle)
-        result.success(account?.isEnabled == true)
+        try {
+            val account = telecomManager.getPhoneAccount(handle)
+            // SELF_MANAGED accounts are always considered enabled once registered.
+            result.success(account != null)
+        } catch (e: SecurityException) {
+            android.util.Log.w("VonageVoice", "isPhoneAccountEnabled: ${e.message}")
+            result.success(false)
+        }
     }
 
     private fun handleOpenPhoneAccountSettings(result: Result) {

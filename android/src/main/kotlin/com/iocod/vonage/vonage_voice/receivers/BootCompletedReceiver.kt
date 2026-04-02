@@ -3,142 +3,80 @@ package com.iocod.vonage.vonage_voice.receivers
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessaging
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
-import com.vonage.voice.api.VoiceClient
 
 /**
- * BootCompletedReceiver — re-registers Vonage push token after device reboot.
+ * BootCompletedReceiver — ensures Firebase Messaging is initialized after device reboot.
  *
- * After a reboot, the app process is killed and the Vonage backend no longer
- * knows where to send incoming call push notifications. This receiver:
+ * After a reboot the Firebase service needs to be woken so the device can
+ * receive FCM push messages for incoming calls. This is the ONLY job of this
+ * receiver — getting the FCM token re-initializes the Firebase subsystem.
  *
- *   1. Reads the stored JWT from SharedPreferences
- *   2. Creates a VoiceClient and restores the session
- *   3. Gets the current FCM token
- *   4. Re-registers it with Vonage via registerDevicePushToken()
+ * The FCM token itself does NOT change on reboot, so no re-registration with
+ * Vonage is needed here. When an actual call push arrives, VonageFirebaseMessagingService
+ * handles session restore and call processing from scratch.
  *
- * This ensures incoming calls work immediately after reboot, without the
- * user needing to manually open the app.
- *
- * directBootAware=true ensures it also receives LOCKED_BOOT_COMPLETED.
- * However, SharedPreferences (credential-encrypted storage) is only
- * available after the user unlocks the device. For LOCKED_BOOT_COMPLETED,
- * we skip re-registration and rely on BOOT_COMPLETED firing later.
+ * ── DEBUGGING ────────────────────────────────────────────────────────────
+ * Filter logcat:   adb logcat -s VonageBoot:V VonageFCM:V TVConnectionService:V
+ * Checkpoint tags: [BOOT-1] receiver fired → [BOOT-2] FCM token retrieved
+ *                  then on incoming call: [FCM-1]→[FCM-2]→[FCM-3]→[FCM-4]→[FCM-5]
  */
 class BootCompletedReceiver : BroadcastReceiver() {
 
     companion object {
-        private const val TAG = "BootCompletedReceiver"
+        private const val TAG = "VonageBoot"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action ?: return
-        Log.d(TAG, "onReceive: action=$action")
+        // Log every intent received so we can confirm the receiver is firing at all
+        Log.i(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        Log.i(TAG, "[BOOT-0] onReceive called, action=${intent.action}")
+        Log.i(TAG, "[BOOT-0] Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT})")
 
-        when (action) {
-            Intent.ACTION_LOCKED_BOOT_COMPLETED -> {
-                // Device is still locked — credential-encrypted storage (SharedPreferences)
-                // is not yet available. We can't read the JWT or re-register.
-                // BOOT_COMPLETED will fire after unlock and handle re-registration.
-                Log.d(TAG, "LOCKED_BOOT_COMPLETED — skipping (storage not available yet)")
-            }
+        val recognized = intent.action == Intent.ACTION_BOOT_COMPLETED ||
+            intent.action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
+            intent.action == "android.intent.action.QUICKBOOT_POWERON" ||
+            intent.action == "com.htc.intent.action.QUICKBOOT_POWERON"
 
-            Intent.ACTION_BOOT_COMPLETED,
-            "android.intent.action.QUICKBOOT_POWERON",
-            "com.htc.intent.action.QUICKBOOT_POWERON" -> {
-                Log.d(TAG, "Device booted — restoring Vonage session and FCM registration")
-                restoreSessionAndRegisterPush(context.applicationContext)
-            }
-        }
-    }
-
-    /**
-     * Restore the Vonage VoiceClient session from the stored JWT, then
-     * re-register the FCM push token so incoming call pushes are delivered.
-     */
-    private fun restoreSessionAndRegisterPush(context: Context) {
-        val storedJwt = VonageClientHolder.getStoredJwt(context)
-        if (storedJwt.isNullOrEmpty()) {
-            Log.d(TAG, "No stored JWT — user never logged in or logged out. Skipping.")
+        if (!recognized) {
+            Log.w(TAG, "[BOOT-0] Action not recognized — ignoring")
             return
         }
 
-        // Use goAsync() to extend the BroadcastReceiver's lifecycle beyond
-        // the default 10-second ANR timeout while we do async network calls.
-        val pendingResult = goAsync()
+        Log.i(TAG, "[BOOT-1] ✓ Boot action recognized: ${intent.action}")
+
+        // Check if a JWT is stored — if not, answering an incoming call after
+        // reboot will fail even if the notification appears.
+        val storedJwt = VonageClientHolder.getStoredJwt(context)
+        if (storedJwt.isNullOrEmpty()) {
+            Log.w(TAG, "[BOOT-1] ⚠ No stored JWT found — user must login before calls will work after reboot")
+        } else {
+            Log.i(TAG, "[BOOT-1] ✓ Stored JWT present (${storedJwt.length} chars) — session can be restored on incoming call")
+        }
+
+        Log.i(TAG, "[BOOT-1] isSessionReady=${VonageClientHolder.isSessionReady}, voiceClient=${if (VonageClientHolder.voiceClient != null) "set" else "null"}")
 
         try {
-            // Create a VoiceClient if one doesn't exist (app was killed)
-            var client = VonageClientHolder.voiceClient
-            if (client == null) {
-                Log.d(TAG, "Creating VoiceClient for boot re-registration")
-                client = VoiceClient(context)
-                VonageClientHolder.voiceClient = client
-            }
+            Log.i(TAG, "[BOOT-2] Triggering FCM token fetch to wake Firebase Messaging...")
 
-            // Restore the session
-            Log.d(TAG, "Restoring Vonage session...")
-            client.createSession(storedJwt) { error, sessionId ->
-                if (error != null) {
-                    Log.e(TAG, "Session restore failed: ${error.message}")
-                    pendingResult.finish()
-                    return@createSession
+            FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+                if (task.isSuccessful) {
+                    val token = task.result
+                    Log.i(TAG, "[BOOT-2] ✓ FCM token retrieved: ${token?.take(20)}... (Firebase Messaging is active)")
+                } else {
+                    Log.e(TAG, "[BOOT-2] ✗ FCM token fetch failed — incoming calls may not deliver after reboot", task.exception)
                 }
-
-                Log.d(TAG, "Session restored: $sessionId")
-                VonageClientHolder.isSessionReady = true
-
-                // Get the current FCM token and re-register with Vonage
-                FirebaseMessaging.getInstance().token
-                    .addOnSuccessListener { fcmToken ->
-                        if (fcmToken.isNullOrEmpty()) {
-                            Log.w(TAG, "FCM token is null/empty — cannot register push")
-                            pendingResult.finish()
-                            return@addOnSuccessListener
-                        }
-
-                        Log.d(TAG, "FCM token obtained — registering with Vonage...")
-
-                        // Unregister old device first to avoid max-device-limit
-                        val oldDeviceId = VonageClientHolder.getStoredDeviceId(context)
-                        if (!oldDeviceId.isNullOrEmpty()) {
-                            client.unregisterDevicePushToken(oldDeviceId) { unregError ->
-                                if (unregError != null) {
-                                    Log.w(TAG, "Old device unregister failed (non-fatal): ${unregError.message}")
-                                }
-                                registerToken(client, context, fcmToken, pendingResult)
-                            }
-                        } else {
-                            registerToken(client, context, fcmToken, pendingResult)
-                        }
-                    }
-                    .addOnFailureListener { e ->
-                        Log.e(TAG, "Failed to get FCM token: ${e.message}")
-                        pendingResult.finish()
-                    }
             }
+
+            FirebaseMessaging.getInstance().isAutoInitEnabled = true
+            Log.i(TAG, "[BOOT-2] FCM autoInit=true — token rotation will be delivered to VonageFirebaseMessagingService")
+            Log.i(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         } catch (e: Exception) {
-            Log.e(TAG, "Boot re-registration failed: ${e.message}", e)
-            pendingResult.finish()
-        }
-    }
-
-    private fun registerToken(
-        client: VoiceClient,
-        context: Context,
-        fcmToken: String,
-        pendingResult: PendingResult
-    ) {
-        client.registerDevicePushToken(fcmToken) { tokenError, deviceId ->
-            if (tokenError != null) {
-                Log.e(TAG, "Push token registration failed: ${tokenError.message}")
-            } else if (deviceId != null) {
-                VonageClientHolder.storeDeviceId(context, deviceId)
-                Log.d(TAG, "Push token registered successfully. deviceId=$deviceId")
-            }
-            pendingResult.finish()
+            Log.e(TAG, "[BOOT-2] ✗ Exception initializing Firebase after boot", e)
         }
     }
 }
+
