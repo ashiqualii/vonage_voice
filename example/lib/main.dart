@@ -117,7 +117,7 @@ class _LoginScreenState extends State<LoginScreen> {
       final result = await VonageVoice.instance.setTokens(
         accessToken: kTestJwt,
         deviceToken: fcmToken,
-        isSandbox: false,
+        isSandbox: true,
       );
 
       if (result == true) {
@@ -192,7 +192,9 @@ class DialerScreen extends StatefulWidget {
 }
 
 class _DialerScreenState extends State<DialerScreen> {
-  final TextEditingController _numberController = TextEditingController();
+  final TextEditingController _numberController = TextEditingController(
+    text: '13156057951',
+  );
   StreamSubscription<CallEvent>? _eventSub;
   StreamSubscription<RemoteMessage>? _fcmForegroundSub;
   Timer? _incomingTimer;
@@ -704,7 +706,6 @@ class ActiveCallScreen extends StatefulWidget {
 class _ActiveCallScreenState extends State<ActiveCallScreen> {
   bool _muted = false;
   bool _onSpeaker = false;
-  bool _onHold = false;
   bool _bluetoothOn = false;
   bool btAvailable = false;
   bool _showDialpad = false;
@@ -796,12 +797,6 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
         case CallEvent.speakerOff:
           setState(() => _onSpeaker = false);
           break;
-        case CallEvent.hold:
-          setState(() => _onHold = true);
-          break;
-        case CallEvent.unhold:
-          setState(() => _onHold = false);
-          break;
         case CallEvent.bluetoothOn:
           setState(() {
             _bluetoothOn = true;
@@ -835,13 +830,6 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
     if (!_callReady) return;
     try {
       await VonageVoice.instance.call.toggleSpeaker(!_onSpeaker);
-    } catch (_) {}
-  }
-
-  Future<void> _toggleHold() async {
-    if (!_callReady) return;
-    try {
-      await VonageVoice.instance.call.holdCall(holdCall: !_onHold);
     } catch (_) {}
   }
 
@@ -1064,14 +1052,6 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                     _callStatus,
                     style: const TextStyle(color: Colors.white54, fontSize: 14),
                   ),
-                  if (_onHold)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 6),
-                      child: Text(
-                        'On Hold',
-                        style: TextStyle(color: Colors.orange, fontSize: 14),
-                      ),
-                    ),
                   if (_callReady)
                     Padding(
                       padding: const EdgeInsets.only(top: 6),
@@ -1156,12 +1136,6 @@ class _ActiveCallScreenState extends State<ActiveCallScreen> {
                         label: 'Bluetooth',
                         active: _bluetoothOn,
                         onTap: _callReady ? _toggleBluetooth : null,
-                      ),
-                      _CallControlButton(
-                        icon: _onHold ? Icons.play_arrow : Icons.pause,
-                        label: _onHold ? 'Resume' : 'Hold',
-                        active: _onHold,
-                        onTap: _callReady ? _toggleHold : null,
                       ),
                     ],
                   ),
