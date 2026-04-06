@@ -60,6 +60,14 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// ```
   VonageCallPlatform get call;
 
+  // ── Call session manager ──────────────────────────────────────────────
+
+  /// Manages call session state across events.
+  ///
+  /// Tracks [CallSession] objects for each concurrent call,
+  /// updating status as events flow in from the native layer.
+  CallSessionManager get callSessionManager;
+
   // ── Event stream ──────────────────────────────────────────────────────
 
   /// Stream of typed [CallEvent] values from the native layer.

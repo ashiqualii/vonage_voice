@@ -1,5 +1,6 @@
 package com.iocod.vonage.vonage_voice
 
+import android.app.KeyguardManager
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
@@ -63,25 +64,39 @@ class AnswerCallTrampolineActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to send ACTION_ANSWER: ${e.message}")
         }
 
-        // Step 2: Launch MainActivity from this Activity context
-        // This works on Android 12+ because we're launching from a foreground Activity.
-        try {
-            val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-            launchIntent?.let { launch ->
-                launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                launch.putExtra("fromIncomingCall", true)
-                launch.putExtra("callHandle", callId)
-                launch.putExtra("callAnswered", true)
-                launch.putExtra(Constants.EXTRA_CALL_ID, callId)
-                launch.putExtra(Constants.EXTRA_CALL_FROM, callerName)
-                launch.putExtra(Constants.EXTRA_CALL_DIRECTION, "incoming")
-                startActivity(launch)
-                Log.d(TAG, "Launched MainActivity")
+        // Step 2: Check lock state — if locked, store pending data instead of launching
+        val keyguardManager = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
+        val isLocked = keyguardManager?.isKeyguardLocked == true
+
+        if (isLocked) {
+            Log.d(TAG, "Device is locked — storing pendingAnsweredCallData")
+            IncomingCallActivity.pendingAnsweredCallData = mapOf(
+                "callId" to callId,
+                "callerName" to callerName,
+                "callerNumber" to callerNumber,
+                "callDirection" to "incoming",
+                "isCallAnswered" to true
+            )
+        } else {
+            // Unlocked: Launch MainActivity from this Activity context
+            try {
+                val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+                launchIntent?.let { launch ->
+                    launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                    launch.putExtra("fromIncomingCall", true)
+                    launch.putExtra("callHandle", callId)
+                    launch.putExtra("callAnswered", true)
+                    launch.putExtra(Constants.EXTRA_CALL_ID, callId)
+                    launch.putExtra(Constants.EXTRA_CALL_FROM, callerName)
+                    launch.putExtra(Constants.EXTRA_CALL_DIRECTION, "incoming")
+                    startActivity(launch)
+                    Log.d(TAG, "Launched MainActivity")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to launch MainActivity: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch MainActivity: ${e.message}")
         }
 
         // Step 3: Finish immediately (invisible)

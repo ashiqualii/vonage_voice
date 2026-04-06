@@ -10,12 +10,16 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.util.Log
 import android.view.WindowManager
-import android.widget.ImageButton
+import android.view.MotionEvent
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
+import com.iocod.vonage.vonage_voice.ui.AnimatedCallAvatarView
 
 /**
  * IncomingCallActivity — native full-screen incoming call UI.
@@ -125,14 +129,39 @@ class IncomingCallActivity : AppCompatActivity() {
 
         val callerNameText = findViewById<TextView>(R.id.caller_name)
         val callerNumberText = findViewById<TextView>(R.id.caller_number)
-        val answerButton = findViewById<ImageButton>(R.id.btn_answer)
-        val declineButton = findViewById<ImageButton>(R.id.btn_decline)
+        val acceptButtonContainer = findViewById<FrameLayout>(R.id.acceptButton)
+        val acceptButtonIcon = findViewById<ImageView>(R.id.acceptButtonCircle)
+        val declineButtonContainer = findViewById<FrameLayout>(R.id.declineButton)
+        val declineButtonIcon = findViewById<ImageView>(R.id.declineButtonCircle)
+
+        // Bottom sheet views
+        val bottomSheetOverlay = findViewById<View>(R.id.callWaitingBottomSheetOverlay)
+        val bottomSheet = findViewById<View>(R.id.callWaitingBottomSheet)
+        val optionHoldAndAnswer = findViewById<View>(R.id.optionHoldAndAnswer)
+        val optionEndAndAnswer = findViewById<View>(R.id.optionEndAndAnswer)
+        val optionDecline = findViewById<View>(R.id.optionDecline)
 
         callerNameText.text = callerName
         callerNumberText.text = if (callerNumber != callerName) callerNumber else ""
 
-        answerButton.setOnClickListener { handleAnswer() }
-        declineButton.setOnClickListener { handleDecline() }
+        // Add elevation for depth
+        acceptButtonContainer.elevation = 12f
+        declineButtonContainer.elevation = 12f
+        acceptButtonIcon.elevation = 14f
+        declineButtonIcon.elevation = 14f
+
+        // Setup swipe/tap animations on both buttons
+        setupButtonSwipeAnimation(acceptButtonContainer, acceptButtonIcon) { handleAnswer() }
+        setupButtonSwipeAnimation(declineButtonContainer, declineButtonIcon) { handleDecline() }
+
+        // Bottom sheet dismiss on overlay tap
+        bottomSheetOverlay.setOnClickListener {
+            bottomSheetOverlay.visibility = View.GONE
+            bottomSheet.visibility = View.GONE
+        }
+        optionHoldAndAnswer.setOnClickListener { handleAnswer() }
+        optionEndAndAnswer.setOnClickListener { handleAnswer() }
+        optionDecline.setOnClickListener { handleDecline() }
 
         // Ringing is managed by TVConnectionService — no startRinging() here
 
@@ -220,37 +249,48 @@ class IncomingCallActivity : AppCompatActivity() {
             startService(answerIntent)
         }
 
-        // Dismiss keyguard if locked, then launch MainActivity.
-        // MainActivity has setShowWhenLocked(true) and requestDismissKeyguard()
-        // so it will appear even over the lock screen.
-        if (wasDeviceLockedOnCreate) {
-            val keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                keyguardManager.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                    override fun onDismissSucceeded() {
-                        Log.d(TAG, "handleAnswer: Keyguard dismissed — launching MainActivity")
-                        launchMainActivity()
-                        finish()
-                    }
-                    override fun onDismissError() {
-                        Log.e(TAG, "handleAnswer: Keyguard dismiss error — launching anyway")
-                        launchMainActivity()
-                        finish()
-                    }
-                    override fun onDismissCancelled() {
-                        Log.w(TAG, "handleAnswer: Keyguard dismiss cancelled — launching anyway")
-                        launchMainActivity()
-                        finish()
-                    }
-                })
+        // Handle lock screen: if device is locked, store pending data and let the
+        // user unlock naturally. MainActivity.onResume() picks up pendingAnsweredCallData.
+        // If unlocked, dismiss any lingering keyguard then launch MainActivity directly.
+        val keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
+        val isCurrentlyLocked = keyguardManager.isKeyguardLocked
+
+        if (isCurrentlyLocked) {
+            Log.d(TAG, "handleAnswer: Device is locked — storing pendingAnsweredCallData")
+            pendingAnsweredCallData = mapOf(
+                "callId" to callId,
+                "callerName" to callerName,
+                "callerNumber" to callerNumber,
+                "callDirection" to "incoming",
+                "isCallAnswered" to true
+            )
+            finish()
+        } else {
+            Log.d(TAG, "handleAnswer: Device is unlocked — launching MainActivity")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                if (keyguardManager.isKeyguardLocked) {
+                    keyguardManager.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                        override fun onDismissSucceeded() {
+                            launchMainActivity()
+                            finish()
+                        }
+                        override fun onDismissCancelled() {
+                            launchMainActivity()
+                            finish()
+                        }
+                        override fun onDismissError() {
+                            launchMainActivity()
+                            finish()
+                        }
+                    })
+                } else {
+                    launchMainActivity()
+                    finish()
+                }
             } else {
                 launchMainActivity()
                 finish()
             }
-        } else {
-            Log.d(TAG, "handleAnswer: Device was unlocked — launching MainActivity")
-            launchMainActivity()
-            finish()
         }
     }
 
@@ -296,5 +336,109 @@ class IncomingCallActivity : AppCompatActivity() {
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         // Do nothing — user must answer or decline
+    }
+
+    /**
+     * Setup swipe/drag animation on a button.
+     * - Tap: immediate bounce + haptic → triggers action
+     * - Drag 120dp+: progressive scale up + haptic → triggers action
+     */
+    @Suppress("ClickableViewAccessibility")
+    private fun setupButtonSwipeAnimation(
+        container: FrameLayout,
+        icon: ImageView,
+        onAction: () -> Unit
+    ) {
+        var startX = 0f
+        var startY = 0f
+        var isDragging = false
+        var hasCompleted = false
+
+        container.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = event.x
+                    startY = event.y
+                    isDragging = false
+                    hasCompleted = false
+
+                    // Press scale-up
+                    container.animate().scaleX(1.15f).scaleY(1.15f).setDuration(120).start()
+                    icon.animate().scaleX(1.2f).scaleY(1.2f).setDuration(120).start()
+                    container.animate().alpha(0.9f).setDuration(120).start()
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = kotlin.math.abs(event.x - startX)
+                    val dy = kotlin.math.abs(event.y - startY)
+                    val total = kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+
+                    if (dx > 40 || dy > 40) {
+                        isDragging = true
+                        val scale = 1.15f + (total / 300f).coerceAtMost(0.15f)
+                        container.scaleX = scale
+                        container.scaleY = scale
+                        val iconScale = 1.2f + (total / 300f).coerceAtMost(0.3f)
+                        icon.scaleX = iconScale
+                        icon.scaleY = iconScale
+                        container.alpha = 0.9f + (total / 500f).coerceAtMost(0.1f)
+
+                        if (total > 120 && !hasCompleted) {
+                            hasCompleted = true
+                            container.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                            // Bounce back animation
+                            container.animate().scaleX(0.9f).scaleY(0.9f).setDuration(80)
+                                .withEndAction {
+                                    container.animate().scaleX(1f).scaleY(1f).setDuration(100).start()
+                                }.start()
+                            icon.animate().scaleX(0.95f).scaleY(0.95f).setDuration(80)
+                                .withEndAction {
+                                    icon.animate().scaleX(1f).scaleY(1f).setDuration(100).start()
+                                }.start()
+                            container.animate().alpha(1f).setDuration(200).start()
+                            onAction()
+                            isDragging = false
+                            return@setOnTouchListener true
+                        }
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (!isDragging && !hasCompleted) {
+                        hasCompleted = true
+                        container.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+                        // Tap bounce
+                        container.animate().scaleX(0.95f).scaleY(0.95f).setDuration(100)
+                            .withEndAction {
+                                container.animate().scaleX(1f).scaleY(1f).setDuration(100).start()
+                            }.start()
+                        onAction()
+                    }
+                    // Reset
+                    container.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
+                    icon.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
+                    container.animate().alpha(1f).setDuration(200).start()
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun getInitials(name: String): String {
+        if (name.isEmpty()) return "?"
+        // If it looks like a phone number, return #
+        if (name.startsWith("+") || name.all { it.isDigit() || it == ' ' || it == '-' || it == '(' || it == ')' }) {
+            return "#"
+        }
+        val parts = name.trim().split("\\s+".toRegex())
+        return when {
+            parts.size >= 2 -> "${parts[0].first().uppercaseChar()}${parts[1].first().uppercaseChar()}"
+            parts.isNotEmpty() -> parts[0].first().uppercaseChar().toString()
+            else -> "?"
+        }
     }
 }

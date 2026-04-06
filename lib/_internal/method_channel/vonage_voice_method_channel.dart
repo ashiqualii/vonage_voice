@@ -26,6 +26,12 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
   @override
   VonageCallPlatform get call => _call;
 
+  /// Manages call session state across events.
+  final CallSessionManager _callSessionManager = CallSessionManager();
+
+  @override
+  CallSessionManager get callSessionManager => _callSessionManager;
+
   /// Cached event stream — created once and reused
   Stream<CallEvent>? _callEventsListener;
 
@@ -498,6 +504,7 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
           tokens[1].contains("31486") ||
           tokens[1].toLowerCase().contains("call rejected")) {
         call.activeCall = null;
+        _callSessionManager.clear();
         return CallEvent.declined;
       }
       return CallEvent.log;
@@ -514,6 +521,30 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       final parsed = _createCallFromState(state, initiated: true);
       if (parsed != null) {
         call.activeCall = parsed;
+        // Update session: promote ringing → active, or create new
+        final sid = parsed.from + parsed.to;
+        final existing = _callSessionManager.ringingSession;
+        if (existing != null) {
+          _callSessionManager.updateSession(
+            existing.callSid,
+            (s) => s.copyWith(
+              status: CallStatus.active,
+              connectionStatus: 'Connected',
+              activeCall: parsed,
+            ),
+          );
+        } else {
+          _callSessionManager.addSession(CallSession(
+            callSid: sid,
+            activeCall: parsed,
+            status: CallStatus.active,
+            connectionStatus: 'Connected',
+            callerName: parsed.fromFormatted,
+            callerNumber: parsed.from,
+            startedAt: DateTime.now(),
+            direction: parsed.callDirection,
+          ));
+        }
         printDebug(
           'Connected — From: ${parsed.from}, '
           'To: ${parsed.to}, '
@@ -531,6 +562,17 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       );
       if (parsed != null) {
         call.activeCall = parsed;
+        final sid = parsed.from + parsed.to;
+        _callSessionManager.addSession(CallSession(
+          callSid: sid,
+          activeCall: parsed,
+          status: CallStatus.ringing,
+          connectionStatus: 'Ringing',
+          callerName: parsed.fromFormatted,
+          callerNumber: parsed.from,
+          startedAt: DateTime.now(),
+          direction: CallDirection.incoming,
+        ));
         printDebug(
           'Incoming — From: ${parsed.from}, '
           'To: ${parsed.to}',
@@ -544,6 +586,17 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
       final parsed = _createCallFromState(state);
       if (parsed != null) {
         call.activeCall = parsed;
+        final sid = parsed.from + parsed.to;
+        _callSessionManager.addSession(CallSession(
+          callSid: sid,
+          activeCall: parsed,
+          status: CallStatus.ringing,
+          connectionStatus: 'Ringing',
+          callerName: parsed.toFormatted,
+          callerNumber: parsed.to,
+          startedAt: DateTime.now(),
+          direction: parsed.callDirection,
+        ));
         printDebug(
           'Ringing — From: ${parsed.from}, '
           'To: ${parsed.to}, '
@@ -604,13 +657,16 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
         return CallEvent.connected;
       case 'Call Ended':
         call.activeCall = null;
+        _callSessionManager.clear();
         return CallEvent.callEnded;
       case 'Missed Call':
         call.activeCall = null;
+        _callSessionManager.clear();
         return CallEvent.missedCall;
       case 'Call Rejected':
       case 'Declined':
         call.activeCall = null;
+        _callSessionManager.clear();
         return CallEvent.declined;
       case 'Unmute':
         return CallEvent.unmute;

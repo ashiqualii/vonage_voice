@@ -34,7 +34,19 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.RadialGradient
+import android.graphics.drawable.Icon
+import android.os.SystemClock
+import android.widget.RemoteViews
 import androidx.core.app.Person
+import com.iocod.vonage.vonage_voice.R
 
 /**
  * TVConnectionService — TelecomVoice ConnectionService.
@@ -1075,13 +1087,53 @@ class TVConnectionService : ConnectionService() {
             )
         }
 
-        // Build a Person for the caller — Samsung One UI and stock Android
-        // use this to identify the notification as a real phone call and
-        // prioritize it for full-screen display on the lock screen.
+        // Build avatar bitmap for notification
+        val avatarBitmap = createCallerAvatarBitmap(from, 64)
+
+        // Android 12+: Use native CallStyle for system-managed UI
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val callerPerson = android.app.Person.Builder()
+                .setName(from)
+                .setIcon(Icon.createWithBitmap(avatarBitmap))
+                .setImportant(true)
+                .build()
+
+            val callStyle = Notification.CallStyle.forIncomingCall(
+                callerPerson,
+                declinePendingIntent,
+                answerPendingIntent
+            )
+
+            return Notification.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID).apply {
+                setSmallIcon(android.R.drawable.ic_menu_call)
+                setVisibility(Notification.VISIBILITY_PUBLIC)
+                setOngoing(true)
+                setAutoCancel(false)
+                setShowWhen(false)
+                setFullScreenIntent(fullScreenPendingIntent, true)
+                setContentIntent(fullScreenPendingIntent)
+                setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                setCategory(Notification.CATEGORY_CALL)
+                setContentTitle(from)
+                setContentText("Incoming Call")
+                setColorized(true)
+                setColor(Color.parseColor("#1C1C1E"))
+                style = callStyle
+            }.build()
+        }
+
+        // Pre-Android 12: Custom RemoteViews
         val callerPerson = Person.Builder()
             .setName(from)
             .setImportant(true)
             .build()
+
+        val customView = RemoteViews(packageName, R.layout.notification_incoming_call)
+        customView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
+        customView.setTextViewText(R.id.notification_caller_name, from)
+        customView.setTextViewText(R.id.notification_caller_number, "Incoming Call")
+        customView.setOnClickPendingIntent(R.id.notification_answer_button, answerPendingIntent)
+        customView.setOnClickPendingIntent(R.id.notification_decline_button, declinePendingIntent)
 
         return NotificationCompat.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID)
             .setContentTitle("Incoming Call")
@@ -1089,7 +1141,13 @@ class TVConnectionService : ConnectionService() {
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setContentIntent(fullScreenPendingIntent)
             .setFullScreenIntent(fullScreenPendingIntent, true)
+            .setCustomContentView(customView)
+            .setCustomBigContentView(customView)
+            .setCustomHeadsUpContentView(customView)
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
             .setOngoing(true)
+            .setColorized(true)
+            .setColor(Color.parseColor("#1C1C1E"))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -1141,13 +1199,66 @@ class TVConnectionService : ConnectionService() {
             )
         }
 
+        // Get caller name from active connection
+        val activeCallId = getActiveCallId() ?: ""
+        val callerName = activeConnections[activeCallId]?.from ?: "Unknown"
+        val avatarBitmap = createCallerAvatarBitmap(callerName, 64)
+        val callStartTime = System.currentTimeMillis() // TODO: track actual call start time
+
+        // Android 12+: Use native CallStyle for system-managed UI with Chronometer
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val caller = android.app.Person.Builder()
+                .setName(callerName)
+                .setIcon(Icon.createWithBitmap(avatarBitmap))
+                .setImportant(true)
+                .build()
+
+            return Notification.Builder(this, Constants.NOTIFICATION_CHANNEL_ID).apply {
+                setOngoing(true)
+                setSmallIcon(android.R.drawable.ic_menu_call)
+                setContentIntent(contentIntent)
+                setCategory(Notification.CATEGORY_CALL)
+                setVisibility(Notification.VISIBILITY_PUBLIC)
+                setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                setColorized(true)
+                setColor(Color.parseColor("#1C1C1E"))
+                style = Notification.CallStyle.forOngoingCall(caller, hangupIntent)
+                setUsesChronometer(true)
+                setWhen(callStartTime)
+            }.build()
+        }
+
+        // Pre-Android 12: Custom RemoteViews with Chronometer
+        val elapsedBase = SystemClock.elapsedRealtime()
+
+        // Collapsed view
+        val collapsedView = RemoteViews(packageName, R.layout.notification_ongoing_call)
+        collapsedView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
+        collapsedView.setTextViewText(R.id.notification_caller_name, callerName)
+        collapsedView.setChronometer(R.id.notification_chronometer, elapsedBase, null, true)
+        collapsedView.setOnClickPendingIntent(R.id.notification_btn_hangup, hangupIntent)
+
+        // Expanded view
+        val expandedView = RemoteViews(packageName, R.layout.notification_ongoing_call_expanded)
+        expandedView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
+        expandedView.setTextViewText(R.id.notification_caller_name, callerName)
+        expandedView.setChronometer(R.id.notification_chronometer, elapsedBase, null, true)
+        expandedView.setOnClickPendingIntent(R.id.notification_btn_hangup, hangupIntent)
+
         return NotificationCompat.Builder(this, Constants.NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("Vonage Voice Call")
-            .setContentText("Call in progress")
+            .setContentTitle(callerName)
+            .setContentText("Ongoing call")
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setContentIntent(contentIntent)
+            .setCustomContentView(collapsedView)
+            .setCustomBigContentView(expandedView)
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
             .setOngoing(true)
             .setSilent(true)
+            .setColorized(true)
+            .setColor(Color.parseColor("#1C1C1E"))
+            .setUsesChronometer(true)
+            .setWhen(callStartTime)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .addAction(
@@ -1158,6 +1269,69 @@ class TVConnectionService : ConnectionService() {
                 ).build()
             )
             .build()
+    }
+
+    /**
+     * Creates a circular avatar bitmap with gradient background and caller initials.
+     * Matches the Twilio Easify metallic 3D look for notifications and CallStyle.
+     */
+    private fun createCallerAvatarBitmap(callerName: String, sizeDp: Int): Bitmap {
+        val density = resources.displayMetrics.density
+        val sizePx = (sizeDp * density).toInt()
+        val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val cx = sizePx / 2f
+        val cy = sizePx / 2f
+        val radius = sizePx / 2f
+
+        // Outer ring: subtle gray gradient border
+        val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                0f, 0f, sizePx.toFloat(), sizePx.toFloat(),
+                Color.parseColor("#5A5A5A"),
+                Color.parseColor("#3A3A3A"),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(cx, cy, radius, ringPaint)
+
+        // Inner fill: dark radial gradient for metallic/3D look
+        val innerRadius = radius - (2 * density)
+        val innerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = RadialGradient(
+                cx * 0.8f, cy * 0.7f, innerRadius * 1.2f,
+                Color.parseColor("#4A4A4A"),
+                Color.parseColor("#1A1A1A"),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(cx, cy, innerRadius, innerPaint)
+
+        // Initials text
+        val initials = getAvatarInitials(callerName)
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = sizePx * 0.35f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+        }
+        val textY = cy - (textPaint.descent() + textPaint.ascent()) / 2
+        canvas.drawText(initials, cx, textY, textPaint)
+
+        return bitmap
+    }
+
+    private fun getAvatarInitials(name: String): String {
+        if (name.isEmpty()) return "?"
+        if (name.startsWith("+") || name.all { it.isDigit() || it == ' ' || it == '-' || it == '(' || it == ')' }) {
+            return "#"
+        }
+        val parts = name.trim().split("\\s+".toRegex())
+        return when {
+            parts.size >= 2 -> "${parts[0].first().uppercaseChar()}${parts[1].first().uppercaseChar()}"
+            parts.isNotEmpty() -> parts[0].first().uppercaseChar().toString()
+            else -> "?"
+        }
     }
 
     // ── Incoming call wake lock ──────────────────────────────────────────
