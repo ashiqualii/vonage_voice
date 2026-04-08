@@ -89,12 +89,38 @@ class IncomingCallActivity : AppCompatActivity() {
                 putExtra(EXTRA_CALLER_NUMBER, callerName)
             }
         }
+
+        /**
+         * Creates an intent for the placeholder state (no callId yet).
+         * Used by buildPlaceholderIncomingNotification() so the incoming
+         * call screen appears immediately on lock screen while the Vonage
+         * SDK processes the push asynchronously.
+         *
+         * The activity shows the caller name and a "Connecting..." state.
+         * Answer button is disabled until a real callId arrives via onNewIntent().
+         */
+        fun createPlaceholderIntent(context: Context, callerName: String): Intent {
+            return Intent(context, IncomingCallActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        Intent.FLAG_ACTIVITY_NO_USER_ACTION
+                action = "com.iocod.vonage.vonage_voice.INCOMING_CALL"
+                // Empty callId signals placeholder state
+                putExtra(EXTRA_CALL_ID, "")
+                putExtra(EXTRA_CALLER_NAME, callerName)
+                putExtra(EXTRA_CALLER_NUMBER, callerName)
+            }
+        }
     }
 
     private var callId: String = ""
     private var callerName: String = "Unknown"
     private var callerNumber: String = ""
     private var wasDeviceLockedOnCreate = false
+    /** True when launched as a placeholder (no callId yet) */
+    private var isPlaceholderMode = false
 
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -138,10 +164,12 @@ class IncomingCallActivity : AppCompatActivity() {
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME) ?: "Unknown"
         callerNumber = intent.getStringExtra(EXTRA_CALLER_NUMBER) ?: callerName
 
-        if (callId.isEmpty()) {
-            Log.e(TAG, "onCreate: callId is empty — finishing")
-            finish()
-            return
+        // Placeholder mode: launched by the placeholder notification before
+        // Vonage SDK has processed the push. Show UI immediately but disable
+        // Answer until a real callId arrives via onNewIntent().
+        isPlaceholderMode = callId.isEmpty()
+        if (isPlaceholderMode) {
+            Log.d(TAG, "onCreate: Placeholder mode — no callId yet, waiting for real intent")
         }
 
         // Prevent duplicate instances — but allow re-creation if the previous was destroyed
@@ -184,6 +212,11 @@ class IncomingCallActivity : AppCompatActivity() {
         setupButtonSwipeAnimation(acceptButtonContainer, acceptButtonIcon) { handleAnswer() }
         setupButtonSwipeAnimation(declineButtonContainer, declineButtonIcon) { handleDecline() }
 
+        // In placeholder mode, dim the answer button until callId arrives
+        if (isPlaceholderMode) {
+            acceptButtonContainer.alpha = 0.5f
+        }
+
         // Bottom sheet dismiss on overlay tap
         bottomSheetOverlay.setOnClickListener {
             bottomSheetOverlay.visibility = View.GONE
@@ -217,6 +250,42 @@ class IncomingCallActivity : AppCompatActivity() {
         try {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(callEndedReceiver)
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Called when a new intent arrives while the activity is already running
+     * (due to singleInstance launch mode + FLAG_ACTIVITY_SINGLE_TOP).
+     *
+     * This is the mechanism by which the placeholder activity receives the
+     * real callId: the real notification's fullScreenIntent fires with a
+     * non-empty callId, which is delivered here instead of creating a new activity.
+     */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        val newCallId = intent?.getStringExtra(EXTRA_CALL_ID) ?: ""
+        val newCallerName = intent?.getStringExtra(EXTRA_CALLER_NAME)
+        Log.d(TAG, "onNewIntent: newCallId=$newCallId, newCallerName=$newCallerName, isPlaceholderMode=$isPlaceholderMode")
+
+        if (newCallId.isNotEmpty() && isPlaceholderMode) {
+            // Transition from placeholder to real incoming call
+            callId = newCallId
+            isPlaceholderMode = false
+            if (!newCallerName.isNullOrEmpty()) {
+                callerName = newCallerName
+                callerNumber = newCallerName
+                findViewById<TextView>(R.id.caller_name)?.text = callerName
+            }
+            // Re-enable the answer button
+            findViewById<FrameLayout>(R.id.acceptButton)?.alpha = 1.0f
+            Log.d(TAG, "onNewIntent: Placeholder → Real mode, callId=$callId")
+        } else if (newCallId.isNotEmpty()) {
+            // Activity was already in real mode but received updated callId
+            callId = newCallId
+            if (!newCallerName.isNullOrEmpty()) {
+                callerName = newCallerName
+            }
+            Log.d(TAG, "onNewIntent: Updated callId=$callId")
+        }
     }
 
     // ── Lock screen handling ──────────────────────────────────────────────
@@ -314,7 +383,13 @@ class IncomingCallActivity : AppCompatActivity() {
     // ── Button handlers ───────────────────────────────────────────────────
 
     private fun handleAnswer() {
-        Log.d(TAG, "handleAnswer: callId=$callId, wasDeviceLockedOnCreate=$wasDeviceLockedOnCreate")
+        Log.d(TAG, "handleAnswer: callId=$callId, wasDeviceLockedOnCreate=$wasDeviceLockedOnCreate, isPlaceholderMode=$isPlaceholderMode")
+
+        // In placeholder mode (no callId yet), ignore answer taps
+        if (isPlaceholderMode || callId.isEmpty()) {
+            Log.d(TAG, "handleAnswer: Still in placeholder mode — callId not available yet")
+            return
+        }
 
         if (callHandled) {
             Log.d(TAG, "handleAnswer: callHandled=true — already processed, finishing")
@@ -370,7 +445,7 @@ class IncomingCallActivity : AppCompatActivity() {
     }
 
     private fun handleDecline() {
-        Log.d(TAG, "handleDecline: callId=$callId")
+        Log.d(TAG, "handleDecline: callId=$callId, isPlaceholderMode=$isPlaceholderMode")
 
         if (callHandled) {
             Log.d(TAG, "handleDecline: callHandled=true — already processed, finishing")
@@ -379,15 +454,28 @@ class IncomingCallActivity : AppCompatActivity() {
         }
         callHandled = true
 
-        // Send hangup/reject intent to TVConnectionService
-        val declineIntent = Intent(this, TVConnectionService::class.java).apply {
-            action = Constants.ACTION_HANGUP
-            putExtra(Constants.EXTRA_CALL_ID, callId)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(declineIntent)
+        if (isPlaceholderMode || callId.isEmpty()) {
+            // No callId yet — send cleanup to stop ringing and foreground service
+            Log.d(TAG, "handleDecline: Placeholder mode — sending CLEANUP")
+            val cleanupIntent = Intent(this, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_CLEANUP
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(cleanupIntent)
+            } else {
+                startService(cleanupIntent)
+            }
         } else {
-            startService(declineIntent)
+            // Send hangup/reject intent to TVConnectionService
+            val declineIntent = Intent(this, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_HANGUP
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(declineIntent)
+            } else {
+                startService(declineIntent)
+            }
         }
 
         releaseWakeLock()

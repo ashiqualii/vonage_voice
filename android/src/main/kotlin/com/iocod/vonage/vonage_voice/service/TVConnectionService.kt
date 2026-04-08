@@ -260,7 +260,8 @@ class TVConnectionService : ConnectionService() {
         // Ensure we satisfy the startForeground contract for every
         // startForegroundService() call. If the service is already in
         // foreground (from handleIncomingCall), this is a no-op update.
-        ensureForeground(intent?.action)
+        val callerFrom = intent?.getStringExtra(Constants.EXTRA_CALL_FROM)
+        ensureForeground(intent?.action, callerFrom)
         intent?.let { handleIntent(it) }
         return START_NOT_STICKY
     }
@@ -276,7 +277,7 @@ class TVConnectionService : ConnectionService() {
      * channel when appropriate, so the notification is always visible
      * on devices that "sticky" the first channel importance.
      */
-    private fun ensureForeground(intentAction: String? = null) {
+    private fun ensureForeground(intentAction: String? = null, callerFrom: String? = null) {
         createNotificationChannel()
         createIncomingCallNotificationChannel()
 
@@ -288,10 +289,11 @@ class TVConnectionService : ConnectionService() {
             buildIncomingCallNotification(entry.key, entry.value.from)
         } else if (isIncomingAction) {
             // Incoming call intent is about to be processed — use a
-            // placeholder notification on the HIGH channel WITHOUT action
-            // buttons. Real Answer/Decline buttons are added when
-            // handleIncomingCall() rebuilds with the actual callId.
-            buildPlaceholderIncomingNotification()
+            // placeholder notification on the HIGH channel WITH fullScreenIntent
+            // so the incoming call screen appears immediately on lock screen.
+            // Real Answer/Decline buttons are added when handleIncomingCall()
+            // rebuilds with the actual callId.
+            buildPlaceholderIncomingNotification(callerFrom ?: "Incoming Call")
         } else if (activeConnections.isNotEmpty()) {
             buildActiveCallNotification()
         } else {
@@ -1205,21 +1207,113 @@ class TVConnectionService : ConnectionService() {
     }
 
     /**
-     * Build a minimal placeholder notification for the foreground service
-     * when we don't yet have a callId (FCM placeholder startup).
-     * No Answer/Decline buttons — those are added when the real callId arrives.
+     * Build a placeholder notification for the foreground service when we
+     * don't yet have a callId (FCM placeholder startup).
+     * 
+     * CRITICAL: This notification MUST include setFullScreenIntent() so
+     * the incoming call screen launches immediately on the lock screen.
+     * Without it, the lock screen only shows a small status-bar notification,
+     * and many OEMs (Samsung, Xiaomi) won't re-trigger fullScreenIntent
+     * when the real notification replaces the placeholder.
+     *
+     * Answer/Decline buttons are NOT included — the IncomingCallActivity
+     * handles the no-callId state by showing the UI with buttons disabled
+     * until the real callId arrives via onNewIntent().
      */
-    private fun buildPlaceholderIncomingNotification(): Notification {
+    private fun buildPlaceholderIncomingNotification(callerDisplay: String): Notification {
         createIncomingCallNotificationChannel()
 
+        // fullScreenIntent → IncomingCallActivity with placeholder callId
+        val fullScreenIntent = IncomingCallActivity.createPlaceholderIntent(applicationContext, callerDisplay)
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            9999, // fixed request code for placeholder
+            fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Decline action — sends ACTION_HANGUP with empty callId.
+        // TVConnectionService.handleHangup() will reject the pending invite
+        // when the real callId arrives, or stop the service if no invite exists.
+        val declineServiceIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+            action = Constants.ACTION_CLEANUP
+        }
+        val declinePendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this,
+                9998,
+                declineServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            PendingIntent.getService(
+                this,
+                9998,
+                declineServiceIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        // Android 12+: Use native CallStyle for consistent system UI
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val avatarBitmap = createCallerAvatarBitmap(callerDisplay, 64)
+            val callerPerson = android.app.Person.Builder()
+                .setName(callerDisplay)
+                .setIcon(Icon.createWithBitmap(avatarBitmap))
+                .setImportant(true)
+                .build()
+
+            // Use a dummy answer intent — the real answer goes through
+            // IncomingCallActivity once callId is available.
+            val dummyAnswerIntent = PendingIntent.getActivity(
+                this,
+                9997,
+                fullScreenIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val callStyle = Notification.CallStyle.forIncomingCall(
+                callerPerson,
+                declinePendingIntent,
+                dummyAnswerIntent
+            )
+
+            return Notification.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID).apply {
+                setSmallIcon(android.R.drawable.ic_menu_call)
+                setVisibility(Notification.VISIBILITY_PUBLIC)
+                setOngoing(true)
+                setAutoCancel(false)
+                setShowWhen(false)
+                setFullScreenIntent(fullScreenPendingIntent, true)
+                setContentIntent(fullScreenPendingIntent)
+                setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                setCategory(Notification.CATEGORY_CALL)
+                setContentTitle(callerDisplay)
+                setContentText("Incoming Call")
+                setColorized(true)
+                setColor(Color.parseColor("#1C1C1E"))
+                style = callStyle
+            }.build()
+        }
+
+        // Pre-Android 12: Simple notification with fullScreenIntent
         return NotificationCompat.Builder(this, Constants.INCOMING_CALL_CHANNEL_ID)
-            .setContentTitle("Incoming Call")
-            .setContentText("Processing incoming call...")
+            .setContentTitle(callerDisplay)
+            .setContentText("Incoming Call")
             .setSmallIcon(android.R.drawable.ic_menu_call)
+            .setContentIntent(fullScreenPendingIntent)
+            .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    android.R.drawable.ic_delete,
+                    "Decline",
+                    declinePendingIntent
+                ).build()
+            )
             .build()
     }
 
