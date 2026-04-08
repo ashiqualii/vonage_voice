@@ -1,13 +1,17 @@
 package com.iocod.vonage.vonage_voice
 
+import android.Manifest
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import android.view.MotionEvent
@@ -16,6 +20,8 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
@@ -58,11 +64,26 @@ class IncomingCallActivity : AppCompatActivity() {
         @Volatile
         var isActivityAlive = false
 
+        private const val REQUEST_CALL_PERMISSIONS = 200
+
+        /** Permissions required to answer a call */
+        private val REQUIRED_CALL_PERMISSIONS = arrayOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_PHONE_STATE,
+        )
+
         fun createIntent(context: Context, callId: String, callerName: String): Intent {
             return Intent(context, IncomingCallActivity::class.java).apply {
+                // FLAG_ACTIVITY_NO_USER_ACTION is critical for fullScreenIntent on lock screen.
+                // Without it, Android shows a heads-up notification instead of full-screen.
+                // FLAG_ACTIVITY_CLEAR_TOP is intentionally NOT used — combined with
+                // singleInstance launchMode it destroys and recreates the activity.
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        Intent.FLAG_ACTIVITY_NO_USER_ACTION
+                action = "com.iocod.vonage.vonage_voice.INCOMING_CALL"
                 putExtra(EXTRA_CALL_ID, callId)
                 putExtra(EXTRA_CALLER_NAME, callerName)
                 putExtra(EXTRA_CALLER_NUMBER, callerName)
@@ -77,15 +98,24 @@ class IncomingCallActivity : AppCompatActivity() {
 
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // Receiver to detect when the call is cancelled/ended remotely
+    // Idempotency flag — prevents double-processing when answer/decline races
+    // with callEndedReceiver. Whichever path sets it first wins.
+    @Volatile
+    private var callHandled = false
+
+    // Receiver to detect when the call is cancelled/ended/answered externally
     private val callEndedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val endedCallId = intent.getStringExtra(Constants.EXTRA_CALL_ID)
             Log.d(TAG, "callEndedReceiver: action=${intent.action}, callId=$endedCallId, our callId=$callId")
-            if (endedCallId == callId || intent.action == Constants.BROADCAST_CALL_INVITE_CANCELLED) {
-                Log.d(TAG, "Call ended/cancelled — finishing IncomingCallActivity")
-                finish()
-            }
+
+            // Only react to events for OUR call (or blanket cancel broadcast)
+            if (endedCallId != callId && intent.action != Constants.BROADCAST_CALL_INVITE_CANCELLED) return
+
+            Log.d(TAG, "Call ended/cancelled/answered externally — cleaning up")
+            callHandled = true
+            releaseWakeLock()
+            finish()
         }
     }
 
@@ -165,10 +195,11 @@ class IncomingCallActivity : AppCompatActivity() {
 
         // Ringing is managed by TVConnectionService — no startRinging() here
 
-        // Listen for call cancelled / ended events
+        // Listen for call cancelled / ended / answered-externally events
         val filter = IntentFilter().apply {
             addAction(Constants.BROADCAST_CALL_INVITE_CANCELLED)
             addAction(Constants.BROADCAST_CALL_ENDED)
+            addAction(Constants.BROADCAST_CALL_ANSWERED)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(callEndedReceiver, filter)
 
@@ -191,11 +222,15 @@ class IncomingCallActivity : AppCompatActivity() {
     // ── Lock screen handling ──────────────────────────────────────────────
 
     private fun showOverLockScreen() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
-        }
+        Log.d(TAG, "showOverLockScreen: Setting up window flags for lock screen display")
 
+        val isMiui = isMiuiDevice()
+        Log.d(TAG, "showOverLockScreen: isMiuiDevice=$isMiui")
+
+        // NOTE: FLAG_DISMISS_KEYGUARD is intentionally NOT included.
+        // It triggers a system unlock dialog on secure lock screens (PIN/pattern)
+        // that steals focus and blocks ALL touch events — user can see the
+        // incoming call UI but cannot interact with answer/decline buttons.
         @Suppress("DEPRECATION")
         window.addFlags(
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
@@ -204,6 +239,49 @@ class IncomingCallActivity : AppCompatActivity() {
             WindowManager.LayoutParams.FLAG_ALLOW_LOCK_WHILE_SCREEN_ON or
             WindowManager.LayoutParams.FLAG_FULLSCREEN
         )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            Log.d(TAG, "showOverLockScreen: setShowWhenLocked and setTurnScreenOn called")
+        }
+
+        // Display cutout handling for notched devices (Android P+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+
+        // MIUI-specific handling — use system overlay window type ONLY when
+        // device is locked. On unlocked devices, this creates a visible overlay
+        // artifact between the heads-up notification and app content.
+        if (isMiui && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            val isDeviceCurrentlyLocked = km?.isKeyguardLocked == true
+            if (isDeviceCurrentlyLocked) {
+                try {
+                    if (Settings.canDrawOverlays(this)) {
+                        Log.d(TAG, "showOverLockScreen: MIUI device locked — setting TYPE_APPLICATION_OVERLAY")
+                        window.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+                    } else {
+                        Log.w(TAG, "showOverLockScreen: MIUI device locked — NO overlay permission")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "showOverLockScreen: Failed to set overlay window type: ${e.message}")
+                }
+            } else {
+                Log.d(TAG, "showOverLockScreen: MIUI device unlocked — skipping TYPE_APPLICATION_OVERLAY")
+            }
+        }
+
+        // Force full screen brightness — some OEMs keep screen dim even with TURN_SCREEN_ON
+        try {
+            window.attributes = window.attributes.apply {
+                screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_FULL
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "showOverLockScreen: Failed to set brightness: ${e.message}")
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -238,6 +316,20 @@ class IncomingCallActivity : AppCompatActivity() {
     private fun handleAnswer() {
         Log.d(TAG, "handleAnswer: callId=$callId, wasDeviceLockedOnCreate=$wasDeviceLockedOnCreate")
 
+        if (callHandled) {
+            Log.d(TAG, "handleAnswer: callHandled=true — already processed, finishing")
+            finish()
+            return
+        }
+
+        // Check permissions before answering — without RECORD_AUDIO the call has no audio
+        if (!ensureCallPermissions("handleAnswer")) {
+            Log.w(TAG, "handleAnswer: Missing permissions — waiting for user grant")
+            return
+        }
+
+        callHandled = true
+
         // Send answer intent to TVConnectionService
         val answerIntent = Intent(this, TVConnectionService::class.java).apply {
             action = Constants.ACTION_ANSWER
@@ -249,13 +341,18 @@ class IncomingCallActivity : AppCompatActivity() {
             startService(answerIntent)
         }
 
-        // Handle lock screen: if device is locked, store pending data and let the
-        // user unlock naturally. MainActivity.onResume() picks up pendingAnsweredCallData.
-        // If unlocked, dismiss any lingering keyguard then launch MainActivity directly.
-        val keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
-        val isCurrentlyLocked = keyguardManager.isKeyguardLocked
+        releaseWakeLock()
 
-        if (isCurrentlyLocked) {
+        val deviceLocked = isDeviceLocked()
+        Log.d(TAG, "handleAnswer: isDeviceLocked=$deviceLocked")
+
+        if (deviceLocked) {
+            // LOCK SCREEN FLOW: The call is answered (audio connects via service above).
+            // We do NOT use requestDismissKeyguard() — on Samsung A15/SDK 36 it works
+            // once then silently fails on subsequent calls, blocking the Looper for
+            // 15-20 seconds and preventing LocalBroadcastManager from delivering events.
+            // Instead: store pending data, finish, let user unlock normally.
+            // MainActivity.onResume() detects pendingAnsweredCallData and navigates.
             Log.d(TAG, "handleAnswer: Device is locked — storing pendingAnsweredCallData")
             pendingAnsweredCallData = mapOf(
                 "callId" to callId,
@@ -267,35 +364,20 @@ class IncomingCallActivity : AppCompatActivity() {
             finish()
         } else {
             Log.d(TAG, "handleAnswer: Device is unlocked — launching MainActivity")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                if (keyguardManager.isKeyguardLocked) {
-                    keyguardManager.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                        override fun onDismissSucceeded() {
-                            launchMainActivity()
-                            finish()
-                        }
-                        override fun onDismissCancelled() {
-                            launchMainActivity()
-                            finish()
-                        }
-                        override fun onDismissError() {
-                            launchMainActivity()
-                            finish()
-                        }
-                    })
-                } else {
-                    launchMainActivity()
-                    finish()
-                }
-            } else {
-                launchMainActivity()
-                finish()
-            }
+            launchMainActivity()
+            finish()
         }
     }
 
     private fun handleDecline() {
         Log.d(TAG, "handleDecline: callId=$callId")
+
+        if (callHandled) {
+            Log.d(TAG, "handleDecline: callHandled=true — already processed, finishing")
+            finish()
+            return
+        }
+        callHandled = true
 
         // Send hangup/reject intent to TVConnectionService
         val declineIntent = Intent(this, TVConnectionService::class.java).apply {
@@ -308,6 +390,7 @@ class IncomingCallActivity : AppCompatActivity() {
             startService(declineIntent)
         }
 
+        releaseWakeLock()
         finish()
     }
 
@@ -428,9 +511,131 @@ class IncomingCallActivity : AppCompatActivity() {
         }
     }
 
+    // ── Permission handling ─────────────────────────────────────────────
+
+    /**
+     * Returns true if all [REQUIRED_CALL_PERMISSIONS] are granted.
+     * If any are missing, requests them (or opens app settings if permanently denied)
+     * and returns false.
+     */
+    private fun ensureCallPermissions(callerTag: String): Boolean {
+        val missing = REQUIRED_CALL_PERMISSIONS.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) return true
+
+        // Check if all missing permissions are permanently denied ("Don't ask again").
+        val permanentlyDenied = missing.filter {
+            !ActivityCompat.shouldShowRequestPermissionRationale(this, it)
+        }
+
+        if (permanentlyDenied.size == missing.size && permanentlyDenied.isNotEmpty()) {
+            val prefs = getSharedPreferences("vonage_permissions", Context.MODE_PRIVATE)
+            val allPreviouslyRequested = permanentlyDenied.all {
+                prefs.getBoolean("requested_$it", false)
+            }
+            if (allPreviouslyRequested) {
+                Log.d(TAG, "$callerTag: All missing permissions permanently denied, opening app settings")
+                openAppSettings()
+                return false
+            }
+        }
+
+        // Mark as requested and show dialog
+        val prefs = getSharedPreferences("vonage_permissions", Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            missing.forEach { putBoolean("requested_$it", true) }
+            apply()
+        }
+
+        Log.d(TAG, "$callerTag: Requesting missing permissions: $missing")
+        ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQUEST_CALL_PERMISSIONS)
+        return false
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CALL_PERMISSIONS) {
+            val allGranted = grantResults.isNotEmpty() && grantResults.all {
+                it == PackageManager.PERMISSION_GRANTED
+            }
+            if (allGranted) {
+                Log.d(TAG, "Permissions granted — proceeding with answer")
+                handleAnswer()
+            } else {
+                Log.w(TAG, "Permissions denied — cannot answer call")
+            }
+        }
+    }
+
+    private fun openAppSettings() {
+        try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", packageName, null)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "openAppSettings: Failed: ${e.message}")
+        }
+    }
+
+    // ── Lock state detection ──────────────────────────────────────────────
+
+    /**
+     * Check if the device is locked using dual-check approach.
+     *
+     * After setShowWhenLocked(true), isKeyguardLocked returns false from this
+     * activity's context — Android considers the keyguard "dismissed" for
+     * activities showing over the lock screen, even though the user hasn't
+     * entered their PIN/pattern. We use the cached wasDeviceLockedOnCreate
+     * value AND a fresh check — both must agree for "locked" result.
+     *
+     * On MIUI, isKeyguardLocked may return true even when the user is actively
+     * using the phone (MIUI's "light" lock state). If the fresh check says
+     * unlocked, trust it — the user has clearly authenticated.
+     */
+    private fun isDeviceLocked(): Boolean {
+        val keyguardMgr = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val freshLocked = keyguardMgr?.isKeyguardLocked == true
+        val result = wasDeviceLockedOnCreate && freshLocked
+        if (wasDeviceLockedOnCreate != freshLocked) {
+            Log.d(TAG, "isDeviceLocked: wasDeviceLockedOnCreate=$wasDeviceLockedOnCreate, freshKeyguardLocked=$freshLocked, returning=$result")
+        }
+        return result
+    }
+
+    // ── MIUI device detection ─────────────────────────────────────────────
+
+    private fun isMiuiDevice(): Boolean {
+        return try {
+            val prop = Class.forName("android.os.SystemProperties")
+            val get = prop.getMethod("get", String::class.java)
+            val miuiVersion = get.invoke(null, "ro.miui.ui.version.name") as? String
+            val brand = Build.BRAND.lowercase()
+            val manufacturer = Build.MANUFACTURER.lowercase()
+
+            val isMiui = !miuiVersion.isNullOrEmpty() ||
+                         brand.contains("xiaomi") ||
+                         brand.contains("redmi") ||
+                         brand.contains("poco") ||
+                         manufacturer.contains("xiaomi") ||
+                         manufacturer.contains("redmi")
+            isMiui
+        } catch (e: Exception) {
+            val brand = Build.BRAND.lowercase()
+            val manufacturer = Build.MANUFACTURER.lowercase()
+            brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco") ||
+            manufacturer.contains("xiaomi") || manufacturer.contains("redmi")
+        }
+    }
+
     private fun getInitials(name: String): String {
         if (name.isEmpty()) return "?"
-        // If it looks like a phone number, return #
         if (name.startsWith("+") || name.all { it.isDigit() || it == ' ' || it == '-' || it == '(' || it == ')' }) {
             return "#"
         }

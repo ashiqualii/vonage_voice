@@ -66,6 +66,7 @@ object Constants {
     // ── LocalBroadcast actions: service → VonageVoicePlugin ──────────────
     const val BROADCAST_CALL_RINGING           = "com.iocod.vonage.CALL_RINGING"
     const val BROADCAST_CALL_CONNECTED         = "com.iocod.vonage.CALL_CONNECTED"
+    const val BROADCAST_CALL_ANSWERED          = "com.iocod.vonage.CALL_ANSWERED"
     const val BROADCAST_CALL_ENDED             = "com.iocod.vonage.CALL_ENDED"
     const val BROADCAST_CALL_INVITE            = "com.iocod.vonage.CALL_INVITE"
     const val BROADCAST_CALL_INVITE_CANCELLED  = "com.iocod.vonage.CALL_INVITE_CANCELLED"

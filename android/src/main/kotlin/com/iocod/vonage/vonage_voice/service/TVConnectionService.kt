@@ -79,15 +79,84 @@ class TVConnectionService : ConnectionService() {
     private var scoReceiver: BroadcastReceiver? = null
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
 
-    // ── Service-level ringtone & vibration ────────────────────────────────
-    // Ringing is managed by the service (not IncomingCallActivity) so it
-    // works reliably in background and locked states where the activity
-    // may fail to launch due to BAL restrictions.
-    private var serviceRingtone: Ringtone? = null
-    private var serviceVibrator: Vibrator? = null
-    private var isServiceRinging = false
+    // ── Audio focus management ────────────────────────────────────────────
+    // Samsung devices (A15, S23, etc.) emit a spurious AUDIOFOCUS_LOSS_TRANSIENT
+    // ~3 seconds after granting focus. This is caused by their SystemUI reclaiming
+    // focus for "call notification" sounds. We ignore any transient loss within
+    // AUDIO_FOCUS_SETTLE_MS of the original request.
+    private var hasAudioFocus = false
+    private var wasAutoMutedByFocusLoss = false
+    private var lastAudioFocusRequestTime = 0L
+    private val restoreAudioFocusHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var pendingAudioFocusRestore: Runnable? = null
+
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        val elapsed = SystemClock.elapsedRealtime() - lastAudioFocusRequestTime
+        android.util.Log.d("TVConnectionService",
+            "[AUDIO-FOCUS] focusChange=$focusChange, elapsed=${elapsed}ms, hasAudioFocus=$hasAudioFocus")
+
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+                // Cancel any pending restore — we already have focus
+                cancelPendingAudioFocusRestore()
+                // If we previously auto-muted, unmute now
+                if (wasAutoMutedByFocusLoss) {
+                    wasAutoMutedByFocusLoss = false
+                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    audioManager.isMicrophoneMute = false
+                    val conn = activeConnections.values.firstOrNull()
+                    if (conn?.isMuted == false) {
+                        android.util.Log.d("TVConnectionService",
+                            "[AUDIO-FOCUS] Restoring unmuted state after focus gain")
+                    }
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Samsung 3-second guard: ignore transient loss that arrives
+                // within AUDIO_FOCUS_SETTLE_MS of our request — it's spurious.
+                if (elapsed < AUDIO_FOCUS_SETTLE_MS) {
+                    android.util.Log.d("TVConnectionService",
+                        "[AUDIO-FOCUS] Ignoring spurious transient loss (${elapsed}ms < ${AUDIO_FOCUS_SETTLE_MS}ms)")
+                    return@OnAudioFocusChangeListener
+                }
+                // Real transient loss (e.g., cellular call, navigation instruction).
+                // Auto-mute the mic to prevent the other party hearing the interruption.
+                android.util.Log.d("TVConnectionService",
+                    "[AUDIO-FOCUS] Real transient loss — auto-muting mic")
+                wasAutoMutedByFocusLoss = true
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                audioManager.isMicrophoneMute = true
+                // Schedule a re-request after 1 second to recover focus
+                scheduleAudioFocusRestore()
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Permanent loss — another app took focus (e.g., music player).
+                // We should still try to hold onto our call audio.
+                android.util.Log.w("TVConnectionService",
+                    "[AUDIO-FOCUS] Permanent loss — scheduling restore")
+                hasAudioFocus = false
+                scheduleAudioFocusRestore()
+            }
+        }
+    }
 
     companion object {
+        private const val AUDIO_FOCUS_SETTLE_MS = 3000L
+        private const val AUDIO_FOCUS_RESTORE_DELAY_MS = 1000L
+
+        /**
+         * Maximum time a pending invite can sit in memory before being
+         * considered stale and auto-expired. This is critical because
+         * the FCM active-call guard blocks new calls when pendingInvites
+         * is non-empty — a stuck invite would permanently block all
+         * future incoming calls until app restart.
+         *
+         * Set to 60 seconds to match Twilio's PENDING_CALL_TIMEOUT_MS.
+         */
+        private const val PENDING_INVITE_TIMEOUT_MS = 60_000L
+
         /**
          * Map of currently active call connections keyed by callId.
          * Accessed by VonageVoicePlugin to query call state.
@@ -99,6 +168,12 @@ class TVConnectionService : ConnectionService() {
          * Moved to activeConnections once the call is answered.
          */
         val pendingInvites: HashMap<String, TVCallInviteConnection> = HashMap()
+
+        /**
+         * Timestamps for when each pending invite was created.
+         * Used by [expireStaleInvites] to auto-clean stuck invites.
+         */
+        private val pendingInviteTimestamps: HashMap<String, Long> = HashMap()
 
         /**
          * Returns true if there is at least one active call connection.
@@ -116,6 +191,45 @@ class TVConnectionService : ConnectionService() {
          */
         fun getActiveConnection(): TVCallConnection? = activeConnections.values.firstOrNull()
     }
+
+    /**
+     * Auto-expire pending invites that have been sitting for longer than
+     * [PENDING_INVITE_TIMEOUT_MS]. This prevents a stuck invite (caused by
+     * a lost server cancel event or network drop) from permanently blocking
+     * all future incoming calls via the FCM active-call guard.
+     */
+    private fun expireStaleInvites() {
+        val now = System.currentTimeMillis()
+        val staleIds = pendingInviteTimestamps.filter { (_, timestamp) ->
+            now - timestamp > PENDING_INVITE_TIMEOUT_MS
+        }.keys.toList()
+
+        for (staleId in staleIds) {
+            android.util.Log.w("TVConnectionService",
+                "Expiring stale pending invite: callId=$staleId (age=${now - (pendingInviteTimestamps[staleId] ?: 0)}ms)")
+            pendingInvites[staleId]?.cancel()
+            pendingInvites.remove(staleId)
+            pendingInviteTimestamps.remove(staleId)
+        }
+
+        if (staleIds.isNotEmpty() && activeConnections.isEmpty() && pendingInvites.isEmpty()) {
+            stopServiceRinging()
+            releaseIncomingCallWakeLock()
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.cancel(Constants.NOTIFICATION_ID)
+            stopForeground(true)
+            stopSelf()
+        }
+    }
+
+    // ── Service-level ringtone & vibration ────────────────────────────────
+    // Ringing is managed by the service (not IncomingCallActivity) so it
+    // works reliably in background and locked states where the activity
+    // may fail to launch due to BAL restrictions.
+    private var serviceRingtone: Ringtone? = null
+    private var serviceVibrator: Vibrator? = null
+    private var isServiceRinging = false
 
     // ── Service lifecycle ─────────────────────────────────────────────────
 
@@ -257,14 +371,30 @@ class TVConnectionService : ConnectionService() {
 
         android.util.Log.d("TVConnectionService", "[INCOMING-REAL] callId=$callId, from=$from")
 
+        // ── Expire stale pending invites ───────────────────────────────────
+        // If a previous invite got stuck (server cancel lost, network drop),
+        // auto-clean it so it doesn't permanently block new calls.
+        expireStaleInvites()
+
         // Skip if we already have a pending invite for this callId (duplicate FCM processing)
         if (pendingInvites.containsKey(callId)) {
             android.util.Log.d("TVConnectionService", "Duplicate incoming call for callId=$callId — skipping")
             return
         }
 
+        // ── Active call guard (single-call only) ──────────────────────────
+        // Safety net: if an active call already exists, ignore the 2nd invite.
+        // The primary guard is in VonageFirebaseMessagingService, but this
+        // protects against race conditions where the FCM check passed but
+        // a call was answered between then and now.
+        if (activeConnections.isNotEmpty()) {
+            android.util.Log.d("TVConnectionService", "Active call exists — ignoring 2nd invite callId=$callId")
+            return
+        }
+
         val connection = TVCallInviteConnection(this, callId, from, to)
         pendingInvites[callId] = connection
+        pendingInviteTimestamps[callId] = System.currentTimeMillis()
 
         // ── Use incoming call notification with Answer/Decline ────────────────
         createIncomingCallNotificationChannel()
@@ -303,16 +433,31 @@ class TVConnectionService : ConnectionService() {
         // When Flutter is in the foreground, Flutter's own IncomingCallScreen
         // handles the UI via the BROADCAST_CALL_INVITE event below.
         // When Flutter is NOT in the foreground (background/killed/locked), the
-        // native IncomingCallActivity provides answer/decline buttons. On
-        // lock screen, Android also auto-launches it via the notification's
-        // fullScreenIntent. The activity no longer handles ringing — the service does.
+        // native IncomingCallActivity provides answer/decline buttons.
+        //
+        // On Android 12+ (API 31), Background Activity Launch (BAL) restrictions
+        // block startActivity() from a foreground service unless the app has
+        // SYSTEM_ALERT_WINDOW or was recently in the foreground. Instead of calling
+        // startActivity() directly, we rely on the notification's fullScreenIntent
+        // which is exempt from BAL restrictions. Direct launch is only attempted
+        // as a fallback on pre-API 31 devices where BAL restrictions don't exist.
         if (!VonageClientHolder.isFlutterInForeground) {
-            try {
-                val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
-                directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                applicationContext.startActivity(directIntent)
-            } catch (e: Exception) {
-                android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                // Pre-API 31: direct launch is safe
+                try {
+                    val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
+                    directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    applicationContext.startActivity(directIntent)
+                } catch (e: Exception) {
+                    android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
+                }
+            } else {
+                // API 31+: rely on fullScreenIntent in the notification.
+                // The notification was already posted above with a pendingIntent
+                // pointing to IncomingCallActivity. Android's notification system
+                // will launch the full-screen intent on the lock screen.
+                android.util.Log.d("TVConnectionService",
+                    "API 31+ — relying on fullScreenIntent for IncomingCallActivity")
             }
         } else {
             android.util.Log.d("TVConnectionService", "Flutter in foreground — skipping native IncomingCallActivity")
@@ -346,6 +491,7 @@ class TVConnectionService : ConnectionService() {
         // so we must not broadcast again to avoid duplicate Missed Call events
         pendingInvites[callId]?.cancel()
         pendingInvites.remove(callId)
+        pendingInviteTimestamps.remove(callId)
 
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
@@ -433,24 +579,33 @@ class TVConnectionService : ConnectionService() {
 
      private fun requestAudioFocus() {
                 val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                lastAudioFocusRequestTime = SystemClock.elapsedRealtime()
+                cancelPendingAudioFocusRestore()
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                         .setAudioAttributes(
                             AudioAttributes.Builder()
                                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build()
                         )
+                        .setAcceptsDelayedFocusGain(true)
+                        .setOnAudioFocusChangeListener(audioFocusListener)
                         .build()
                     audioFocusRequest = focusRequest
-                    audioManager.requestAudioFocus(focusRequest)
+                    val result = audioManager.requestAudioFocus(focusRequest)
+                    hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+                    android.util.Log.d("TVConnectionService",
+                        "[AUDIO-FOCUS] requestAudioFocus: result=$result, hasAudioFocus=$hasAudioFocus")
                 } else {
                     @Suppress("DEPRECATION")
-                    audioManager.requestAudioFocus(
-                        null,
+                    val result = audioManager.requestAudioFocus(
+                        audioFocusListener,
                         AudioManager.STREAM_VOICE_CALL,
-                        AudioManager.AUDIOFOCUS_GAIN
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
                     )
+                    hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
                 }
 
                 // Set audio mode to voice call — critical for microphone to work
@@ -505,8 +660,28 @@ class TVConnectionService : ConnectionService() {
                 registerBluetoothMonitor()
     }
 
+    private fun scheduleAudioFocusRestore() {
+        cancelPendingAudioFocusRestore()
+        pendingAudioFocusRestore = Runnable {
+            if (activeConnections.isNotEmpty()) {
+                android.util.Log.d("TVConnectionService",
+                    "[AUDIO-FOCUS] Restoring audio focus after transient loss")
+                requestAudioFocus()
+            }
+        }
+        restoreAudioFocusHandler.postDelayed(pendingAudioFocusRestore!!, AUDIO_FOCUS_RESTORE_DELAY_MS)
+    }
+
+    private fun cancelPendingAudioFocusRestore() {
+        pendingAudioFocusRestore?.let { restoreAudioFocusHandler.removeCallbacks(it) }
+        pendingAudioFocusRestore = null
+    }
+
     private fun releaseAudioFocus() {
         unregisterBluetoothMonitor()
+        cancelPendingAudioFocusRestore()
+        hasAudioFocus = false
+        wasAutoMutedByFocusLoss = false
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -514,7 +689,7 @@ class TVConnectionService : ConnectionService() {
             audioFocusRequest = null
         } else {
             @Suppress("DEPRECATION")
-            audioManager.abandonAudioFocus(null)
+            audioManager.abandonAudioFocus(audioFocusListener)
         }
 
         audioManager.mode = AudioManager.MODE_NORMAL
@@ -724,6 +899,7 @@ class TVConnectionService : ConnectionService() {
 
             // Promote invite connection to active connection
             val invite = pendingInvites.remove(callId)
+            pendingInviteTimestamps.remove(callId)
             val connection = TVCallConnection(
                 this,
                 callId,
@@ -747,6 +923,15 @@ class TVConnectionService : ConnectionService() {
                 putExtra(Constants.EXTRA_CALL_DIRECTION, "INCOMING")
             }
             broadcastManager.sendBroadcast(broadcast)
+
+            // Broadcast CALL_ANSWERED so IncomingCallActivity (if alive) can
+            // dismiss itself. This handles the case where the call is answered
+            // externally (BT headset button, notification action) while the
+            // full-screen IncomingCallActivity is still showing.
+            val answeredBroadcast = Intent(Constants.BROADCAST_CALL_ANSWERED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            broadcastManager.sendBroadcast(answeredBroadcast)
         }
     }
 
@@ -777,6 +962,7 @@ class TVConnectionService : ConnectionService() {
         if (pendingInvites.containsKey(callId)) {
             // Remove from pendingInvites immediately so cleanup runs correctly
             pendingInvites.remove(callId)
+            pendingInviteTimestamps.remove(callId)
 
             // Broadcast CALL_INVITE_CANCELLED so IncomingCallActivity dismisses
             val cancelBroadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
@@ -1375,9 +1561,40 @@ class TVConnectionService : ConnectionService() {
      * Called from [handleIncomingCall] so ringing starts immediately
      * regardless of whether IncomingCallActivity manages to launch.
      */
+    private var ringtoneAudioFocusRequest: AudioFocusRequest? = null
+
     private fun startServiceRinging() {
         if (isServiceRinging) return
         isServiceRinging = true
+
+        // ── Request audio focus for ringtone ──────────────────────────────
+        // Without audio focus, other apps (music, podcasts, navigation) may
+        // play over or duck the ringtone, making it inaudible to the user.
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_RINGTONE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val focusAttrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+                ringtoneAudioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(focusAttrs)
+                    .setAcceptsDelayedFocusGain(false)
+                    .build()
+                audioManager.requestAudioFocus(ringtoneAudioFocusRequest!!)
+                android.util.Log.d("TVConnectionService", "Ringtone audio focus requested")
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(
+                    null,
+                    AudioManager.STREAM_RING,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error requesting ringtone audio focus: ${e.message}")
+        }
 
         // Play default ringtone
         try {
@@ -1444,6 +1661,22 @@ class TVConnectionService : ConnectionService() {
             serviceVibrator = null
         } catch (e: Exception) {
             android.util.Log.e("TVConnectionService", "Error stopping service vibration: ${e.message}")
+        }
+
+        // ── Release ringtone audio focus ───────────────────────────────────
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ringtoneAudioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+                ringtoneAudioFocusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.abandonAudioFocus(null)
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+            android.util.Log.d("TVConnectionService", "Ringtone audio focus released")
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "Error releasing ringtone audio focus: ${e.message}")
         }
     }
 

@@ -33,3 +33,4 @@ migrate_working_dir/
 /coverage/
 example/android/app/google-services.json
 example/ios/Runner/GoogleService-Info.plist
+AGENT_INSTRUCTIONS.md
