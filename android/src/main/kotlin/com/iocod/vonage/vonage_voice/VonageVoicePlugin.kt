@@ -404,6 +404,22 @@ class VonageVoicePlugin :
                     VonageFirebaseMessagingService.clearPendingFcmData(ctx)
                 }
             } else {
+                // If the call was already answered natively (killed-app lock-screen
+                // answer), the FCM data is stale — clear it and skip re-processing.
+                // Without this guard, tryReprocessPendingFcm() would re-create the
+                // SDK invite and cause a phantom re-ring after the call has ended.
+                val answeredPrefs = ctx.getSharedPreferences(
+                    TVConnectionService.PREFS_ANSWERED_CALL, Context.MODE_PRIVATE)
+                val answeredCallId = answeredPrefs.getString(
+                    TVConnectionService.KEY_ANSWERED_CALL_ID, null)
+                if (!answeredCallId.isNullOrEmpty()) {
+                    android.util.Log.d("VonagePlugin",
+                        "reEmit: Call already answered natively (callId=$answeredCallId) — clearing stale FCM data")
+                    VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                    TVConnectionService.clearAnsweredCallData(ctx)
+                    return
+                }
+
                 // vonage_pending_call is empty — this is the killed-process scenario where
                 // FCM arrived but processPushCallInvite never completed (so handleIncomingCall()
                 // never wrote to vonage_pending_call). Check vonage_pending_fcm directly for

@@ -20,6 +20,7 @@ import com.iocod.vonage.vonage_voice.call.TVCallInviteConnection
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.IncomingCallActivity
 import com.iocod.vonage.vonage_voice.AnswerCallTrampolineActivity
+import com.iocod.vonage.vonage_voice.fcm.VonageFirebaseMessagingService
 import com.vonage.voice.api.VoiceClient
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
@@ -1044,6 +1045,7 @@ class TVConnectionService : ConnectionService() {
 
         // Clear the persisted pending call data — call is being answered
         clearPendingCallData(this)
+        VonageFirebaseMessagingService.clearPendingFcmData(this)
 
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
@@ -1159,6 +1161,7 @@ class TVConnectionService : ConnectionService() {
         // Clear both the pending invite data and the answered call data
         clearPendingCallData(this)
         clearAnsweredCallData(this)
+        VonageFirebaseMessagingService.clearPendingFcmData(this)
 
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
@@ -1227,6 +1230,7 @@ class TVConnectionService : ConnectionService() {
         // Clear both the pending invite data and the answered call data
         clearPendingCallData(this)
         clearAnsweredCallData(this)
+        VonageFirebaseMessagingService.clearPendingFcmData(this)
         incomingNotificationPosted = false
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
