@@ -9,7 +9,9 @@ import android.telecom.Connection
 import android.telecom.DisconnectCause
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import com.iocod.vonage.vonage_voice.constants.Constants
+import com.iocod.vonage.vonage_voice.service.TVConnectionService
 
 /**
  * TVCallConnection — TelecomVoice active call connection.
@@ -55,12 +57,29 @@ class TVCallConnection(
      * Called when the system (or user via headset button) requests a disconnect.
      * We broadcast SYSTEM_DISCONNECT so VonageVoicePlugin can call client.hangup(callId)
      * to properly tear down the server-side call leg.
+     *
+     * We also send ACTION_HANGUP directly to TVConnectionService as a fallback
+     * for the killed-app lock screen case where TVBroadcastReceiver isn't
+     * registered. This ensures the foreground notification is always canceled
+     * and the service is stopped even without the Flutter engine running.
      */
     override fun onDisconnect() {
         audioManager.mode = AudioManager.MODE_NORMAL
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroy()
         broadcastEvent(Constants.BROADCAST_SYSTEM_DISCONNECT)
+
+        // Direct service intent — guaranteed cleanup path
+        try {
+            val intent = Intent(context, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_HANGUP
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            ContextCompat.startForegroundService(context, intent)
+        } catch (e: Exception) {
+            android.util.Log.w("TVCallConnection",
+                "onDisconnect: Failed to send hangup intent: ${e.message}")
+        }
     }
 
     /**

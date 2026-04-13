@@ -305,6 +305,74 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                 }
             }
 
+            // ── Hangup listener for killed-app state ─────────────────────
+            // CRITICAL: Without this, if the remote party hangs up while the
+            // device is locked and Flutter hasn't started yet, the notification
+            // tile persists because VonageVoicePlugin.registerVoiceClientListeners()
+            // (the only other place that sets this listener) hasn't been called.
+            //
+            // This mirrors the pattern used by Twilio's ConnectionService where
+            // disconnect callbacks naturally fire regardless of Flutter's state.
+            // Since Vonage doesn't integrate with Android Telecom for call lifecycle,
+            // we must register the SDK hangup listener at the FCM level.
+            client.setOnCallHangupListener { callId, quality, reason ->
+                android.util.Log.d("VonageFCM",
+                    "[FCM-HANGUP] Remote hangup detected (killed-app path): callId=$callId, reason=$reason")
+
+                // Remove the connection from the active map
+                val connection = TVConnectionService.activeConnections[callId]
+                val pendingInvite = TVConnectionService.pendingInvites[callId]
+
+                if (connection != null) {
+                    connection.disconnect()
+                    TVConnectionService.activeConnections.remove(callId)
+
+                    // Broadcast CALL_ENDED so any alive activity/receiver can react
+                    val broadcastIntent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                        putExtra(Constants.EXTRA_CALL_ID, callId)
+                    }
+                    LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(broadcastIntent)
+                } else if (pendingInvite != null) {
+                    // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
+                    pendingInvite.cancel()
+                    TVConnectionService.pendingInvites.remove(callId)
+                }
+
+                // Clear stale pending data so unlock doesn't navigate to a dead call
+                IncomingCallActivity.pendingAnsweredCallData = null
+                VonageClientHolder.isCallAnsweredNatively = false
+                VonageClientHolder.isAnsweringInProgress = false
+
+                // Clean up notification + stop foreground service
+                if (TVConnectionService.activeConnections.isEmpty() &&
+                    TVConnectionService.pendingInvites.isEmpty()) {
+                    // Direct notification cancel — belt-and-suspenders for Samsung
+                    // lock screen where startForegroundService can be deferred
+                    try {
+                        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE)
+                                as android.app.NotificationManager
+                        nm.cancel(Constants.NOTIFICATION_ID)
+                    } catch (e: Exception) {
+                        android.util.Log.w("VonageFCM",
+                            "[FCM-HANGUP] Direct notification cancel failed: ${e.message}")
+                    }
+
+                    try {
+                        val cleanupIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+                            action = Constants.ACTION_CLEANUP
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            applicationContext.startForegroundService(cleanupIntent)
+                        } else {
+                            applicationContext.startService(cleanupIntent)
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e("VonageFCM",
+                            "[FCM-HANGUP] Failed to send cleanup intent: ${e.message}", e)
+                    }
+                }
+            }
+
             // ── Restore session from stored JWT ──────────────────────────
             // When the app was killed, the VoiceClient has no session.
             // Without a session, client.answer() will fail when the user

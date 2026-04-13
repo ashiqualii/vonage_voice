@@ -1077,6 +1077,22 @@ class TVConnectionService : ConnectionService() {
                 } else {
                     VonageClientHolder.isAnsweringInProgress = false
                     broadcastError("answer failed: ${error.message}")
+
+                    // Clean up stale invite — the call is dead on the server
+                    val inviteConn = pendingInvites.remove(callId)
+                    pendingInviteTimestamps.remove(callId)
+                    inviteConn?.setDisconnected(android.telecom.DisconnectCause(
+                        android.telecom.DisconnectCause.ERROR, "Answer failed"))
+                    inviteConn?.destroy()
+
+                    // Dismiss IncomingCallActivity (it listens for INVITE_CANCELLED)
+                    val cancelBroadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
+                        putExtra(Constants.EXTRA_CALL_ID, callId)
+                    }
+                    broadcastManager.sendBroadcast(cancelBroadcast)
+
+                    // Cancel notification and stop service
+                    handleCleanup()
                 }
                 return@answer
             }
@@ -1206,6 +1222,14 @@ class TVConnectionService : ConnectionService() {
         activeConnections[callId]?.disconnect()
         activeConnections.remove(callId)
 
+        // Clear the static pendingAnsweredCallData so MainActivity.onResume()
+        // does NOT navigate to a dead-call screen after remote hangup on lock screen.
+        IncomingCallActivity.pendingAnsweredCallData = null
+
+        // Reset "answered natively" flag so the next call's invite listener works.
+        VonageClientHolder.isCallAnsweredNatively = false
+        VonageClientHolder.isAnsweringInProgress = false
+
         // Always cancel the notification and stop the service when no calls remain
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
@@ -1232,6 +1256,17 @@ class TVConnectionService : ConnectionService() {
         clearAnsweredCallData(this)
         VonageFirebaseMessagingService.clearPendingFcmData(this)
         incomingNotificationPosted = false
+
+        // Clear the static pendingAnsweredCallData so that MainActivity.onResume()
+        // does NOT navigate to a dead-call screen when the user unlocks after a
+        // remote hangup that happened while the device was locked.
+        IncomingCallActivity.pendingAnsweredCallData = null
+
+        // Reset "answered natively" flag so the NEXT incoming call's invite
+        // listener is properly registered in registerVoiceClientListeners().
+        VonageClientHolder.isCallAnsweredNatively = false
+        VonageClientHolder.isAnsweringInProgress = false
+
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)

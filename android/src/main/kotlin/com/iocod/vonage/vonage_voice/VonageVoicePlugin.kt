@@ -18,6 +18,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.constants.FlutterErrorCodes
 import com.iocod.vonage.vonage_voice.fcm.VonageFirebaseMessagingService
+import com.iocod.vonage.vonage_voice.IncomingCallActivity
 import com.iocod.vonage.vonage_voice.receivers.TVBroadcastReceiver
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
@@ -261,16 +262,44 @@ class VonageVoicePlugin :
             }
             if (toFlush.isNotEmpty()) {
                 android.util.Log.d("VonagePlugin", "onListen: flushing ${toFlush.size} queued event(s) to Flutter")
+
+                // Check if the queue contains a Connected event — if so, the call
+                // was already answered natively and we should skip the Incoming event.
+                val hasConnectedEvent = toFlush.any { it.startsWith("Connected") }
+                // Check if the queue contains a CallEnded event — if so, the call
+                // has already ended and we should skip both Incoming and Connected.
+                val hasEndedEvent = toFlush.any {
+                    it == VNNativeCallEvents.EVENT_CALL_ENDED || it == VNNativeCallEvents.EVENT_MISSED_CALL
+                }
+
                 for (queued in toFlush) {
-                    // Drop stale Incoming events if the invite is no longer valid —
-                    // prevents showing a ringing screen for a call the user already missed.
-                    // An Incoming event is only valid if the invite is still in pendingInvites
-                    // OR there's an active connection (already answered natively).
-                    if (queued.startsWith("Incoming") &&
-                        TVConnectionService.pendingInvites.isEmpty() &&
-                        TVConnectionService.activeConnections.isEmpty()) {
+                    // Drop stale Incoming events if:
+                    // 1. No pending invite AND no active connection (call completely gone), OR
+                    // 2. A Connected event is also in the queue (call already answered — no
+                    //    point showing the ringing screen before switching to active call), OR
+                    // 3. A CallEnded event is also in the queue (call already ended).
+                    if (queued.startsWith("Incoming")) {
+                        if (TVConnectionService.pendingInvites.isEmpty() &&
+                            TVConnectionService.activeConnections.isEmpty()) {
+                            android.util.Log.d("VonagePlugin",
+                                "onListen: dropping stale Incoming event — no pending invite or active connection")
+                            continue
+                        }
+                        if (hasConnectedEvent) {
+                            android.util.Log.d("VonagePlugin",
+                                "onListen: dropping Incoming event — Connected event already queued")
+                            continue
+                        }
+                        if (hasEndedEvent) {
+                            android.util.Log.d("VonagePlugin",
+                                "onListen: dropping Incoming event — CallEnded event already queued")
+                            continue
+                        }
+                    }
+                    // Drop Connected events if the call has already ended
+                    if (queued.startsWith("Connected") && hasEndedEvent) {
                         android.util.Log.d("VonagePlugin",
-                            "onListen: dropping stale Incoming event — no pending invite or active connection")
+                            "onListen: dropping Connected event — CallEnded event already queued")
                         continue
                     }
                     android.util.Log.d("VonagePlugin", "onListen: flushed queued event: $queued")
@@ -2133,6 +2162,9 @@ class VonageVoicePlugin :
 
         // ── Call hung up ──────────────────────────────────────────────────
         client.setOnCallHangupListener { callId, quality, reason ->
+            android.util.Log.d("VonagePlugin",
+                "setOnCallHangupListener: callId=$callId, reason=$reason")
+
             // Guard against duplicate CALL_ENDED — handleHangup() in
             // TVConnectionService already removes the connection and
             // broadcasts CALL_ENDED when the caller initiates hangup.
@@ -2153,11 +2185,34 @@ class VonageVoicePlugin :
                 TVConnectionService.pendingInvites.remove(callId)
             }
 
+            // Clear pending answered call data so MainActivity.onResume() does
+            // NOT navigate to a dead-call screen when user unlocks after remote
+            // hangup on lock screen.
+            IncomingCallActivity.pendingAnsweredCallData = null
+
+            // Reset "answered natively" flag so the next call's invite listener
+            // is properly registered in registerVoiceClientListeners().
+            VonageClientHolder.isCallAnsweredNatively = false
+            VonageClientHolder.isAnsweringInProgress = false
+
             // Tell TVConnectionService to clean up notification & stop foreground
             // when no calls remain. This handles the remote hangup case where
             // handleHangup() was never called locally.
             if (TVConnectionService.activeConnections.isEmpty() &&
                 TVConnectionService.pendingInvites.isEmpty()) {
+                // Direct notification cancellation — belt-and-suspenders.
+                // On Samsung One UI + lock screen, startForegroundService()
+                // can occasionally be deferred. Cancel immediately here so the
+                // lock screen tile doesn't persist.
+                try {
+                    val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
+                            as android.app.NotificationManager
+                    nm.cancel(Constants.NOTIFICATION_ID)
+                } catch (e: Exception) {
+                    android.util.Log.w("VonagePlugin",
+                        "Direct notification cancel failed: ${e.message}")
+                }
+
                 try {
                     val cleanupIntent = Intent(ctx, TVConnectionService::class.java).apply {
                         action = Constants.ACTION_CLEANUP
