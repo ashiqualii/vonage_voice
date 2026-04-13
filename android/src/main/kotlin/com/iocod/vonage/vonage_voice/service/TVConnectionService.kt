@@ -79,6 +79,11 @@ class TVConnectionService : ConnectionService() {
     private var scoReceiver: BroadcastReceiver? = null
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
 
+    // Guards against firing fullScreenIntent multiple times for the same call.
+    // Samsung A15 / Android 16 can crash or show heads-up instead of full-screen
+    // when nm.notify() fires the same fullScreenIntent PendingIntent repeatedly.
+    private var incomingNotificationPosted = false
+
     // ── Audio focus management ────────────────────────────────────────────
     // Samsung devices (A15, S23, etc.) emit a spurious AUDIOFOCUS_LOSS_TRANSIENT
     // ~3 seconds after granting focus. This is caused by their SystemUI reclaiming
@@ -157,6 +162,15 @@ class TVConnectionService : ConnectionService() {
          */
         private const val PENDING_INVITE_TIMEOUT_MS = 60_000L
 
+        // ── SharedPreferences keys (matching Twilio's cross-process pattern) ──
+        const val PREFS_PENDING_CALL       = "vonage_pending_call"
+        const val KEY_PENDING_CALL_ID      = "pending_call_id"
+        const val KEY_PENDING_CALL_FROM    = "pending_call_from"
+        const val KEY_PENDING_CALL_TO      = "pending_call_to"
+        const val KEY_PENDING_CALL_TIMESTAMP = "pending_call_timestamp"
+        /** Maximum age (ms) for a persisted call entry to be considered valid. */
+        const val PENDING_CALL_TTL_MS      = 120_000L
+
         /**
          * Map of currently active call connections keyed by callId.
          * Accessed by VonageVoicePlugin to query call state.
@@ -190,6 +204,67 @@ class TVConnectionService : ConnectionService() {
          * Used by VonageVoicePlugin for direct state updates (e.g. selectAudioDevice).
          */
         fun getActiveConnection(): TVCallConnection? = activeConnections.values.firstOrNull()
+
+        /** Clear the persisted pending call entry — called after answer/hangup/cleanup. */
+        fun clearPendingCallData(context: android.content.Context) {
+            try {
+                context.getSharedPreferences(PREFS_PENDING_CALL, android.content.Context.MODE_PRIVATE)
+                    .edit().clear().commit()
+                android.util.Log.d("TVConnectionService", "clearPendingCallData: SharedPreferences cleared")
+            } catch (e: Exception) {
+                android.util.Log.w("TVConnectionService", "clearPendingCallData failed: ${e.message}")
+            }
+        }
+
+        // ── Answered call persistence (survives across process death) ─────────
+        // Mirrors the PREFS_PENDING_CALL pattern: written with commit() when a
+        // call is answered natively (doAnswer() success callback), read by
+        // MainActivity.onResume() and reEmitPendingCallState() so Flutter can
+        // navigate directly to the active call screen even if the process was
+        // killed between the lock-screen answer and the user unlocking.
+        const val PREFS_ANSWERED_CALL           = "vonage_answered_call"
+        const val KEY_ANSWERED_CALL_ID          = "answered_call_id"
+        const val KEY_ANSWERED_CALL_FROM        = "answered_call_from"
+        const val KEY_ANSWERED_CALL_TO          = "answered_call_to"
+        const val KEY_ANSWERED_CALL_TIMESTAMP   = "answered_call_timestamp"
+        /** Maximum age for the answered-call entry to be considered valid (5 min). */
+        const val ANSWERED_CALL_TTL_MS          = 300_000L
+
+        /**
+         * Persist answered call metadata to SharedPreferences.
+         * Called synchronously (commit) from doAnswer() success so the data
+         * survives process death on aggressive OEMs (MIUI, Samsung).
+         */
+        fun persistAnsweredCallData(
+            context: android.content.Context,
+            callId: String,
+            from: String?,
+            to: String?
+        ) {
+            try {
+                context.getSharedPreferences(PREFS_ANSWERED_CALL, android.content.Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_ANSWERED_CALL_ID, callId)
+                    .putString(KEY_ANSWERED_CALL_FROM, from ?: "")
+                    .putString(KEY_ANSWERED_CALL_TO, to ?: "")
+                    .putLong(KEY_ANSWERED_CALL_TIMESTAMP, System.currentTimeMillis())
+                    .commit()
+                android.util.Log.d("TVConnectionService", "✓ persistAnsweredCallData: callId=$callId, from=$from")
+            } catch (e: Exception) {
+                android.util.Log.w("TVConnectionService", "persistAnsweredCallData failed: ${e.message}")
+            }
+        }
+
+        /** Clear the answered call entry — called on hangup/cleanup/call-end. */
+        fun clearAnsweredCallData(context: android.content.Context) {
+            try {
+                context.getSharedPreferences(PREFS_ANSWERED_CALL, android.content.Context.MODE_PRIVATE)
+                    .edit().clear().commit()
+                android.util.Log.d("TVConnectionService", "clearAnsweredCallData: SharedPreferences cleared")
+            } catch (e: Exception) {
+                android.util.Log.w("TVConnectionService", "clearAnsweredCallData failed: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -237,6 +312,20 @@ class TVConnectionService : ConnectionService() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
 
+        android.util.Log.i("TVConnectionService",
+            "[LIFECYCLE] onCreate: pid=${android.os.Process.myPid()}, " +
+            "pendingInvites=${pendingInvites.size}, activeConns=${activeConnections.size}")
+
+        // Install a catch-all handler to log crashes that would otherwise
+        // appear as silent "binderDied" events in system_server Telecom logs.
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            android.util.Log.e("TVConnectionService",
+                "[FATAL] Uncaught exception on thread ${thread.name} (pid=${android.os.Process.myPid()})",
+                throwable)
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
+
         // Clean up the old notification channel that had sound/vibration.
         // Must happen here (before any startForeground call) because
         // Android throws SecurityException if you delete a channel while
@@ -246,6 +335,9 @@ class TVConnectionService : ConnectionService() {
             manager.deleteNotificationChannel(Constants.INCOMING_CALL_CHANNEL_ID_OLD)
         }
     }
+
+    // NOTE: ConnectionService.onBind() is final — cannot be overridden.
+    // Telecom binding is tracked via onCreateIncomingConnection logs instead.
 
     /**
      * Entry point for all actions sent from VonageVoicePlugin via
@@ -257,11 +349,17 @@ class TVConnectionService : ConnectionService() {
      * that arrives while the service is not yet in foreground.
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action ?: "(null)"
+        val callId = intent?.getStringExtra(Constants.EXTRA_CALL_ID)
+        val callerFrom = intent?.getStringExtra(Constants.EXTRA_CALL_FROM)
+        android.util.Log.i("TVConnectionService",
+            "[INTENT] onStartCommand: action=$action, callId=$callId, from=$callerFrom, " +
+            "pendingInvites=${pendingInvites.size}, activeConns=${activeConnections.size}, " +
+            "pid=${android.os.Process.myPid()}")
         // Ensure we satisfy the startForeground contract for every
         // startForegroundService() call. If the service is already in
         // foreground (from handleIncomingCall), this is a no-op update.
-        val callerFrom = intent?.getStringExtra(Constants.EXTRA_CALL_FROM)
-        ensureForeground(intent?.action, callerFrom)
+        ensureForeground(intent?.action, callerFrom, callId)
         intent?.let { handleIntent(it) }
         return START_NOT_STICKY
     }
@@ -277,7 +375,7 @@ class TVConnectionService : ConnectionService() {
      * channel when appropriate, so the notification is always visible
      * on devices that "sticky" the first channel importance.
      */
-    private fun ensureForeground(intentAction: String? = null, callerFrom: String? = null) {
+    private fun ensureForeground(intentAction: String? = null, callerFrom: String? = null, callId: String? = null) {
         createNotificationChannel()
         createIncomingCallNotificationChannel()
 
@@ -287,12 +385,18 @@ class TVConnectionService : ConnectionService() {
         val notification = if (pendingInvites.isNotEmpty()) {
             val entry = pendingInvites.entries.first()
             buildIncomingCallNotification(entry.key, entry.value.from)
+        } else if (isIncomingAction && !callId.isNullOrEmpty()) {
+            // Real incoming call with known callId — build full notification
+            // with the real callId in fullScreenIntent. This prevents the
+            // activity from launching in placeholder mode on locked screens
+            // (fullScreenIntent fires immediately, before handleIncomingCall runs).
+            android.util.Log.d("TVConnectionService",
+                "[ensureForeground] Using real notification: callId=$callId, from=$callerFrom")
+            buildIncomingCallNotification(callId, callerFrom ?: "Incoming Call")
         } else if (isIncomingAction) {
-            // Incoming call intent is about to be processed — use a
-            // placeholder notification on the HIGH channel WITH fullScreenIntent
-            // so the incoming call screen appears immediately on lock screen.
-            // Real Answer/Decline buttons are added when handleIncomingCall()
-            // rebuilds with the actual callId.
+            // No callId yet (placeholder path from killed-app FCM) — use
+            // placeholder notification WITH fullScreenIntent so the incoming
+            // call screen appears immediately on lock screen.
             buildPlaceholderIncomingNotification(callerFrom ?: "Incoming Call")
         } else if (activeConnections.isNotEmpty()) {
             buildActiveCallNotification()
@@ -312,6 +416,22 @@ class TVConnectionService : ConnectionService() {
             startForeground(Constants.NOTIFICATION_ID, notification, serviceType)
         } else {
             startForeground(Constants.NOTIFICATION_ID, notification)
+        }
+
+        // For incoming calls, also post via NotificationManager.notify() —
+        // startForeground() alone doesn't reliably fire fullScreenIntent on
+        // Samsung A15 / Android 16.  This must happen BEFORE the wake lock
+        // turns the screen on, so the system still considers the device
+        // "locked + screen off" and launches the fullScreenIntent as a
+        // full-screen activity (not a heads-up notification).
+        // ONLY fire once — Samsung crashes or shows heads-up (not full-screen)
+        // when the same fullScreenIntent PendingIntent fires multiple times.
+        if ((isIncomingAction || pendingInvites.isNotEmpty()) && !incomingNotificationPosted) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(Constants.NOTIFICATION_ID, notification)
+            incomingNotificationPosted = true
+            android.util.Log.d("TVConnectionService",
+                "[ensureForeground] ✓ nm.notify() fired fullScreenIntent (pid=${android.os.Process.myPid()})")
         }
 
         // Acquire FULL_WAKE_LOCK for incoming calls to physically turn the screen on.
@@ -371,7 +491,10 @@ class TVConnectionService : ConnectionService() {
             return
         }
 
-        android.util.Log.d("TVConnectionService", "[INCOMING-REAL] callId=$callId, from=$from")
+        android.util.Log.i("TVConnectionService", "[INCOMING-REAL] callId=$callId, from=$from, " +
+            "isFlutterForeground=${VonageClientHolder.isFlutterInForeground}, " +
+            "isFlutterAttached=${VonageClientHolder.isFlutterEngineAttached}, " +
+            "isSessionReady=${VonageClientHolder.isSessionReady}")
 
         // ── Expire stale pending invites ───────────────────────────────────
         // If a previous invite got stuck (server cancel lost, network drop),
@@ -398,72 +521,116 @@ class TVConnectionService : ConnectionService() {
         pendingInvites[callId] = connection
         pendingInviteTimestamps[callId] = System.currentTimeMillis()
 
-        // ── Use incoming call notification with Answer/Decline ────────────────
-        createIncomingCallNotificationChannel()
-        // Use PHONE_CALL type — RECORD_AUDIO is not yet granted before the user answers.
-        // MICROPHONE type requires RECORD_AUDIO permission and will crash on API 34+.
-        val incomingNotification = buildIncomingCallNotification(callId, from)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                Constants.NOTIFICATION_ID,
-                incomingNotification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
-            )
-        } else {
-            startForeground(Constants.NOTIFICATION_ID, incomingNotification)
+        // ── Persist call metadata to SharedPreferences ────────────────────
+        // Mirrors Twilio's pending_incoming_call_sid pattern: write with commit()
+        // (synchronous) so the data survives if the OS kills the process between
+        // FCM delivery and the user tapping Answer on MIUI/aggressive OEMs.
+        // The plugin's reEmitPendingCallState() reads this as a cross-process fallback.
+        try {
+            getSharedPreferences(PREFS_PENDING_CALL, android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_PENDING_CALL_ID, callId)
+                .putString(KEY_PENDING_CALL_FROM, from)
+                .putString(KEY_PENDING_CALL_TO, to)
+                .putLong(KEY_PENDING_CALL_TIMESTAMP, System.currentTimeMillis())
+                .commit()
+            android.util.Log.d("TVConnectionService", "✓ Persisted pending call to SharedPreferences: callId=$callId")
+        } catch (e: Exception) {
+            android.util.Log.w("TVConnectionService", "Failed to persist pending call: ${e.message}")
         }
 
-        // Also post via NotificationManager.notify() to ensure fullScreenIntent
-        // re-fires on devices where updating the foreground notification (same ID)
-        // does NOT re-trigger the full-screen intent (Samsung, Xiaomi, etc.)
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(Constants.NOTIFICATION_ID, incomingNotification)
+        // ── Broadcast REAL_CALL_READY so placeholder activity upgrades ────
+        val upgradeIntent = Intent(Constants.BROADCAST_REAL_CALL_READY).apply {
+            putExtra(Constants.EXTRA_CALL_ID, callId)
+            putExtra(Constants.EXTRA_CALL_FROM, from)
+        }
+        broadcastManager.sendBroadcast(upgradeIntent)
+        android.util.Log.d("TVConnectionService", "[INCOMING-REAL] Sent BROADCAST_REAL_CALL_READY callId=$callId")
+
+        // ── Notification is already posted by ensureForeground() ────────
+        // ensureForeground() runs in onStartCommand BEFORE handleIntent(),
+        // so the notification with fullScreenIntent is already active.
+        // On Samsung A15 / Android 16, the fullScreenIntent is the ONLY
+        // reliable way to show an activity over the lock screen.
+        // DO NOT post the notification again here — triple-notify causes
+        // Samsung to show heads-up instead of full-screen, and may contribute
+        // to process crashes from rapid PendingIntent re-fires.
+
+        // ── Now notify Telecom ────────────────────────────────────────────
+        // addNewIncomingCall() integrates us with the Android call system
+        // (audio routing, Bluetooth, call log, etc). onShowIncomingCallUi()
+        // is the secondary UI path — the notification's fullScreenIntent above
+        // is primary for lock screen display.
+        val flutterCanHandleUi = VonageClientHolder.isFlutterInForeground
+                && VonageClientHolder.isEventSinkAttached
+        if (!flutterCanHandleUi) {
+            android.util.Log.d("TVConnectionService",
+                "[INCOMING-REAL] Showing native UI — isFlutterForeground=${VonageClientHolder.isFlutterInForeground}, isEventSinkAttached=${VonageClientHolder.isEventSinkAttached}")
+            val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+            if (telecomManager != null) {
+                val componentName = android.content.ComponentName(this, TVConnectionService::class.java)
+                val handle = PhoneAccountHandle(componentName, "VonageVoiceAccount")
+                try {
+                    val existing = telecomManager.getPhoneAccount(handle)
+                    if (existing == null || existing.capabilities != android.telecom.PhoneAccount.CAPABILITY_SELF_MANAGED) {
+                        telecomManager.registerPhoneAccount(
+                            android.telecom.PhoneAccount.builder(handle, "Vonage Voice")
+                                .setCapabilities(android.telecom.PhoneAccount.CAPABILITY_SELF_MANAGED)
+                                .build()
+                        )
+                        android.util.Log.d("TVConnectionService", "[INCOMING-REAL] PhoneAccount registered")
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("TVConnectionService", "[INCOMING-REAL] ensurePhoneAccount: ${e.message}")
+                }
+
+                try {
+                    val account = telecomManager.getPhoneAccount(handle)
+                    val isEnabled = account?.isEnabled ?: false
+                    android.util.Log.d("TVConnectionService",
+                        "[INCOMING-REAL] PhoneAccount state: enabled=$isEnabled, " +
+                        "capabilities=${account?.capabilities}")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        val permitted = telecomManager.isIncomingCallPermitted(handle)
+                        android.util.Log.d("TVConnectionService",
+                            "[INCOMING-REAL] isIncomingCallPermitted=$permitted")
+                        if (!permitted) {
+                            android.util.Log.w("TVConnectionService",
+                                "[INCOMING-REAL] ⚠ Telecom will REJECT this call — falling back to notification-only")
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("TVConnectionService",
+                        "[INCOMING-REAL] PhoneAccount check failed: ${e.message}")
+                }
+
+                val extras = android.os.Bundle().apply {
+                    putString(Constants.EXTRA_CALL_ID, callId)
+                    putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+                }
+                try {
+                    telecomManager.addNewIncomingCall(handle, extras)
+                    android.util.Log.d("TVConnectionService", "[INCOMING-REAL] ✓ addNewIncomingCall() succeeded callId=$callId")
+                } catch (e: Exception) {
+                    android.util.Log.e("TVConnectionService", "[INCOMING-REAL] ✗ addNewIncomingCall() failed: ${e.message} — using notification fallback")
+                }
+            } else {
+                android.util.Log.w("TVConnectionService", "[INCOMING-REAL] TelecomManager not available — notification-only path")
+            }
+        } else {
+            android.util.Log.d("TVConnectionService", "[INCOMING-REAL] Flutter in foreground with active EventSink — skipping native UI")
+        }
 
         // Acquire wake lock to ensure the screen turns on for incoming call
         if (incomingCallWakeLock == null) {
             acquireIncomingCallWakeLock()
         }
 
-        // ── Start ringing from the service ─────────────────────────────
-        // Ringing is managed by the service so it works reliably in all
-        // app states (foreground, background, locked, killed). The service
-        // is always alive at this point because onStartCommand → ensureForeground
-        // has already been called.
+        // ── Start ringing AFTER Telecom has accepted the call ─────────────
         startServiceRinging()
 
-        // ── Launch IncomingCallActivity only when Flutter is NOT in foreground ──
-        // When Flutter is in the foreground, Flutter's own IncomingCallScreen
-        // handles the UI via the BROADCAST_CALL_INVITE event below.
-        // When Flutter is NOT in the foreground (background/killed/locked), the
-        // native IncomingCallActivity provides answer/decline buttons.
-        //
-        // On Android 12+ (API 31), Background Activity Launch (BAL) restrictions
-        // block startActivity() from a foreground service unless the app has
-        // SYSTEM_ALERT_WINDOW or was recently in the foreground. Instead of calling
-        // startActivity() directly, we rely on the notification's fullScreenIntent
-        // which is exempt from BAL restrictions. Direct launch is only attempted
-        // as a fallback on pre-API 31 devices where BAL restrictions don't exist.
-        if (!VonageClientHolder.isFlutterInForeground) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                // Pre-API 31: direct launch is safe
-                try {
-                    val directIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
-                    directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    applicationContext.startActivity(directIntent)
-                } catch (e: Exception) {
-                    android.util.Log.e("TVConnectionService", "Direct IncomingCallActivity launch failed: ${e.message}")
-                }
-            } else {
-                // API 31+: rely on fullScreenIntent in the notification.
-                // The notification was already posted above with a pendingIntent
-                // pointing to IncomingCallActivity. Android's notification system
-                // will launch the full-screen intent on the lock screen.
-                android.util.Log.d("TVConnectionService",
-                    "API 31+ — relying on fullScreenIntent for IncomingCallActivity")
-            }
-        } else {
-            android.util.Log.d("TVConnectionService", "Flutter in foreground — skipping native IncomingCallActivity")
-        }
+        android.util.Log.i("TVConnectionService",
+            "[INCOMING-REAL] ✓ handleIncomingCall complete: callId=$callId, pendingInvites=${pendingInvites.size}")
 
         val broadcast = Intent(Constants.BROADCAST_CALL_INVITE).apply {
             putExtra(Constants.EXTRA_CALL_ID, callId)
@@ -488,6 +655,10 @@ class TVConnectionService : ConnectionService() {
 
         // Release the incoming call wake lock — call is being cancelled
         releaseIncomingCallWakeLock()
+
+        // Clear the persisted pending call data — caller cancelled the invite
+        clearPendingCallData(this)
+        incomingNotificationPosted = false
 
         // cancel() internally broadcasts BROADCAST_CALL_INVITE_CANCELLED
         // so we must not broadcast again to avoid duplicate Missed Call events
@@ -858,6 +1029,9 @@ class TVConnectionService : ConnectionService() {
         // Release the incoming call wake lock — call is being answered
         releaseIncomingCallWakeLock()
 
+        // Clear the persisted pending call data — call is being answered
+        clearPendingCallData(this)
+
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
             return
@@ -902,6 +1076,20 @@ class TVConnectionService : ConnectionService() {
             // Promote invite connection to active connection
             val invite = pendingInvites.remove(callId)
             pendingInviteTimestamps.remove(callId)
+
+            // Persist answered call to SharedPreferences so Flutter can restore
+            // the active call screen even if the process is killed between the
+            // lock-screen answer and the user unlocking (MIUI/Samsung OEM trims).
+            // Mirrors the PREFS_PENDING_CALL pattern used for incoming-call recovery.
+            persistAnsweredCallData(this, callId, invite?.from, invite?.to)
+
+            // Cleanly disconnect the invite connection from the Telecom framework.
+            // This was returned from onCreateIncomingConnection() so Telecom tracks it.
+            // We must destroy it before the new active connection takes over.
+            invite?.setDisconnected(android.telecom.DisconnectCause(
+                android.telecom.DisconnectCause.LOCAL, "Promoted to active call"))
+            invite?.destroy()
+
             val connection = TVCallConnection(
                 this,
                 callId,
@@ -955,6 +1143,10 @@ class TVConnectionService : ConnectionService() {
         // Release the incoming call wake lock — call is being declined/ended
         releaseIncomingCallWakeLock()
 
+        // Clear both the pending invite data and the answered call data
+        clearPendingCallData(this)
+        clearAnsweredCallData(this)
+
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")
             return
@@ -963,8 +1155,13 @@ class TVConnectionService : ConnectionService() {
         // Check if this is a pending invite (reject) or active call (hangup)
         if (pendingInvites.containsKey(callId)) {
             // Remove from pendingInvites immediately so cleanup runs correctly
-            pendingInvites.remove(callId)
+            val inviteConnection = pendingInvites.remove(callId)
             pendingInviteTimestamps.remove(callId)
+
+            // Disconnect the invite connection from the Telecom framework
+            inviteConnection?.setDisconnected(android.telecom.DisconnectCause(
+                android.telecom.DisconnectCause.REJECTED))
+            inviteConnection?.destroy()
 
             // Broadcast CALL_INVITE_CANCELLED so IncomingCallActivity dismisses
             val cancelBroadcast = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
@@ -1014,6 +1211,10 @@ class TVConnectionService : ConnectionService() {
     private fun handleCleanup() {
         stopServiceRinging()
         releaseIncomingCallWakeLock()
+        // Clear both the pending invite data and the answered call data
+        clearPendingCallData(this)
+        clearAnsweredCallData(this)
+        incomingNotificationPosted = false
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
@@ -1122,14 +1323,59 @@ class TVConnectionService : ConnectionService() {
 
     /**
      * Called by the Telecom framework to create an incoming connection.
-     * Required override — returns the pending invite connection for this callId.
+     * Triggered by addNewIncomingCall() — returns the pending invite connection.
+     *
+     * The Telecom framework nests the extras we passed to addNewIncomingCall()
+     * inside EXTRA_INCOMING_CALL_EXTRAS, so we check both paths.
      */
     override fun onCreateIncomingConnection(
         connectionManagerPhoneAccount: PhoneAccountHandle?,
         request: ConnectionRequest?
     ): Connection {
-        val callId = request?.extras?.getString(Constants.EXTRA_CALL_ID) ?: ""
-        return pendingInvites[callId] ?: TVCallInviteConnection(this, callId, "", "")
+        try {
+            // Telecom nests our extras under EXTRA_INCOMING_CALL_EXTRAS
+            val callId = request?.extras
+                ?.getBundle(TelecomManager.EXTRA_INCOMING_CALL_EXTRAS)
+                ?.getString(Constants.EXTRA_CALL_ID)
+                // Fallback: check top-level extras (some OEMs flatten the bundle)
+                ?: request?.extras?.getString(Constants.EXTRA_CALL_ID)
+                ?: ""
+
+            android.util.Log.d("TVConnectionService",
+                "[TELECOM] onCreateIncomingConnection: callId=$callId, " +
+                "pendingInvites=${pendingInvites.keys}, pid=${android.os.Process.myPid()}")
+
+            val connection = pendingInvites[callId]
+            if (connection != null) {
+                android.util.Log.d("TVConnectionService",
+                    "[TELECOM] ✓ Returning pending invite connection for callId=$callId")
+                return connection
+            }
+
+            // Fallback: if callId lookup failed, return the first pending invite
+            // (there should only be one at a time in our single-call model)
+            val fallback = pendingInvites.values.firstOrNull()
+            if (fallback != null) {
+                android.util.Log.w("TVConnectionService",
+                    "onCreateIncomingConnection: callId=$callId not found, using fallback=${fallback.callId}")
+                return fallback
+            }
+
+            // Last resort: create a new connection. This happens when Telecom
+            // restarts the process after a crash — pendingInvites is empty.
+            android.util.Log.e("TVConnectionService",
+                "onCreateIncomingConnection: no pending invites found for callId=$callId " +
+                "(pid=${android.os.Process.myPid()}) — creating bare connection")
+            return TVCallInviteConnection(this, callId, "", "")
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService",
+                "[TELECOM] onCreateIncomingConnection CRASHED", e)
+            // Return a minimal connection to prevent Telecom from timing out
+            val safeCallId = request?.extras
+                ?.getBundle(TelecomManager.EXTRA_INCOMING_CALL_EXTRAS)
+                ?.getString(Constants.EXTRA_CALL_ID) ?: ""
+            return TVCallInviteConnection(this, safeCallId, "", "")
+        }
     }
 
     // ── Foreground service ────────────────────────────────────────────────
@@ -1408,7 +1654,7 @@ class TVConnectionService : ConnectionService() {
             .setImportant(true)
             .build()
 
-        val customView = RemoteViews(packageName, R.layout.notification_incoming_call)
+        val customView = RemoteViews(packageName, R.layout.vonage_notification_incoming_call)
         customView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
         customView.setTextViewText(R.id.notification_caller_name, from)
         customView.setTextViewText(R.id.notification_caller_number, "Incoming Call")
@@ -1512,14 +1758,14 @@ class TVConnectionService : ConnectionService() {
         val elapsedBase = SystemClock.elapsedRealtime()
 
         // Collapsed view
-        val collapsedView = RemoteViews(packageName, R.layout.notification_ongoing_call)
+        val collapsedView = RemoteViews(packageName, R.layout.vonage_notification_ongoing_call)
         collapsedView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
         collapsedView.setTextViewText(R.id.notification_caller_name, callerName)
         collapsedView.setChronometer(R.id.notification_chronometer, elapsedBase, null, true)
         collapsedView.setOnClickPendingIntent(R.id.notification_btn_hangup, hangupIntent)
 
         // Expanded view
-        val expandedView = RemoteViews(packageName, R.layout.notification_ongoing_call_expanded)
+        val expandedView = RemoteViews(packageName, R.layout.vonage_notification_ongoing_call_expanded)
         expandedView.setImageViewBitmap(R.id.notification_avatar, avatarBitmap)
         expandedView.setTextViewText(R.id.notification_caller_name, callerName)
         expandedView.setChronometer(R.id.notification_chronometer, elapsedBase, null, true)
@@ -1777,6 +2023,8 @@ class TVConnectionService : ConnectionService() {
     // ── Broadcast helpers ─────────────────────────────────────────────────
 
     private fun broadcastCallEnded(callId: String) {
+        // Clear answered call data — the call is fully over
+        clearAnsweredCallData(this)
         val intent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
             putExtra(Constants.EXTRA_CALL_ID, callId)
         }
@@ -1820,17 +2068,29 @@ object VonageClientHolder {
      * True when the Flutter app Activity is in the foreground (resumed/started).
      * Tracked via ProcessLifecycleOwner in VonageVoicePlugin.
      *
-     * Used by TVConnectionService.handleIncomingCall() to decide whether to
-     * launch the native IncomingCallActivity (background/killed/locked) or
-     * let Flutter handle the incoming call UI (foreground).
-     *
      * Key distinction from [isFlutterEngineAttached]:
-     *   - Engine attached + foreground → Flutter handles UI, skip native screen
+     *   - Engine attached + foreground → Flutter MAY handle UI (check isEventSinkAttached)
      *   - Engine attached + background → Native screen needed (Flutter can't show UI)
      *   - Engine detached → Native screen needed (app process killed/restarted)
      */
     @Volatile
     var isFlutterInForeground: Boolean = false
+
+    /**
+     * True when the Dart side is actively subscribed to the Vonage EventChannel
+     * (i.e., onListen() has been called and onCancel() has NOT been called).
+     *
+     * This is the authoritative signal that Flutter can actually receive call events.
+     * [isFlutterInForeground] alone is NOT sufficient — the Flutter Activity can be
+     * in the foreground while the EventChannel subscription is null (e.g. the user
+     * navigated to a screen that disposed the widget subscribing to the stream).
+     *
+     * Used in handleIncomingCall() to decide whether to show the native
+     * IncomingCallActivity: if Flutter is foreground BUT sink is detached, we
+     * MUST show the native screen or the call is completely invisible.
+     */
+    @Volatile
+    var isEventSinkAttached: Boolean = false
 
     /**
      * Timestamp (millis) of the last FCM push processed by the native

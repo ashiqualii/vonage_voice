@@ -416,23 +416,23 @@ if (call != null) {
 
 Incoming calls work differently on each platform:
 
-- **Android:** Vonage sends an FCM push → plugin picks it up → shows system call notification
+- **Android:** Vonage sends an FCM push → the plugin's native `VonageFirebaseMessagingService` picks it up automatically → shows system call notification / full-screen incoming call screen
 - **iOS:** Vonage sends a VoIP push via PushKit → plugin handles it → CallKit shows the native call screen
 
-### Forward Firebase Pushes (Android Only — Required)
+### Forward Firebase Pushes (iOS via Flutter — Required)
 
-Flutter's `firebase_messaging` intercepts FCM messages before the native Vonage SDK sees them. You need to forward them. Add **two handlers**:
-
-#### Background Handler (top-level function in `main.dart`)
+On **iOS**, Flutter's `firebase_messaging` intercepts FCM messages before the native Vonage SDK sees them. You need to forward them to the plugin:
 
 ```dart
+import 'dart:io';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:vonage_voice/vonage_voice.dart';
 
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  if (message.data.isNotEmpty) {
+  // Only forward on iOS — Android handles push natively
+  if (Platform.isIOS && message.data.isNotEmpty) {
     await VonageVoice.instance.processVonagePush(message.data);
   }
 }
@@ -445,23 +445,24 @@ Future<void> main() async {
 }
 ```
 
-#### Foreground Handler (in your main screen's `initState`)
+And the foreground handler (in your main screen's `initState`):
 
 ```dart
 @override
 void initState() {
   super.initState();
   FirebaseMessaging.onMessage.listen((RemoteMessage message) {
-    if (message.data.isNotEmpty) {
+    // Only forward on iOS — Android handles push natively
+    if (Platform.isIOS && message.data.isNotEmpty) {
       VonageVoice.instance.processVonagePush(message.data);
     }
   });
 }
 ```
 
-> **Why both?** The background handler runs when the app is closed/backgrounded. The foreground handler runs when the app is open. Without both, you'll miss calls in some situations.
+> **Android:** You do **not** need to forward FCM pushes on Android. The plugin's native `VonageFirebaseMessagingService` handles incoming call pushes automatically — even when the app is killed or backgrounded. Calling `processVonagePush()` on Android is unnecessary and the plugin will safely deduplicate if you do.
 >
-> **iOS:** You don't need any of this. The plugin handles VoIP pushes automatically through PushKit.
+> **iOS:** You need both the background handler (`onBackgroundMessage`) and the foreground handler (`onMessage`). The plugin handles VoIP pushes through PushKit, but FCM data messages still need forwarding.
 
 ### Listen for Incoming Calls
 
@@ -767,21 +768,29 @@ If set wrong, incoming calls won't work on iOS.
 
 1. **Push credentials not uploaded.** Go to [Vonage Dashboard](https://dashboard.nexmo.com/applications) → your app → Push Credentials. Upload FCM server key (Android) or VoIP `.p12` certificate (iOS).
 2. **Wrong `isSandbox` value (iOS).** Use `true` for debug builds, `false` for release. Mismatched value = no pushes delivered.
-3. **Firebase push not forwarded (Android).** Make sure both the background handler (`FirebaseMessaging.onBackgroundMessage`) and foreground handler (`FirebaseMessaging.onMessage`) are set up. See [Receiving Incoming Calls](#receiving-incoming-calls).
+3. **Firebase push not forwarded (iOS).** Make sure both the background handler (`FirebaseMessaging.onBackgroundMessage`) and foreground handler (`FirebaseMessaging.onMessage`) forward pushes to `processVonagePush()` with a `Platform.isIOS` guard. See [Receiving Incoming Calls](#receiving-incoming-calls). On Android, push handling is automatic — do **not** forward FCM pushes via Dart on Android.
 4. **Battery optimization killing the app (Android).** Manufacturers like Vivo, Xiaomi, OPPO, and Samsung aggressively kill background apps. Call `requestBatteryOptimizationExemption()` and tell users to disable battery optimization for your app in system settings.
+5. **Phone account not enabled (Android).** The plugin uses Android's Telecom framework with `CAPABILITY_SELF_MANAGED`. Call `registerPhoneAccount()` and verify with `isPhoneAccountEnabled()`. Some OEMs require the user to manually enable the phone account in Settings → Apps → Default Apps → Phone.
+6. **Notification permission not granted (Android 13+).** Call `requestNotificationPermission()` — without it, incoming call notifications (including full-screen intent) cannot be posted.
 
 ### No audio during calls
 
 - **Microphone permission not granted.** Call `requestMicAccess()` before placing or answering calls.
 - **Auto-reject is on.** If you enabled `rejectCallOnNoPermissions(shouldReject: true)`, calls will be auto-rejected when permissions are missing.
 
-### Full-screen call UI not showing (Android 14+)
-
-- Android 14 requires `USE_FULL_SCREEN_INTENT` permission. Call `canUseFullScreenIntent()` to check, and `openFullScreenIntentSettings()` to let the user grant it. Without it, incoming calls appear as a small notification instead of a full-screen UI.
-
 ### App killed on Chinese OEM devices
 
 - **Vivo, Xiaomi, OPPO** have aggressive battery management beyond stock Android. Besides calling `requestBatteryOptimizationExemption()`, users may also need to manually whitelist your app in the manufacturer's battery/power manager settings (e.g. iManager on Vivo).
+
+### Lock screen incoming call not showing (Xiaomi/Redmi/POCO)
+
+- **MIUI overlay permission required.** On MIUI devices, the incoming call screen may not appear over the lock screen without `SYSTEM_ALERT_WINDOW` (overlay) permission. The plugin automatically applies `TYPE_APPLICATION_OVERLAY` on locked MIUI devices when the permission is granted. Guide users to Settings → Apps → your app → Permissions → Display pop-up windows to enable it.
+
+### Lock screen incoming call shows as small notification instead of full-screen
+
+- **Android 14+ (API 34):** Grant `USE_FULL_SCREEN_INTENT` — call `canUseFullScreenIntent()` to check, `openFullScreenIntentSettings()` to prompt.
+- **Phone account not registered:** Call `registerPhoneAccount()` — the Telecom framework provides a BAL (Background Activity Launch) exemption that is the most reliable way to show activities on the lock screen.
+- **Notifications disabled:** On Android 13+, call `requestNotificationPermission()` — `fullScreenIntent` requires an active notification.
 
 ---
 
@@ -800,7 +809,7 @@ If set wrong, incoming calls won't work on iOS.
 | `callEventsListener` | `Stream<CallEvent>` | Both | Stream of all call events |
 | `setOnDeviceTokenChanged(callback)` | `void` | Both | Listen for FCM/VoIP token changes |
 | `showMissedCallNotifications` (setter) | `void` | Both | Enable or disable missed call notifications |
-| `processVonagePush(data)` | `Future<String?>` | Both | Forward FCM push data to Vonage SDK |
+| `processVonagePush(data)` | `Future<String?>` | iOS | Forward FCM push data to Vonage SDK (Android handles this natively — not needed) |
 | `registerClient(id, name)` | `Future<bool?>` | Both | Map a caller ID to a display name |
 | `unregisterClient(id)` | `Future<bool?>` | Both | Remove a caller ID mapping |
 | `setDefaultCallerName(name)` | `Future<bool?>` | Both | Set fallback name for unknown callers |

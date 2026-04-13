@@ -95,6 +95,18 @@ class MethodChannelVonageCall extends VonageCallPlatform {
         .then<bool>((bool? value) => value ?? false);
   }
 
+  /// Triggers native re-emission of the current call state after a terminated
+  /// process restart. Mirrors Twilio's `getActiveCallOnResumeFromTerminatedState`.
+  @override
+  Future<bool> getActiveCallOnResumeFromTerminatedState() {
+    return _channel
+        .invokeMethod<bool?>(
+          'getActiveCallOnResumeFromTerminatedState',
+          <String, dynamic>{},
+        )
+        .then<bool>((bool? value) => value ?? false);
+  }
+
   /// Returns the active Vonage call ID (session identifier).
   ///
   /// `null` until the first [CallEvent.ringing] event fires because

@@ -185,7 +185,15 @@ enum class VNMethodChannels(val methodName: String) {
     CAN_DRAW_OVERLAYS("canDrawOverlays"),
 
     /** Opens system settings for SYSTEM_ALERT_WINDOW permission. */
-    OPEN_OVERLAY_SETTINGS("openOverlaySettings");
+    OPEN_OVERLAY_SETTINGS("openOverlaySettings"),
+
+    /**
+     * Re-emits the current call state (pending invite or active connection)
+     * to Flutter after a terminated-state restart.
+     * Mirrors Twilio's `getActiveCallOnResumeFromTerminatedState`.
+     * Returns true if native has an active call.
+     */
+    GET_ACTIVE_CALL_ON_RESUME("getActiveCallOnResumeFromTerminatedState");
 
     companion object {
         /**

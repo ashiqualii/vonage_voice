@@ -1,17 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <!-- Full-screen dark theme for IncomingCallActivity -->
+    <!-- Full-screen dark theme for IncomingCallActivity.
+         Uses transparent background + windowDisablePreview to match Twilio's
+         proven lock-screen-compatible theme on Samsung A15 / Android 16. -->
     <style name="Theme.VonageIncomingCall" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionBar">false</item>
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowContentOverlay">@null</item>
-        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowDisablePreview">true</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowTranslucentStatus">true</item>
-        <item name="android:windowTranslucentNavigation">true</item>
     </style>
 
     <!-- Invisible transparent theme for AnswerCallTrampolineActivity -->

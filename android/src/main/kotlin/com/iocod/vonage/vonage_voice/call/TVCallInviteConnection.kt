@@ -5,6 +5,7 @@ import android.content.Intent
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.iocod.vonage.vonage_voice.IncomingCallActivity
 import com.iocod.vonage.vonage_voice.constants.Constants
 
 /**
@@ -72,6 +73,57 @@ class TVCallInviteConnection(
         setDisconnected(DisconnectCause(DisconnectCause.CANCELED))
         destroy()
         broadcastEvent(Constants.BROADCAST_CALL_INVITE_CANCELLED)
+    }
+
+    /**
+     * Called by the Telecom framework for SELF_MANAGED connections after
+     * [TelecomManager.addNewIncomingCall]. The system grants a Background
+     * Activity Launch (BAL) exemption during this callback, so we can
+     * safely call startActivity() to show IncomingCallActivity on the
+     * lock screen — no USE_FULL_SCREEN_INTENT or SYSTEM_ALERT_WINDOW needed.
+     *
+     * If IncomingCallActivity is already alive (placeholder from killed-app
+     * path), the singleInstance launch mode + FLAG_ACTIVITY_SINGLE_TOP
+     * delivers the real callId via onNewIntent() rather than creating a
+     * second instance. The broadcast-based upgrade (BROADCAST_REAL_CALL_READY)
+     * is the primary upgrade path; this is the secondary/fallback.
+     */
+    override fun onShowIncomingCallUi() {
+        val activityAlive = IncomingCallActivity.isActivityAlive
+        android.util.Log.d("TVCallInviteConnection",
+            "onShowIncomingCallUi: callId=$callId, from=$from, isActivityAlive=$activityAlive, " +
+            "pid=${android.os.Process.myPid()}")
+
+        if (activityAlive) {
+            // The notification's fullScreenIntent already launched the activity
+            // on the lock screen with proper keyguard exemption.  Calling
+            // startActivity() again from this service context on Samsung A15 /
+            // Android 16 would create the activity BEHIND the keyguard (user
+            // sees lock screen only).  Deliver callId via onNewIntent() instead.
+            android.util.Log.d("TVCallInviteConnection",
+                "onShowIncomingCallUi: activity already alive — delivering callId via onNewIntent()")
+            try {
+                val updateIntent = IncomingCallActivity.createIntent(context, callId, from)
+                updateIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                context.startActivity(updateIntent)
+            } catch (e: Exception) {
+                android.util.Log.e("TVCallInviteConnection",
+                    "onShowIncomingCallUi: failed to deliver onNewIntent: ${e.message}")
+            }
+            return
+        }
+
+        // Activity NOT alive — launch it.  This path is the fallback for
+        // devices where the notification's fullScreenIntent did NOT fire
+        // (e.g. fullScreenIntent permission revoked, DND blocking, etc.).
+        try {
+            val activityIntent = IncomingCallActivity.createIntent(context, callId, from)
+            activityIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(activityIntent)
+        } catch (e: Exception) {
+            android.util.Log.e("TVCallInviteConnection",
+                "onShowIncomingCallUi: failed to launch IncomingCallActivity: ${e.message}")
+        }
     }
 
     // ── Public control methods ────────────────────────────────────────────

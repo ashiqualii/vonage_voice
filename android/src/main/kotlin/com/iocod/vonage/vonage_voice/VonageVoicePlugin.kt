@@ -17,6 +17,7 @@ import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.constants.FlutterErrorCodes
+import com.iocod.vonage.vonage_voice.fcm.VonageFirebaseMessagingService
 import com.iocod.vonage.vonage_voice.receivers.TVBroadcastReceiver
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
@@ -94,6 +95,14 @@ class VonageVoicePlugin :
     /** Local mute state — Vonage SDK has no getMuteState() so we track it here. */
     private var isMuted: Boolean = false
 
+    /** Dedup guard for BROADCAST_CALL_INVITE — prevents duplicate Incoming events. */
+    private var lastBroadcastCallId: String? = null
+    private var lastBroadcastTimeMs: Long = 0L
+
+    /** Dedup guard for setCallInviteListener — prevents double-fire when SDK accumulates listeners. */
+    private var lastInviteCallId: String? = null
+    private var lastInviteTimeMs: Long = 0L
+
     // ── Permission request tracking ───────────────────────────────────────
 
     private val permissionResultHandlers = HashMap<Int, (Boolean) -> Unit>()
@@ -101,6 +110,14 @@ class VonageVoicePlugin :
 
     /** Pending re-emit runnables — cancelled in onCancel() to prevent stale emissions. */
     private val pendingReEmitRunnables = mutableListOf<Runnable>()
+
+    /**
+     * Critical call-state events queued while [eventSink] is null.
+     * Flushed in [onListen] the moment Flutter re-subscribes.
+     * Mirrors the Twilio plugin's [pendingEvents] pattern.
+     * Thread-safe: access is synchronized on this list.
+     */
+    private val pendingCallEvents = mutableListOf<String>()
 
     companion object {
         private const val REQUEST_CODE_MIC         = 1001
@@ -135,6 +152,17 @@ class VonageVoicePlugin :
         context = binding.applicationContext
         storage = StorageImpl(binding.applicationContext)
 
+        // ── Idempotent cleanup: remove any leftover from a previous attach ──
+        // Handles hot restart and engine re-attach without a preceding detach,
+        // which causes duplicate lifecycle callbacks ("App moved to FOREGROUND"
+        // logged twice per transition) and duplicate broadcast handling.
+        try {
+            ProcessLifecycleOwner.get().lifecycle.removeObserver(appLifecycleObserver)
+        } catch (_: Exception) {}
+        broadcastReceiver?.let {
+            try { it.unregister(binding.applicationContext) } catch (_: Exception) {}
+        }
+
         // Register MethodChannel
         methodChannel = MethodChannel(binding.binaryMessenger, "vonage_voice/messages")
         methodChannel!!.setMethodCallHandler(this)
@@ -155,6 +183,7 @@ class VonageVoicePlugin :
         // (app killed → FCM → user taps notification → engine starts)
         // will re-emit the pending call state to Flutter.
         pendingCallReEmitted = null
+        synchronized(pendingCallEvents) { pendingCallEvents.clear() }
 
         // Track app foreground/background state so TVConnectionService
         // knows whether to show the native IncomingCallActivity (background)
@@ -219,7 +248,36 @@ class VonageVoicePlugin :
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
+        VonageClientHolder.isEventSinkAttached = (events != null)
         android.util.Log.d("VonagePlugin", "onListen — EventSink attached, scheduling reEmitPendingCallState")
+
+        // Flush any call-state events that arrived while the EventSink was null.
+        // Mirrors the Twilio plugin's pendingEvents flush-on-onListen pattern.
+        if (events != null) {
+            val toFlush: List<String>
+            synchronized(pendingCallEvents) {
+                toFlush = pendingCallEvents.toList()
+                pendingCallEvents.clear()
+            }
+            if (toFlush.isNotEmpty()) {
+                android.util.Log.d("VonagePlugin", "onListen: flushing ${toFlush.size} queued event(s) to Flutter")
+                for (queued in toFlush) {
+                    // Drop stale Incoming events if the invite is no longer valid —
+                    // prevents showing a ringing screen for a call the user already missed.
+                    // An Incoming event is only valid if the invite is still in pendingInvites
+                    // OR there's an active connection (already answered natively).
+                    if (queued.startsWith("Incoming") &&
+                        TVConnectionService.pendingInvites.isEmpty() &&
+                        TVConnectionService.activeConnections.isEmpty()) {
+                        android.util.Log.d("VonagePlugin",
+                            "onListen: dropping stale Incoming event — no pending invite or active connection")
+                        continue
+                    }
+                    android.util.Log.d("VonagePlugin", "onListen: flushed queued event: $queued")
+                    events.success(queued)
+                }
+            }
+        }
 
         // Cancel any leftover runnables from a previous subscription
         cancelPendingReEmitRunnables()
@@ -244,6 +302,7 @@ class VonageVoicePlugin :
     override fun onCancel(arguments: Any?) {
         cancelPendingReEmitRunnables()
         eventSink = null
+        VonageClientHolder.isEventSinkAttached = false
     }
 
     /** Cancel all pending re-emit runnables to prevent stale emissions. */
@@ -308,6 +367,67 @@ class VonageVoicePlugin :
             emitEvent(VNNativeCallEvents.incomingCallEvent(from, invite.to))
             return
         }
+
+        // Case 0: SharedPreferences cross-process fallback (Twilio pattern).
+        // Fires when the OS killed the process between FCM delivery and the
+        // user tapping the notification — pendingInvites is empty in the new
+        // process, but SharedPreferences survived across the process boundary.
+        // We re-emit Incoming so Flutter shows the ringing screen, then call
+        // tryReprocessPendingFcm() to rebuild the Vonage SDK invite so
+        // that answer() will actually work.
+        val ctx = context ?: return
+        try {
+            val prefs = ctx.getSharedPreferences(
+                TVConnectionService.PREFS_PENDING_CALL, Context.MODE_PRIVATE)
+            val savedCallId   = prefs.getString(TVConnectionService.KEY_PENDING_CALL_ID, null)
+            val savedFrom     = prefs.getString(TVConnectionService.KEY_PENDING_CALL_FROM, null)
+            val savedTo       = prefs.getString(TVConnectionService.KEY_PENDING_CALL_TO, "") ?: ""
+            val savedTimestamp = prefs.getLong(TVConnectionService.KEY_PENDING_CALL_TIMESTAMP, 0)
+
+            if (!savedCallId.isNullOrEmpty() && !savedFrom.isNullOrEmpty()) {
+                val elapsed = System.currentTimeMillis() - savedTimestamp
+                if (elapsed < TVConnectionService.PENDING_CALL_TTL_MS) {
+                    if (pendingCallReEmitted == "incoming_$savedCallId") return
+                    pendingCallReEmitted = "incoming_$savedCallId"
+                    activeCallId = savedCallId
+                    val displayFrom = resolveCallerName(savedFrom)
+                    android.util.Log.d("VonagePlugin",
+                        "reEmit: Incoming from SharedPreferences fallback — callId=$savedCallId, from=$displayFrom (age=${elapsed}ms)")
+                    emitEvent(VNNativeCallEvents.incomingCallEvent(displayFrom, savedTo))
+                    // Re-process the raw FCM push so the Vonage SDK registers
+                    // the invite and client.answer(callId) will succeed.
+                    tryReprocessPendingFcm(retriesLeft = 5)
+                } else {
+                    android.util.Log.d("VonagePlugin",
+                        "reEmit: SharedPreferences entry expired (age=${elapsed}ms) — clearing")
+                    TVConnectionService.clearPendingCallData(ctx)
+                    VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                }
+            } else {
+                // vonage_pending_call is empty — this is the killed-process scenario where
+                // FCM arrived but processPushCallInvite never completed (so handleIncomingCall()
+                // never wrote to vonage_pending_call). Check vonage_pending_fcm directly for
+                // raw FCM data and trigger session restore + re-processing.
+                val fcmPrefs = ctx.getSharedPreferences(
+                    VonageFirebaseMessagingService.PREFS_PENDING_FCM, Context.MODE_PRIVATE)
+                val nexmoRaw = fcmPrefs.getString(VonageFirebaseMessagingService.KEY_NEXMO_RAW, null)
+                val fcmTimestamp = fcmPrefs.getLong(VonageFirebaseMessagingService.KEY_FCM_TIMESTAMP, 0)
+                if (!nexmoRaw.isNullOrEmpty()) {
+                    val fcmAge = System.currentTimeMillis() - fcmTimestamp
+                    if (fcmAge < VonageFirebaseMessagingService.PENDING_FCM_TTL_MS) {
+                        android.util.Log.d("VonagePlugin",
+                            "reEmit: vonage_pending_call empty but FCM data exists (age=${fcmAge}ms) — triggering tryReprocessPendingFcm")
+                        tryReprocessPendingFcm(retriesLeft = 10)
+                    } else {
+                        android.util.Log.d("VonagePlugin",
+                            "reEmit: FCM data expired (age=${fcmAge}ms) — clearing")
+                        VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("VonagePlugin", "reEmitPendingCallState: SharedPreferences check failed: ${e.message}")
+        }
     }
 
     // ── MethodChannel dispatcher ──────────────────────────────────────────
@@ -349,6 +469,16 @@ class VonageVoicePlugin :
             // ── Call state queries ────────────────────────────────────────
             VNMethodChannels.IS_ON_CALL -> result.success(TVConnectionService.hasActiveCall())
             VNMethodChannels.CALL_SID -> result.success(activeCallId)
+
+            // ── Terminated-state recovery (mirrors Twilio's GetActiveCallOnResumeFromTerminatedState) ───
+            // Dart bloc calls this on startup to trigger a re-emit of the current call state.
+            // Resets pendingCallReEmitted so reEmitPendingCallState() always fires fresh.
+            VNMethodChannels.GET_ACTIVE_CALL_ON_RESUME -> {
+                android.util.Log.d("VonagePlugin", "getActiveCallOnResumeFromTerminatedState — triggering reEmitPendingCallState")
+                pendingCallReEmitted = null
+                reEmitPendingCallState()
+                result.success(TVConnectionService.hasActiveCall())
+            }
 
             // ── Caller identity registry ──────────────────────────────────
             VNMethodChannels.REGISTER_CLIENT -> handleRegisterClient(call, result)
@@ -568,6 +698,13 @@ class VonageVoicePlugin :
             } else {
                 android.util.Log.w("VonagePlugin", "⚠ No FCM token provided — Vonage will NOT send incoming call pushes!")
             }
+
+            // ── Cross-process invite recovery ─────────────────────────────
+            // If the OS killed the process while a background call was ringing
+            // (MIUI/aggressive OEMs), the Vonage SDK lost the invite. Now that
+            // the session is ready, re-process the stored FCM nexmo payload so
+            // client.answer() works when the user taps Answer on the ringing screen.
+            tryReprocessPendingFcm(retriesLeft = 3)
 
             result.success(true)
         }
@@ -1742,6 +1879,16 @@ class VonageVoicePlugin :
                 val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
                 val from = resolveCallerName(intent.getStringExtra(Constants.EXTRA_CALL_FROM) ?: "")
                 val to = intent.getStringExtra(Constants.EXTRA_CALL_TO) ?: ""
+                // Dedup: ignore if same callId seen within 5 seconds (prevents double-emit
+                // when BROADCAST fires from both FCM service and ConnectionService paths).
+                val now = System.currentTimeMillis()
+                if (callId == lastBroadcastCallId && (now - lastBroadcastTimeMs) < 5_000L) {
+                    android.util.Log.d("VonagePlugin",
+                        "BROADCAST_CALL_INVITE duplicate suppressed — callId=$callId")
+                    return
+                }
+                lastBroadcastCallId = callId
+                lastBroadcastTimeMs = now
                 activeCallId = callId
                 val event = VNNativeCallEvents.incomingCallEvent(from, to)
                 android.util.Log.d("VonagePlugin", "BROADCAST_CALL_INVITE -- callId: $callId, from: $from, to: $to")
@@ -1813,7 +1960,11 @@ class VonageVoicePlugin :
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
 
                 if (needsInviteListenerRegistration) {
-                    registerInviteListeners()
+                    // Re-register all voice client listeners (not just invite listeners).
+                    // Using registerVoiceClientListeners() ensures setCallInviteListener
+                    // replaces any existing listener rather than potentially accumulating
+                    // a second one (which would cause INCOMING CALL to fire twice).
+                    registerVoiceClientListeners()
                 }
             }
 
@@ -1924,6 +2075,16 @@ class VonageVoicePlugin :
         } else {
             // ── Incoming call invite ──────────────────────────────────────────
             client.setCallInviteListener { callId, from, channelType ->
+                // Dedup: guard against the SDK firing this callback twice for the
+                // same call (can happen if setCallInviteListener accumulates rather
+                // than replaces when called multiple times during a session).
+                val nowInvite = System.currentTimeMillis()
+                if (callId == lastInviteCallId && (nowInvite - lastInviteTimeMs) < 5_000L) {
+                    android.util.Log.d("VonagePlugin", "setCallInviteListener duplicate suppressed — callId=$callId")
+                    return@setCallInviteListener
+                }
+                lastInviteCallId = callId
+                lastInviteTimeMs = nowInvite
                 // Prefer the display name extracted from the push payload
                 // (set by handleProcessPush or VonageFirebaseMessagingService).
                 val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
@@ -2044,6 +2205,13 @@ class VonageVoicePlugin :
         android.util.Log.d("VonagePlugin", "registerInviteListeners — re-registering invite listeners after native call ended")
 
         client.setCallInviteListener { callId, from, channelType ->
+            val nowInvite = System.currentTimeMillis()
+            if (callId == lastInviteCallId && (nowInvite - lastInviteTimeMs) < 5_000L) {
+                android.util.Log.d("VonagePlugin", "setCallInviteListener duplicate suppressed — callId=$callId")
+                return@setCallInviteListener
+            }
+            lastInviteCallId = callId
+            lastInviteTimeMs = nowInvite
             val displayFrom = VonageClientHolder.pendingCallerDisplay ?: from
             VonageClientHolder.pendingCallerDisplay = null
             android.util.Log.d("VonagePlugin", "INCOMING CALL -- callId: $callId, from: $from, display: $displayFrom")
@@ -2070,16 +2238,133 @@ class VonageVoicePlugin :
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
+     * Re-process a previously persisted FCM nexmo push payload through the
+     * Vonage SDK to rebuild the call invite in the new process.
+     *
+     * This is the cross-process recovery step that mirrors Twilio's SharedPreferences
+     * pattern. Without it, emitting "Incoming" to Flutter shows the ringing screen
+     * but client.answer(callId) would fail because the Vonage SDK has no record of
+     * the invite in the new process — the raw nexmo data is needed to restore it.
+     *
+     * Called from [reEmitPendingCallState] Case 0 (SharedPreferences fallback)
+     * and from the session-ready callback in [handleTokens] so the invite is
+     * always re-processed before the user can tap Answer.
+     */
+    private fun tryReprocessPendingFcm(retriesLeft: Int = 5) {
+        val ctx = context ?: return
+        try {
+            val fcmPrefs = ctx.getSharedPreferences(
+                VonageFirebaseMessagingService.PREFS_PENDING_FCM, Context.MODE_PRIVATE)
+            val nexmoRaw  = fcmPrefs.getString(VonageFirebaseMessagingService.KEY_NEXMO_RAW, null)
+            val timestamp = fcmPrefs.getLong(VonageFirebaseMessagingService.KEY_FCM_TIMESTAMP, 0)
+
+            if (nexmoRaw.isNullOrEmpty()) {
+                android.util.Log.d("VonagePlugin", "tryReprocessPendingFcm: no stored FCM data — nothing to re-process")
+                return
+            }
+
+            val elapsed = System.currentTimeMillis() - timestamp
+            if (elapsed >= VonageFirebaseMessagingService.PENDING_FCM_TTL_MS) {
+                android.util.Log.d("VonagePlugin",
+                    "tryReprocessPendingFcm: FCM data expired (age=${elapsed}ms) — clearing")
+                VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                TVConnectionService.clearPendingCallData(ctx)
+                return
+            }
+
+            val client = VonageClientHolder.voiceClient
+            if (client == null || !VonageClientHolder.isSessionReady) {
+                if (retriesLeft > 0) {
+                    android.util.Log.d("VonagePlugin",
+                        "tryReprocessPendingFcm: client/session not ready — retrying in 1s (retriesLeft=$retriesLeft)")
+                    mainHandler.postDelayed({ tryReprocessPendingFcm(retriesLeft - 1) }, 1000)
+                } else {
+                    android.util.Log.w("VonagePlugin",
+                        "tryReprocessPendingFcm: gave up waiting for client/session after retries")
+                }
+                return
+            }
+
+            // Check if invite already exists in pendingInvites — skip re-processing
+            if (TVConnectionService.pendingInvites.isNotEmpty()) {
+                android.util.Log.d("VonagePlugin",
+                    "tryReprocessPendingFcm: pendingInvites already populated — skipping re-process")
+                VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                return
+            }
+
+            // Reconstruct the dataString in the format expected by the Vonage SDK:
+            // It calls extractJsonFromPushData which does substringAfter("nexmo=").dropLast(1).
+            // The stored nexmoRaw is the raw JSON value. We must wrap it: {nexmo=<json>}
+            val dataString = "{nexmo=$nexmoRaw}"
+            android.util.Log.d("VonagePlugin",
+                "tryReprocessPendingFcm: re-calling processPushCallInvite (age=${elapsed}ms)")
+
+            val callId = client.processPushCallInvite(dataString)
+            android.util.Log.d("VonagePlugin",
+                "tryReprocessPendingFcm: processPushCallInvite returned callId=$callId")
+
+            if (!callId.isNullOrEmpty()) {
+                // Update activeCallId so answer() uses the correct callId
+                activeCallId = callId
+                android.util.Log.d("VonagePlugin",
+                    "tryReprocessPendingFcm: ✓ invite re-processed, activeCallId=$callId")
+                // Clear FCM prefs — successfully re-processed
+                VonageFirebaseMessagingService.clearPendingFcmData(ctx)
+                // Schedule fresh re-emit runnables so Flutter is notified even if
+                // the EventSink was null during the MPIN→main navigation gap.
+                // Reset dedup guard so reEmitPendingCallState() fires unconditionally.
+                pendingCallReEmitted = null
+                val handler = Handler(Looper.getMainLooper())
+                for (delay in longArrayOf(200, 700, 1800, 3500)) {
+                    val r = Runnable { if (eventSink != null) reEmitPendingCallState() }
+                    pendingReEmitRunnables.add(r)
+                    handler.postDelayed(r, delay)
+                }
+                android.util.Log.d("VonagePlugin",
+                    "tryReprocessPendingFcm: scheduled 4 re-emit runnables (200/700/1800/3500ms)")
+            } else {
+                android.util.Log.w("VonagePlugin",
+                    "tryReprocessPendingFcm: processPushCallInvite returned null callId")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("VonagePlugin", "tryReprocessPendingFcm: exception: ${e.message}", e)
+        }
+    }
+
+    /**
      * Emit a pipe-delimited string event to Flutter via the EventChannel.
      * Must be called on the main thread — Flutter channels are not thread-safe.
      */
+    /**
+     * Returns true if [event] is a critical call-state event that must
+     * be queued when [eventSink] is null, so Flutter receives it on the
+     * next subscription. Audio-only events (mute, speaker, bluetooth) are
+     * not queued — they are stale by the time Flutter re-subscribes.
+     */
+    private fun isCriticalCallEvent(event: String): Boolean =
+        event.startsWith("Incoming") ||
+        event.startsWith("Ringing") ||
+        event.startsWith("Connected") ||
+        event == VNNativeCallEvents.EVENT_CALL_ENDED ||
+        event == VNNativeCallEvents.EVENT_MISSED_CALL ||
+        event.startsWith("Declined")
+
     private fun emitEvent(event: String) {
         mainHandler.post {
-            if (eventSink == null) {
-                android.util.Log.w("VonagePlugin", "emitEvent: eventSink is NULL -- event lost: $event")
+            val sink = eventSink
+            if (sink == null) {
+                if (isCriticalCallEvent(event)) {
+                    // Queue the event — Flutter will receive it when it re-subscribes.
+                    // Mirrors the Twilio plugin's pendingEvents pattern.
+                    synchronized(pendingCallEvents) { pendingCallEvents.add(event) }
+                    android.util.Log.d("VonagePlugin", "emitEvent: queued (sink null): $event")
+                } else {
+                    android.util.Log.w("VonagePlugin", "emitEvent: eventSink is NULL -- event lost: $event")
+                }
             } else {
                 android.util.Log.d("VonagePlugin", "emitEvent: $event")
-                eventSink?.success(event)
+                sink.success(event)
             }
         }
     }

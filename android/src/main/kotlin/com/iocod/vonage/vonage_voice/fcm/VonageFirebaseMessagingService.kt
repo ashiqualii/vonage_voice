@@ -2,12 +2,15 @@ package com.iocod.vonage.vonage_voice.fcm
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
 import android.telecom.TelecomManager
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import com.iocod.vonage.vonage_voice.IncomingCallActivity
 import com.iocod.vonage.vonage_voice.constants.Constants
 import com.iocod.vonage.vonage_voice.service.TVConnectionService
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
@@ -47,6 +50,19 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
 
     private lateinit var broadcastManager: LocalBroadcastManager
 
+    /**
+     * Ensure broadcastManager is initialised. When this service is
+     * instantiated directly by FCM, onCreate() runs and sets the field.
+     * However, when EasifyFirebaseMessagingService delegates via
+     * reflection, onCreate() is NEVER called — so we lazily init here
+     * to avoid UninitializedPropertyAccessException on error paths.
+     */
+    private fun ensureBroadcastManager() {
+        if (!::broadcastManager.isInitialized) {
+            broadcastManager = LocalBroadcastManager.getInstance(applicationContext)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
@@ -66,6 +82,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
      */
     override fun onNewToken(token: String) {
         super.onNewToken(token)
+        ensureBroadcastManager()
 
         val intent = Intent(Constants.BROADCAST_NEW_FCM_TOKEN).apply {
             putExtra(Constants.EXTRA_FCM_DATA, token)
@@ -88,6 +105,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
      */
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
         super.onMessageReceived(remoteMessage)
+        ensureBroadcastManager()
         android.util.Log.i("VonageFCM", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         android.util.Log.i("VonageFCM", "[FCM-1] onMessageReceived — keys=${remoteMessage.data.keys}")
 
@@ -153,36 +171,22 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             VonageClientHolder.pendingCallerDisplay = callerDisplay
         }
 
-        // ── START FOREGROUND SERVICE IMMEDIATELY ──────────────────────────
-        // On Android 12+ (API 31), apps have a very short window after
-        // onMessageReceived() to call startForegroundService(). The Vonage
-        // SDK processes the push asynchronously, so the setCallInviteListener
-        // callback may fire AFTER the window closes — causing
-        // ForegroundServiceStartNotAllowedException on stock Android or
-        // the service simply never starting on aggressive OEMs like Vivo.
-        //
-        // Fix: start the service NOW with a placeholder intent (no callId).
-        // ensureForeground() in TVConnectionService shows a "Processing
-        // incoming call…" notification immediately. When processPushCallInvite
-        // fires the invite listener, a second intent with real callId is sent
-        // and the notification is updated with caller details.
+        // ── Persist FCM nexmo data to SharedPreferences ───────────────────
+        // Twilio mirrors this pattern: store push data BEFORE processing so the
+        // plugin can re-process the invite if the OS kills the process between
+        // FCM delivery and the user tapping Answer (MIUI, vivo, aggressive OEMs).
+        // commit() (synchronous) guarantees the write survives a sudden kill.
         try {
-            val placeholderIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
-                action = Constants.ACTION_INCOMING_CALL
-                // No EXTRA_CALL_ID — handleIncomingCall will skip creating a
-                // pendingInvite, but ensureForeground() already showed the notification.
-                putExtra(Constants.EXTRA_CALL_FROM, callerDisplay ?: "Incoming Call")
-                putExtra(Constants.EXTRA_CALL_TO, "")
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                android.util.Log.i("VonageFCM", "[FCM-3] Starting placeholder foreground service immediately")
-                applicationContext.startForegroundService(placeholderIntent)
-            } else {
-                applicationContext.startService(placeholderIntent)
-            }
-            android.util.Log.i("VonageFCM", "[FCM-3] ✓ Placeholder foreground service started")
+            val fcmPrefs = applicationContext.getSharedPreferences(
+                PREFS_PENDING_FCM, android.content.Context.MODE_PRIVATE)
+            fcmPrefs.edit()
+                .putString(KEY_NEXMO_RAW, nexmoRaw)
+                .putString(KEY_CALLER_DISPLAY, callerDisplay ?: "")
+                .putLong(KEY_FCM_TIMESTAMP, System.currentTimeMillis())
+                .commit()
+            android.util.Log.d("VonageFCM", "[FCM-2] ✓ Persisted nexmo FCM data to SharedPreferences")
         } catch (e: Exception) {
-            android.util.Log.e("VonageFCM", "[FCM-3] ✗ Failed to start placeholder foreground service: ${e.message}", e)
+            android.util.Log.w("VonageFCM", "[FCM-2] Failed to persist FCM data: ${e.message}")
         }
 
         var client = VonageClientHolder.voiceClient
@@ -191,6 +195,38 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         // created the VoiceClient but its async createSession hasn't completed yet.
         val clientWasNull = client == null || !VonageClientHolder.isSessionReady
         android.util.Log.i("VonageFCM", "[FCM-4] Client state: voiceClient=${if (client != null) "set" else "null"}, isSessionReady=${VonageClientHolder.isSessionReady}, clientWasNull=$clientWasNull")
+
+        // ── START PLACEHOLDER ONLY FOR THE ASYNC RECOVERY PATH ───────────
+        // Twilio can start its service with the real invite immediately because
+        // the FCM callback already has a materialized CallInvite object.
+        // Vonage only knows the real callId after processPushCallInvite()
+        // finishes. We therefore keep the placeholder only when the client/session
+        // is not ready yet (killed app, reboot, boot-race). In the already-alive
+        // path we skip the placeholder entirely and wait for the real incoming
+        // call intent so the user does not see a transient placeholder UI.
+        if (clientWasNull) {
+            try {
+                val placeholderIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_INCOMING_CALL
+                    // No EXTRA_CALL_ID — handleIncomingCall will skip creating a
+                    // pendingInvite, but ensureForeground() already showed the notification.
+                    putExtra(Constants.EXTRA_CALL_FROM, callerDisplay ?: "Incoming Call")
+                    putExtra(Constants.EXTRA_CALL_TO, "")
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    android.util.Log.i("VonageFCM", "[FCM-3] Starting placeholder foreground service (client/session not ready)")
+                    applicationContext.startForegroundService(placeholderIntent)
+                } else {
+                    applicationContext.startService(placeholderIntent)
+                }
+                android.util.Log.i("VonageFCM", "[FCM-3] ✓ Placeholder foreground service started")
+            } catch (e: Exception) {
+                android.util.Log.e("VonageFCM", "[FCM-3] ✗ Failed to start placeholder foreground service: ${e.message}", e)
+            }
+        } else {
+            android.util.Log.i("VonageFCM", "[FCM-3] Skipping placeholder — client/session already ready, waiting for real callId")
+        }
+
         if (client == null) {
             android.util.Log.i("VonageFCM", "[FCM-4] Creating new VoiceClient (boot/killed path)")
             client = VoiceClient(applicationContext)
@@ -360,8 +396,46 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         wakeLock: PowerManager.WakeLock?,
         retriesLeft: Int
     ) {
+        // ── Diagnostic: network + doze state before createSession ────────
+        val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val isNetworkAvailable: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        } else {
+            @Suppress("DEPRECATION")
+            cm?.activeNetworkInfo?.isConnectedOrConnecting == true
+        }
+        val pm2 = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val isDoze = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) pm2.isDeviceIdleMode else false
+        val isScreenOn = pm2.isInteractive
+        android.util.Log.i("VonageFCM",
+            "[FCM-5a] Pre-createSession: thread=${Thread.currentThread().name}, " +
+            "networkAvailable=$isNetworkAvailable, dozeMode=$isDoze, screenOn=$isScreenOn, " +
+            "jwtLength=${jwt.length}, retriesLeft=$retriesLeft")
+
+        // ── Timeout watchdog ─────────────────────────────────────────────
+        // If createSession callback never fires (network blocked, doze, SDK hang),
+        // log a warning after 20 seconds to capture the exact failure mode.
+        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val watchdog = Runnable {
+            if (!callbackFired.get()) {
+                val pm3 = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val dozeNow = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) pm3.isDeviceIdleMode else false
+                android.util.Log.e("VonageFCM",
+                    "[FCM-5a] ⚠️ WATCHDOG: createSession callback did NOT fire after 20s! " +
+                    "networkWas=$isNetworkAvailable, dozeWas=$isDoze, dozeNow=$dozeNow, " +
+                    "isSessionReady=${VonageClientHolder.isSessionReady}, inviteHandled=${inviteHandledDirectly.get()}")
+            }
+        }
+        watchdogHandler.postDelayed(watchdog, 20_000L)
+
         android.util.Log.i("VonageFCM", "[FCM-5a] Calling createSession (retriesLeft=$retriesLeft)...")
         client.createSession(jwt) { error, sessionId ->
+            callbackFired.set(true)
+            watchdogHandler.removeCallbacks(watchdog)
+            android.util.Log.i("VonageFCM",
+                "[FCM-5a] createSession callback fired on thread=${Thread.currentThread().name}")
             if (error != null) {
                 android.util.Log.e("VonageFCM", "[FCM-5a] ✗ createSession failed (retriesLeft=$retriesLeft): ${error.message}")
                 if (retriesLeft > 0) {
@@ -380,6 +454,7 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                 processInviteAndNotify(client, dataString, callerDisplay, clientWasNull, inviteHandledDirectly, wakeLock)
             }
         }
+        android.util.Log.d("VonageFCM", "[FCM-5a] createSession registered (async) — waiting for callback...")
     }
 
     private fun processInviteAndNotify(
@@ -390,17 +465,21 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         inviteHandledDirectly: java.util.concurrent.atomic.AtomicBoolean,
         wakeLock: PowerManager.WakeLock?
     ) {
-        android.util.Log.i("VonageFCM", "[FCM-6] Calling processPushCallInvite...")
+        android.util.Log.i("VonageFCM", "[FCM-6] Calling processPushCallInvite... " +
+            "clientWasNull=$clientWasNull, inviteHandled=${inviteHandledDirectly.get()}, " +
+            "isSessionReady=${VonageClientHolder.isSessionReady}, " +
+            "isActivityAlive=${IncomingCallActivity.isActivityAlive}")
         try {
             val callId = client.processPushCallInvite(dataString)
-            android.util.Log.i("VonageFCM", "[FCM-6] processPushCallInvite returned: $callId")
+            android.util.Log.i("VonageFCM", "[FCM-6] processPushCallInvite returned: callId=$callId")
             if (!callId.isNullOrEmpty()) {
-                android.util.Log.d("VonageFCM", "Incoming call processed with callId: $callId")
+                android.util.Log.d("VonageFCM", "[FCM-6] Incoming call processed with callId: $callId")
 
                 if (clientWasNull && inviteHandledDirectly.compareAndSet(false, true)) {
                     val displayFrom = VonageClientHolder.pendingCallerDisplay ?: callerDisplay ?: "Unknown"
                     VonageClientHolder.pendingCallerDisplay = null
 
+                    android.util.Log.i("VonageFCM", "[FCM-7] Sending real incoming call intent: callId=$callId, from=$displayFrom")
                     val realIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
                         action = Constants.ACTION_INCOMING_CALL
                         putExtra(Constants.EXTRA_CALL_ID, callId)
@@ -409,16 +488,17 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                     }
                     try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            android.util.Log.i("VonageFCM", "[FCM-7] ✓ Sending real incoming call intent: callId=$callId, from=$displayFrom")
                             applicationContext.startForegroundService(realIntent)
                         } else {
                             applicationContext.startService(realIntent)
                         }
-                        android.util.Log.i("VonageFCM", "[FCM-7] ✓ Incoming call intent sent — notification + ringtone should appear")
+                        android.util.Log.i("VonageFCM", "[FCM-7] ✓ Real incoming call intent sent — handleIncomingCall will add to Telecom + notify + ring")
                         android.util.Log.i("VonageFCM", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                     } catch (e: Exception) {
                         android.util.Log.e("VonageFCM", "[FCM-7] ✗ Error sending real incoming call intent: ${e.message}", e)
                     }
+                } else {
+                    android.util.Log.d("VonageFCM", "[FCM-6] inviteHandledDirectly already set — listener path handled it")
                 }
             } else {
                 android.util.Log.i("VonageFCM", "[FCM-6] processPushCallInvite returned null — waiting for setCallInviteListener to fire")
@@ -494,14 +574,16 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
     private fun acquireProcessingWakeLock(): PowerManager.WakeLock? {
         return try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            pm.newWakeLock(
+            val lock = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "VonageVoice:FCMProcessing"
             ).apply {
                 acquire(30_000L) // 30s timeout safety net
             }
+            android.util.Log.d("VonageFCM", "[WAKELOCK] ✓ PARTIAL_WAKE_LOCK acquired (30s timeout)")
+            lock
         } catch (e: Exception) {
-            android.util.Log.e("VonageFCM", "Failed to acquire WakeLock: ${e.message}")
+            android.util.Log.e("VonageFCM", "[WAKELOCK] ✗ Failed to acquire WakeLock: ${e.message}")
             null
         }
     }
@@ -544,6 +626,27 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         } catch (e: Exception) {
             android.util.Log.w("VonageFCM", "isDeviceInSystemCall: ${e.message}")
             false
+        }
+    }
+
+    companion object {
+        /** SharedPreferences file that stores the raw nexmo FCM payload for cross-process recovery. */
+        const val PREFS_PENDING_FCM   = "vonage_pending_fcm"
+        const val KEY_NEXMO_RAW       = "nexmo_raw"
+        const val KEY_CALLER_DISPLAY  = "caller_display"
+        const val KEY_FCM_TIMESTAMP   = "fcm_timestamp"
+        /** Maximum age (ms) for a stored FCM payload to be considered valid for re-processing. */
+        const val PENDING_FCM_TTL_MS  = 120_000L
+
+        /** Clear the persisted FCM data — called after the invite is successfully re-processed. */
+        fun clearPendingFcmData(context: android.content.Context) {
+            try {
+                context.getSharedPreferences(PREFS_PENDING_FCM, android.content.Context.MODE_PRIVATE)
+                    .edit().clear().commit()
+                android.util.Log.d("VonageFCM", "clearPendingFcmData: SharedPreferences cleared")
+            } catch (e: Exception) {
+                android.util.Log.w("VonageFCM", "clearPendingFcmData failed: ${e.message}")
+            }
         }
     }
 }

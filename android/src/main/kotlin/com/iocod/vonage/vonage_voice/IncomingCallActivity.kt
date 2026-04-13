@@ -129,9 +129,35 @@ class IncomingCallActivity : AppCompatActivity() {
     @Volatile
     private var callHandled = false
 
-    // Receiver to detect when the call is cancelled/ended/answered externally
+    // Receiver to detect when the call is cancelled/ended/answered externally,
+    // AND when the real callId arrives (placeholder → real upgrade).
     private val callEndedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Constants.BROADCAST_REAL_CALL_READY -> {
+                    // ── Placeholder → Real mode upgrade via broadcast ──────────
+                    // This is the primary upgrade path for the killed-app scenario.
+                    // TVConnectionService sends this as soon as it has a real callId.
+                    // Unlike onNewIntent(), this does NOT depend on a fullScreenIntent
+                    // re-trigger which Samsung/Xiaomi devices may suppress.
+                    val realCallId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+                    if (isPlaceholderMode && realCallId.isNotEmpty()) {
+                        Log.d(TAG, "BROADCAST_REAL_CALL_READY: Upgrading placeholder → real, callId=$realCallId")
+                        callId = realCallId
+                        isPlaceholderMode = false
+                        val newFrom = intent.getStringExtra(Constants.EXTRA_CALL_FROM)
+                        if (!newFrom.isNullOrEmpty()) {
+                            callerName = newFrom
+                            callerNumber = newFrom
+                            findViewById<TextView>(R.id.caller_name)?.text = callerName
+                        }
+                        // Re-enable the answer button
+                        findViewById<FrameLayout>(R.id.acceptButton)?.alpha = 1.0f
+                    }
+                    return
+                }
+            }
+
             val endedCallId = intent.getStringExtra(Constants.EXTRA_CALL_ID)
             Log.d(TAG, "callEndedReceiver: action=${intent.action}, callId=$endedCallId, our callId=$callId")
 
@@ -147,6 +173,18 @@ class IncomingCallActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i(TAG, "onCreate: START pid=${android.os.Process.myPid()}")
+
+        try {
+            onCreateInternal(savedInstanceState)
+        } catch (e: Exception) {
+            Log.e(TAG, "onCreate: CRASHED — finishing activity", e)
+            isActivityAlive = false
+            finish()
+        }
+    }
+
+    private fun onCreateInternal(savedInstanceState: Bundle?) {
 
         // Capture lock state BEFORE setShowWhenLocked changes it
         val keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
@@ -163,6 +201,31 @@ class IncomingCallActivity : AppCompatActivity() {
         callId = intent.getStringExtra(EXTRA_CALL_ID) ?: ""
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME) ?: "Unknown"
         callerNumber = intent.getStringExtra(EXTRA_CALLER_NUMBER) ?: callerName
+
+        // Safety net: if callId is empty (placeholder fullScreenIntent fired before
+        // handleIncomingCall wrote the real notification), try to recover from
+        // SharedPreferences where handleIncomingCall persists the pending call data.
+        // This handles the race where ensureForeground posts a placeholder notification
+        // before handleIncomingCall runs, AND covers process-recreation scenarios.
+        if (callId.isEmpty()) {
+            try {
+                val prefs = getSharedPreferences(TVConnectionService.PREFS_PENDING_CALL, MODE_PRIVATE)
+                val storedCallId = prefs.getString(TVConnectionService.KEY_PENDING_CALL_ID, null)
+                val storedFrom = prefs.getString(TVConnectionService.KEY_PENDING_CALL_FROM, null)
+                val storedTs = prefs.getLong(TVConnectionService.KEY_PENDING_CALL_TIMESTAMP, 0)
+                val age = System.currentTimeMillis() - storedTs
+                if (!storedCallId.isNullOrEmpty() && age < 120_000L) {
+                    callId = storedCallId
+                    if (!storedFrom.isNullOrEmpty()) {
+                        callerName = storedFrom
+                        callerNumber = storedFrom
+                    }
+                    Log.d(TAG, "onCreate: Recovered callId=$callId from SharedPreferences (age=${age}ms)")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "onCreate: SharedPreferences recovery failed: ${e.message}")
+            }
+        }
 
         // Placeholder mode: launched by the placeholder notification before
         // Vonage SDK has processed the push. Show UI immediately but disable
@@ -183,7 +246,7 @@ class IncomingCallActivity : AppCompatActivity() {
         Log.d(TAG, "onCreate: callId=$callId, callerName=$callerName")
 
         // Set up the native UI
-        setContentView(R.layout.activity_incoming_call)
+        setContentView(R.layout.vonage_activity_incoming_call)
 
         val callerNameText = findViewById<TextView>(R.id.caller_name)
         val callerNumberText = findViewById<TextView>(R.id.caller_number)
@@ -228,11 +291,12 @@ class IncomingCallActivity : AppCompatActivity() {
 
         // Ringing is managed by TVConnectionService — no startRinging() here
 
-        // Listen for call cancelled / ended / answered-externally events
+        // Listen for call cancelled / ended / answered-externally / real-call-ready events
         val filter = IntentFilter().apply {
             addAction(Constants.BROADCAST_CALL_INVITE_CANCELLED)
             addAction(Constants.BROADCAST_CALL_ENDED)
             addAction(Constants.BROADCAST_CALL_ANSWERED)
+            addAction(Constants.BROADCAST_REAL_CALL_READY)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(callEndedReceiver, filter)
 
@@ -262,6 +326,9 @@ class IncomingCallActivity : AppCompatActivity() {
      */
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
+        // Persist the latest intent so Android uses it when recreating the task
+        // after a process death (singleInstance keeps the task record).
+        setIntent(intent)
         val newCallId = intent?.getStringExtra(EXTRA_CALL_ID) ?: ""
         val newCallerName = intent?.getStringExtra(EXTRA_CALLER_NAME)
         Log.d(TAG, "onNewIntent: newCallId=$newCallId, newCallerName=$newCallerName, isPlaceholderMode=$isPlaceholderMode")
