@@ -1023,6 +1023,19 @@ class TVConnectionService : ConnectionService() {
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Idempotency guard — prevents double-answering when both
+        // IncomingCallActivity and Connection.onAnswer() race to answer.
+        if (VonageClientHolder.isAnsweringInProgress) {
+            android.util.Log.d("TVConnectionService",
+                "handleAnswer: Already answering in progress — skipping duplicate for callId=$callId")
+            return
+        }
+        if (VonageClientHolder.isCallAnsweredNatively) {
+            android.util.Log.d("TVConnectionService",
+                "handleAnswer: Call already answered natively — skipping duplicate for callId=$callId")
+            return
+        }
+
         // Stop ringing — call is being answered
         stopServiceRinging()
 

@@ -164,6 +164,20 @@ class IncomingCallActivity : AppCompatActivity() {
             // Only react to events for OUR call (or blanket cancel broadcast)
             if (endedCallId != callId && intent.action != Constants.BROADCAST_CALL_INVITE_CANCELLED) return
 
+            // If the call was answered externally (Samsung tile, BT headset, notification)
+            // while the device is locked, store pending data so MainActivity.onResume()
+            // can navigate directly to the active call screen after the user unlocks.
+            if (intent.action == Constants.BROADCAST_CALL_ANSWERED && wasDeviceLockedOnCreate) {
+                Log.d(TAG, "callEndedReceiver: Call answered externally while locked — storing pendingAnsweredCallData")
+                pendingAnsweredCallData = mapOf(
+                    "callId" to callId,
+                    "callerName" to callerName,
+                    "callerNumber" to callerNumber,
+                    "callDirection" to "incoming",
+                    "isCallAnswered" to true
+                )
+            }
+
             Log.d(TAG, "Call ended/cancelled/answered externally — cleaning up")
             callHandled = true
             releaseWakeLock()
