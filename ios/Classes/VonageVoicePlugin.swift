@@ -35,6 +35,23 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     // Accessible from AppDelegate to forward PushKit events when needed.
     public static var sharedInstance: VonageVoicePlugin?
 
+    /// When `true`, the AppDelegate owns the PKPushRegistry for `.voIP`
+    /// and forwards pushes/tokens to this plugin. The plugin will NOT
+    /// create its own PKPushRegistry. Set from AppDelegate before
+    /// GeneratedPluginRegistrant.register().
+    public static var pushKitSetupByAppDelegate = false
+
+    /// VoIP push token received by AppDelegate before the plugin was ready.
+    /// Consumed in `register(with:)`.
+    public static var pendingVoipToken: Data?
+
+    /// VoIP push payload received by AppDelegate before the plugin was ready.
+    /// Consumed in `register(with:)`.
+    public static var pendingVoipPushPayload: PKPushPayload?
+
+    /// VoIP push completion handler deferred by AppDelegate.
+    public static var pendingVoipPushCompletion: (() -> Void)?
+
     // ─── Flutter Communication ───────────────────────────────────────
     /// Sends events (call state, audio, errors) to Flutter via EventChannel.
     private var eventSink: FlutterEventSink?
@@ -231,9 +248,38 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
         sharedInstance = instance
 
-        // Start listening for VoIP pushes.
-        instance.voipRegistry.delegate = instance
-        instance.voipRegistry.desiredPushTypes = [.voIP]
+        // ── PushKit ──────────────────────────────────────────────────────
+        // Apple mandates ONE PKPushRegistry per push type. If AppDelegate
+        // already owns .voIP (it does — for Twilio/Vonage routing), we
+        // skip creating our own and rely on AppDelegate to forward events.
+        if VonageVoicePlugin.pushKitSetupByAppDelegate {
+            NSLog("[VonageVoice] PushKit managed by AppDelegate — skipping own PKPushRegistry")
+
+            // Consume VoIP token that arrived before plugin was ready.
+            if let pendingToken = VonageVoicePlugin.pendingVoipToken {
+                VonageVoicePlugin.pendingVoipToken = nil
+                instance.deviceToken = pendingToken
+                let hexToken = pendingToken.map { String(format: "%02x", $0) }.joined()
+                NSLog("[VonageVoice] Consumed pending VoIP token (%d bytes) hex=%@",
+                      pendingToken.count, hexToken)
+            }
+
+            // Consume VoIP push that arrived before plugin was ready.
+            if let pendingPayload = VonageVoicePlugin.pendingVoipPushPayload {
+                let pendingCompletion = VonageVoicePlugin.pendingVoipPushCompletion ?? {}
+                VonageVoicePlugin.pendingVoipPushPayload = nil
+                VonageVoicePlugin.pendingVoipPushCompletion = nil
+                NSLog("[VonageVoice] Processing pending VoIP push from AppDelegate")
+                instance.pushRegistry(PKPushRegistry(queue: .main),
+                                      didReceiveIncomingPushWith: pendingPayload,
+                                      for: .voIP,
+                                      completion: pendingCompletion)
+            }
+        } else {
+            // No AppDelegate PushKit — plugin owns the registry.
+            instance.voipRegistry.delegate = instance
+            instance.voipRegistry.desiredPushTypes = [.voIP]
+        }
     }
 
 
