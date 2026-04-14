@@ -115,13 +115,12 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
 
-        // ── Cellular call detection ───────────────────────────────────────
-        // If the user is already on a cellular (SIM/carrier) call, skip
-        // processing the VoIP invite entirely. The call will appear as
-        // "missed" on the Vonage side. Without this check, the VoIP call
-        // would interrupt the cellular call and both parties would lose audio.
+        // ── Active call detection ─────────────────────────────────────────
+        // If the user is already on ANY call (cellular, Twilio VoIP,
+        // WhatsApp, or any other ConnectionService-based call), skip
+        // the VoIP invite entirely. It will appear as "missed" on Vonage.
         if (isDeviceInSystemCall()) {
-            android.util.Log.w("VonageFCM", "[FCM-1] Device is in a cellular call — skipping VoIP invite")
+            android.util.Log.w("VonageFCM", "[FCM-1] Device is in an active call — skipping VoIP invite")
             return
         }
 
@@ -129,8 +128,6 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         // Vonage is single-call only (no hold/swap/conference). If there is
         // already an active or pending Vonage call, ignore the 2nd invite
         // entirely — it will appear as "missed" on the Vonage side.
-        // This also covers cross-provider scenarios: Twilio calls use
-        // ConnectionService so they are caught by isDeviceInSystemCall() above.
         if (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty()) {
             android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
             return
@@ -666,27 +663,25 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         }
     }
 
-    // ── Cellular call detection ───────────────────────────────────────────
+    // ── Active call detection ─────────────────────────────────────────────
 
     /**
-     * Returns true if the device is currently in a cellular (SIM/carrier) call.
+     * Returns true if the device is currently in ANY active call — cellular,
+     * Twilio VoIP, or any other VoIP app registered via ConnectionService.
      *
-     * Uses [TelecomManager.isInManagedCall] (API 31+) which returns true when
-     * the user is on a carrier-managed call. On older APIs, falls back to
-     * [TelecomManager.isInCall] which also detects VoIP calls registered via
-     * ConnectionService, but that's acceptable since we don't want to interrupt
-     * ANY active call.
+     * Uses [TelecomManager.isInCall] which detects both managed (cellular)
+     * and self-managed (VoIP) calls. This ensures an incoming Vonage invite
+     * is silently skipped when the user is already on a Twilio call, a phone
+     * call, WhatsApp call, or any other active call.
      */
     private fun isDeviceInSystemCall(): Boolean {
         return try {
             val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
                 ?: return false
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                telecomManager.isInManagedCall
-            } else {
-                @Suppress("DEPRECATION")
-                telecomManager.isInCall
-            }
+            @Suppress("DEPRECATION")
+            val inCall = telecomManager.isInCall
+            android.util.Log.d("VonageFCM", "isDeviceInSystemCall: isInCall=$inCall")
+            inCall
         } catch (e: SecurityException) {
             // READ_PHONE_STATE permission may not be granted — assume no call
             android.util.Log.w("VonageFCM", "isDeviceInSystemCall: SecurityException — ${e.message}")
