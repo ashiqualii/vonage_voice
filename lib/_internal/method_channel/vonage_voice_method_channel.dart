@@ -513,6 +513,10 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     // ── Call Error prefix ─────────────────────────────────────────────
     if (state.startsWith("Call Error:")) {
       printDebug(state);
+      if (state.contains("max-device-limit") ||
+          state.contains("exceeding max devices limit")) {
+        return CallEvent.deviceLimitExceeded;
+      }
       return CallEvent.log;
     }
 
