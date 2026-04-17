@@ -1482,6 +1482,13 @@ extension VonageVoicePlugin {
     /// Starts a safety-net timer. If the call invite isn't resolved within
     /// the timeout (e.g. WebSocket cancel was lost), end it as a missed call.
     private func startRingingTimeout() {
+        // Timer must be scheduled on the main run loop so it actually fires.
+        // SDK callbacks (e.g. createSession completion) may run on background
+        // threads whose run loops are not active.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.startRingingTimeout() }
+            return
+        }
         cancelRingingTimeout()
         sendPhoneCallEvents(description: "LOG|startRingingTimeout — \(VonageVoicePlugin.ringingTimeoutSeconds)s")
         ringingTimeoutTimer = Timer.scheduledTimer(withTimeInterval: VonageVoicePlugin.ringingTimeoutSeconds, repeats: false) { [weak self] _ in
@@ -1513,6 +1520,11 @@ extension VonageVoicePlugin {
 
     /// Cancels the ringing timeout if active.
     private func cancelRingingTimeout() {
+        // Must invalidate on the same thread where the timer was scheduled (main).
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.cancelRingingTimeout() }
+            return
+        }
         ringingTimeoutTimer?.invalidate()
         ringingTimeoutTimer = nil
     }
@@ -2062,6 +2074,11 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
 
         // Report to CallKit immediately so Apple doesn't kill us.
         reportIncomingCall(from: defaultCaller, uuid: uuid)
+
+        // Start the background task NOW — before the async session restore.
+        // Without this, iOS suspends the app after PushKit completion and
+        // the WebSocket dies before .answeredElsewhere can arrive.
+        beginInviteBackgroundTask()
 
         // Safety timeout: end the call if didReceiveInviteForCall never fires.
         pushCompletionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
