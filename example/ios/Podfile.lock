@@ -69,10 +69,10 @@ PODS:
   - PromisesObjC (2.4.0)
   - vonage_voice (0.0.1):
     - Flutter
-    - VonageClientSDKVoice (~> 1.7.2)
-  - VonageClientSDKVoice (1.7.2):
-    - VonageWebRTC (~> 99.13.76)
-  - VonageWebRTC (99.13.88)
+    - VonageClientSDKVoice (~> 2.3.0)
+  - VonageClientSDKVoice (2.3.0):
+    - VonageWebRTC (~> 121.1.100)
+  - VonageWebRTC (121.1.102)
 
 DEPENDENCIES:
   - firebase_core (from `.symlinks/plugins/firebase_core/ios`)
@@ -121,10 +121,10 @@ SPEC CHECKSUMS:
   integration_test: 252f60fa39af5e17c3aa9899d35d908a0721b573
   nanopb: fad817b59e0457d11a5dfbde799381cd727c1275
   PromisesObjC: f5707f49cb48b9636751c5b2e7d227e43fba9f47
-  vonage_voice: 1db33fe4788357e80a7afe05128b34b87f82c049
-  VonageClientSDKVoice: 6ac2c7f465fd488653885c30cd8f1c4b5b173b9d
-  VonageWebRTC: c290e56427e29dee6e06fcfe8c4c013b1eddd083
+  vonage_voice: 6ea87e63f948a28a97c05631043574bcc95c9e60
+  VonageClientSDKVoice: 031078ac6b4bda51ee19649ab5d1d7e36383b992
+  VonageWebRTC: 51ba476e367055ee0cf8e0d8b055819437d0453f
 
-PODFILE CHECKSUM: 251cb053df7158f337c0712f2ab29f4e0fa474ce
+PODFILE CHECKSUM: 53a6aebc29ccee84c41f92f409fc20cd4ca011f1
 
 COCOAPODS: 1.16.2

@@ -16,8 +16,8 @@ Plugin for vonage voice
   s.source_files = 'Classes/**/*'
   s.static_framework = true
   s.dependency 'Flutter'
-  s.dependency 'VonageClientSDKVoice', '~> 1.7.2'
-  s.platform = :ios, '13.0'
+  s.dependency 'VonageClientSDKVoice', '~> 2.3.0'
+  s.platform = :ios, '15.0'
   s.frameworks = 'CallKit', 'PushKit', 'AVFoundation', 'UIKit', 'UserNotifications'
 
   # Flutter.framework does not contain a i386 slice.

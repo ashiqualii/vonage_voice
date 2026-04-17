@@ -2300,11 +2300,13 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
                             reason: VGHangupReason) {
         let reasonName: String
         switch reason {
-        case .localHangup:   reasonName = "localHangup(0)"
-        case .remoteReject:  reasonName = "remoteReject(1)"
-        case .remoteHangup:  reasonName = "remoteHangup(2)"
-        case .mediaTimeout:  reasonName = "mediaTimeout(3)"
-        @unknown default:    reasonName = "unknown(\(reason.rawValue))"
+        case .localHangup:          reasonName = "localHangup(0)"
+        case .remoteReject:         reasonName = "remoteReject(1)"
+        case .remoteHangup:         reasonName = "remoteHangup(2)"
+        case .mediaTimeout:         reasonName = "mediaTimeout(3)"
+        case .remoteNoAnswerTimeout: reasonName = "remoteNoAnswerTimeout(4)"
+        case .unknown:              reasonName = "unknown(\(reason.rawValue))"
+        @unknown default:           reasonName = "unknown(\(reason.rawValue))"
         }
         sendPhoneCallEvents(description: "LOG|didReceiveHangupForCall callId=\(callId)")
         sendPhoneCallEvents(description: "LOG|  reason=\(reasonName)")
