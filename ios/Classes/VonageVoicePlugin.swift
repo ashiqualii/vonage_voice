@@ -126,6 +126,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     /// The UUID of the currently active (foreground) call.
     private var activeCallUUID: UUID?
 
+    /// True while voiceClient.answer() is in-flight but hasn't completed yet.
+    /// Prevents didReceiveInviteCancelForCall from ending a call that is
+    /// being answered on this device (race between answer callback and
+    /// server-side invite cleanup).
+    private var isAnsweringInProgress = false
+
     /// Outgoing call state — set before the CXStartCallAction fires.
     private var callOutgoing = false
     private var userInitiatedDisconnect = false
@@ -1705,8 +1711,10 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
 
         // Normal path — answer immediately.
+        isAnsweringInProgress = true
         voiceClient.answer(invite.callId) { [weak self] error in
             guard let self = self else { return }
+            self.isAnsweringInProgress = false
             if let error = error {
                 self.sendPhoneCallEvents(description: "LOG|answer failed: \(error.localizedDescription)")
                 action.fail()
@@ -2036,8 +2044,10 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         // Fulfil any queued answer action (user tapped Answer before callId was available).
         if let answerAction = pendingAnswerAction {
             pendingAnswerAction = nil
+            isAnsweringInProgress = true
             voiceClient.answer(callId) { [weak self] error in
                 guard let self = self else { return }
+                self.isAnsweringInProgress = false
                 if let error = error {
                     self.sendPhoneCallEvents(description: "LOG|Deferred answer failed: \(error.localizedDescription)")
                     answerAction.fail()
@@ -2108,12 +2118,12 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             return
         }
 
-        // GUARD: If the call was already answered and moved to activeCalls,
-        // do NOT process the cancel — the SDK may fire cancel as cleanup
-        // after the invite was consumed by answer. Ending an active call
-        // here would cause the "auto-hangup after answer" bug.
-        if activeCalls[uuid] != nil {
-            sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for already-answered call callId=\(callId)")
+        // GUARD: If the call was already answered (or is being answered right
+        // now), do NOT process the cancel — the SDK fires cancel as cleanup
+        // after the invite was consumed by answer. Ending an active/answering
+        // call here would cause the "auto-hangup after answer" bug.
+        if activeCalls[uuid] != nil || isAnsweringInProgress {
+            sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for answered/answering call callId=\(callId)")
             return
         }
 
@@ -2159,10 +2169,18 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             } else {
                 sendPhoneCallEvents(description: "LOG|  userInitiatedDisconnect=true, skipping CallKit report")
             }
+
+            // If this was a pending invite (answered on another device),
+            // treat it like a cancel — clean up invite and emit Missed Call.
+            let wasInvite = callInvites[uuid] != nil
+            if wasInvite {
+                callInvites.removeValue(forKey: uuid)
+                callIdToUUID.removeValue(forKey: callId)
+            }
             callDisconnected(uuid: uuid)
 
             if activeCalls.isEmpty {
-                sendPhoneCallEvents(description: "Call Ended")
+                sendPhoneCallEvents(description: wasInvite ? "Missed Call" : "Call Ended")
             }
         } else {
             sendPhoneCallEvents(description: "LOG|  WARNING: No UUID found for callId=\(callId) — orphan hangup")
