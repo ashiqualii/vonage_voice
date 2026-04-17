@@ -140,6 +140,22 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var callArgs: [String: Any] = [:]
     private var outgoingCallerName = ""
 
+    // ─── Invite Keep-Alive ──────────────────────────────────────────
+    // When the device is locked, iOS suspends the app after PushKit
+    // completion — killing the WebSocket. The cancel event from the
+    // server (answered elsewhere / caller hung up) never arrives and
+    // CallKit keeps ringing. A background task keeps the process alive
+    // long enough for the cancel to be delivered. A ringing timeout
+    // acts as a safety net if the background task expires first.
+
+    /// Background task that keeps the app alive while a call invite is pending.
+    private var inviteBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// Safety-net timer: ends the pending invite if it isn't resolved
+    /// within this interval (e.g. cancel push lost, WebSocket dead).
+    private var ringingTimeoutTimer: Timer?
+    private static let ringingTimeoutSeconds: TimeInterval = 60
+
     // ─── Audio State ─────────────────────────────────────────────────
     private var isMuted = false
     private var desiredSpeakerState = false
@@ -1412,6 +1428,95 @@ extension VonageVoicePlugin {
 
 extension VonageVoicePlugin {
 
+    // ─── Invite Keep-Alive Helpers ───────────────────────────────────
+
+    /// Starts a background task that keeps the app alive while a call
+    /// invite is pending. Without this, iOS suspends the app when the
+    /// device is locked and the WebSocket cancel event never arrives —
+    /// causing CallKit to ring indefinitely.
+    private func beginInviteBackgroundTask() {
+        guard inviteBackgroundTask == .invalid else {
+            sendPhoneCallEvents(description: "LOG|beginInviteBackgroundTask — already active, skipping")
+            return
+        }
+        sendPhoneCallEvents(description: "LOG|beginInviteBackgroundTask — starting")
+        inviteBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VonageVoiceInvitePending") { [weak self] in
+            // iOS is about to suspend us. End any pending invite so the
+            // user doesn't see a ghost call on the lock screen forever.
+            self?.handleInviteBackgroundTaskExpired()
+        }
+    }
+
+    /// Ends the background task if one is active. Safe to call multiple times.
+    private func endInviteBackgroundTask() {
+        guard inviteBackgroundTask != .invalid else { return }
+        sendPhoneCallEvents(description: "LOG|endInviteBackgroundTask — ending")
+        UIApplication.shared.endBackgroundTask(inviteBackgroundTask)
+        inviteBackgroundTask = .invalid
+    }
+
+    /// Called when iOS is about to kill the background task.
+    /// Ends all pending invites as missed calls so CallKit stops ringing.
+    private func handleInviteBackgroundTaskExpired() {
+        sendPhoneCallEvents(description: "LOG|Background task expired — ending pending invites")
+
+        // End all pending invites (there should be at most one).
+        let pendingUUIDs = callInvites.keys.filter { activeCalls[$0] == nil }
+        for uuid in pendingUUIDs {
+            let invite = callInvites[uuid]
+            callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+            if let invite = invite {
+                callIdToUUID.removeValue(forKey: invite.callId)
+            }
+            callInvites.removeValue(forKey: uuid)
+            callDisconnected(uuid: uuid)
+        }
+        if !pendingUUIDs.isEmpty {
+            sendPhoneCallEvents(description: "Missed Call")
+        }
+
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
+    }
+
+    /// Starts a safety-net timer. If the call invite isn't resolved within
+    /// the timeout (e.g. WebSocket cancel was lost), end it as a missed call.
+    private func startRingingTimeout() {
+        cancelRingingTimeout()
+        sendPhoneCallEvents(description: "LOG|startRingingTimeout — \(VonageVoicePlugin.ringingTimeoutSeconds)s")
+        ringingTimeoutTimer = Timer.scheduledTimer(withTimeInterval: VonageVoicePlugin.ringingTimeoutSeconds, repeats: false) { [weak self] _ in
+            self?.handleRingingTimeout()
+        }
+    }
+
+    /// Called when the ringing timeout fires.
+    private func handleRingingTimeout() {
+        sendPhoneCallEvents(description: "LOG|Ringing timeout fired — ending pending invites")
+        ringingTimeoutTimer = nil
+
+        let pendingUUIDs = callInvites.keys.filter { activeCalls[$0] == nil }
+        for uuid in pendingUUIDs {
+            let invite = callInvites[uuid]
+            callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+            if let invite = invite {
+                callIdToUUID.removeValue(forKey: invite.callId)
+            }
+            callInvites.removeValue(forKey: uuid)
+            callDisconnected(uuid: uuid)
+        }
+        if !pendingUUIDs.isEmpty {
+            sendPhoneCallEvents(description: "Missed Call")
+        }
+
+        endInviteBackgroundTask()
+    }
+
+    /// Cancels the ringing timeout if active.
+    private func cancelRingingTimeout() {
+        ringingTimeoutTimer?.invalidate()
+        ringingTimeoutTimer = nil
+    }
+
     /// Cleans up all pending push coordination state.
     private func cleanupPushState() {
         pushCompletionTimer?.invalidate()
@@ -1420,6 +1525,8 @@ extension VonageVoicePlugin {
         pendingPushUUID = nil
         pendingAnswerAction = nil
         pendingEndAction = nil
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
     }
 
     /// Ends the pre-reported call when something goes wrong (timeout or session restore failure).
@@ -1431,6 +1538,8 @@ extension VonageVoicePlugin {
         callDisconnected(uuid: uuid)
         sendPhoneCallEvents(description: "Missed Call")
         pendingPushCompletion?()
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
         cleanupPushState()
     }
 }
@@ -1540,6 +1649,11 @@ extension VonageVoicePlugin {
             sendPhoneCallEvents(description: "Speaker Off")
             sendPhoneCallEvents(description: "Bluetooth Off")
             sendPhoneCallEvents(description: "LOG|  all per-call state reset (no remaining calls)")
+
+            // No pending invites or active calls — release the background task
+            // and cancel the ringing timeout.
+            cancelRingingTimeout()
+            endInviteBackgroundTask()
         }
         sendPhoneCallEvents(description: "LOG|  after: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
     }
@@ -1873,8 +1987,17 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
         NSLog("[VonageVoice-Push] Vonage push type: %@", String(describing: pushType))
 
-        // ── Not a Vonage call push → report dummy and end ────────────
+        // ── Not a Vonage call push ────────────────────────────────────
+        // Must still report a dummy call to satisfy Apple's requirement.
+        // BUT: also forward to the SDK — Vonage may send a cancel push
+        // (e.g. call answered elsewhere) that the SDK needs to process.
+        // This is critical when the device is locked: the WebSocket is
+        // frozen so the cancel can only arrive via a second VoIP push.
         guard pushType == .incomingCall else {
+            if !callInvites.isEmpty {
+                sendPhoneCallEvents(description: "LOG|Non-incomingCall push while invite pending — forwarding to SDK")
+                voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+            }
             reportDummyCallAndEnd(completion: completion)
             return
         }
@@ -2017,6 +2140,12 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
 
         sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
         reportIncomingCall(from: callerDisplay, uuid: uuid)
+
+        // Keep the app alive while the invite is pending so the WebSocket
+        // can deliver a cancel event (answered elsewhere / caller hung up)
+        // even when the device is locked and iOS would otherwise suspend us.
+        beginInviteBackgroundTask()
+        startRingingTimeout()
     }
 
     /// Handles didReceiveInviteForCall when the app was launched from killed state.
@@ -2025,6 +2154,10 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
     private func handleKilledStateInvite(callId: String, caller: String, pushUUID: UUID) {
         pushCompletionTimer?.invalidate()
         pushCompletionTimer = nil
+
+        // Keep the app alive while the invite is pending (locked-device fix).
+        beginInviteBackgroundTask()
+        startRingingTimeout()
 
         let callerDisplay = clients[caller] ?? caller
 
