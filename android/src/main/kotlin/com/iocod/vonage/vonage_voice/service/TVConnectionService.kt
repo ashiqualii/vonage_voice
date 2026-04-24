@@ -78,6 +78,71 @@ class TVConnectionService : ConnectionService() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var scoReceiver: BroadcastReceiver? = null
+
+    // ── ICK (incoming_call_kit) integration ───────────────────────────────
+    // ICK callId in use for the current incoming call.
+    // For non-placeholder calls this equals the vonage callId.
+    // For placeholder calls a generated UUID is used until the real callId
+    // arrives via handleIncomingCall(); the entry is then upgraded in-place.
+    private var currentIckCallId: String? = null
+
+    // Receives ICK accept/decline events via LocalBroadcastManager so that
+    // TVConnectionService can answer/hang up natively in the killed-app path
+    // (when Flutter's IncomingCallBridge is not alive).
+    private val ickEventReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val ickCallId = intent.getStringExtra("callId") ?: return
+            val vonageCallId = getVonageCallIdFromIck(ickCallId) ?: return
+
+            // Only handle natively when Flutter is NOT the active handler.
+            // When Flutter is alive, IncomingCallBridge processes these events.
+            val flutterCanHandle = VonageClientHolder.isFlutterInForeground &&
+                    VonageClientHolder.isEventSinkAttached
+            if (flutterCanHandle) return
+
+            when (intent.action) {
+                ICK_BROADCAST_ACCEPTED -> {
+                    android.util.Log.d("TVConnectionService",
+                        "[ICK] Native accept: ickCallId=$ickCallId, vonageCallId=$vonageCallId")
+                    handleAnswer(Intent().apply {
+                        putExtra(Constants.EXTRA_CALL_ID, vonageCallId)
+                    })
+                }
+                ICK_BROADCAST_DECLINED -> {
+                    android.util.Log.d("TVConnectionService",
+                        "[ICK] Native decline: ickCallId=$ickCallId, vonageCallId=$vonageCallId")
+                    handleHangup(Intent().apply {
+                        putExtra(Constants.EXTRA_CALL_ID, vonageCallId)
+                    })
+                }
+                ICK_BROADCAST_HOLD_AND_ANSWER -> {
+                    android.util.Log.d("TVConnectionService",
+                        "[ICK] Native hold+answer: ickCallId=$ickCallId, vonageCallId=$vonageCallId")
+                    // Hold all active connections
+                    activeConnections.values.forEach { conn ->
+                        try { conn.onHold() } catch (_: Exception) {}
+                    }
+                    // Answer the waiting invite
+                    handleAnswer(Intent().apply {
+                        putExtra(Constants.EXTRA_CALL_ID, vonageCallId)
+                    })
+                }
+                ICK_BROADCAST_END_AND_ANSWER -> {
+                    android.util.Log.d("TVConnectionService",
+                        "[ICK] Native end+answer: ickCallId=$ickCallId, vonageCallId=$vonageCallId")
+                    // End all active connections, then answer the waiting invite
+                    activeConnections.keys.toList().forEach { activeCallId ->
+                        handleHangup(Intent().apply {
+                            putExtra(Constants.EXTRA_CALL_ID, activeCallId)
+                        })
+                    }
+                    handleAnswer(Intent().apply {
+                        putExtra(Constants.EXTRA_CALL_ID, vonageCallId)
+                    })
+                }
+            }
+        }
+    }
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
 
     // Guards against firing fullScreenIntent multiple times for the same call.
@@ -231,6 +296,18 @@ class TVConnectionService : ConnectionService() {
         /** Maximum age for the answered-call entry to be considered valid (5 min). */
         const val ANSWERED_CALL_TTL_MS          = 300_000L
 
+        // ── ICK (incoming_call_kit) constants ─────────────────────────────
+        private const val ICK_ACTIVITY_CLASS    = "com.ashiquali.incoming_call_kit.IncomingCallActivity"
+        private const val ICK_SERVICE_CLASS     = "com.ashiquali.incoming_call_kit.IncomingCallService"
+        private const val ICK_PREFS_NAME        = "incoming_call_kit_config"
+        private const val ICK_EXTRA_CALL_ID     = "extra_call_id"
+        private const val ICK_ACTION_DISMISS    = "com.ashiquali.incoming_call_kit.ACTION_DISMISS"
+        private const val ICK_ACTION_UPDATE     = "com.ashiquali.incoming_call_kit.ACTION_UPDATE"
+        const val ICK_BROADCAST_ACCEPTED           = "incoming_call_kit.ACCEPTED"
+        const val ICK_BROADCAST_DECLINED           = "incoming_call_kit.DECLINED"
+        const val ICK_BROADCAST_HOLD_AND_ANSWER    = "incoming_call_kit.HOLD_AND_ANSWER"
+        const val ICK_BROADCAST_END_AND_ANSWER     = "incoming_call_kit.END_AND_ANSWER"
+
         /**
          * Persist answered call metadata to SharedPreferences.
          * Called synchronously (commit) from doAnswer() success so the data
@@ -312,6 +389,17 @@ class TVConnectionService : ConnectionService() {
     override fun onCreate() {
         super.onCreate()
         broadcastManager = LocalBroadcastManager.getInstance(this)
+
+        // Register ICK accept/decline receiver for killed-app / background path.
+        // IncomingCallBridge (Flutter) handles these events when Flutter is alive;
+        // ickEventReceiver handles them natively when Flutter is dead.
+        val ickFilter = IntentFilter().apply {
+            addAction(ICK_BROADCAST_ACCEPTED)
+            addAction(ICK_BROADCAST_DECLINED)
+            addAction(ICK_BROADCAST_HOLD_AND_ANSWER)
+            addAction(ICK_BROADCAST_END_AND_ANSWER)
+        }
+        broadcastManager.registerReceiver(ickEventReceiver, ickFilter)
 
         android.util.Log.i("TVConnectionService",
             "[LIFECYCLE] onCreate: pid=${android.os.Process.myPid()}, " +
@@ -427,12 +515,19 @@ class TVConnectionService : ConnectionService() {
         // full-screen activity (not a heads-up notification).
         // ONLY fire once — Samsung crashes or shows heads-up (not full-screen)
         // when the same fullScreenIntent PendingIntent fires multiple times.
-        if ((isIncomingAction || pendingInvites.isNotEmpty()) && !incomingNotificationPosted) {
+        // SUPPRESS when Flutter is running — IncomingCallBridge shows ICK from
+        // Dart side, firing here would produce duplicate incoming call UI.
+        val flutterAlive = VonageClientHolder.isFlutterInForeground &&
+                VonageClientHolder.isEventSinkAttached
+        if ((isIncomingAction || pendingInvites.isNotEmpty()) && !incomingNotificationPosted && !flutterAlive) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(Constants.NOTIFICATION_ID, notification)
             incomingNotificationPosted = true
             android.util.Log.d("TVConnectionService",
                 "[ensureForeground] ✓ nm.notify() fired fullScreenIntent (pid=${android.os.Process.myPid()})")
+        } else if (flutterAlive && (isIncomingAction || pendingInvites.isNotEmpty())) {
+            android.util.Log.d("TVConnectionService",
+                "[ensureForeground] Suppressed nm.notify() — Flutter alive, IncomingCallBridge handles UI")
         }
 
         // Acquire FULL_WAKE_LOCK for incoming calls to physically turn the screen on.
@@ -443,6 +538,13 @@ class TVConnectionService : ConnectionService() {
     }
 
     // override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Unregister the ICK event receiver to prevent memory leaks.
+        try { broadcastManager.unregisterReceiver(ickEventReceiver) } catch (_: Exception) {}
+        android.util.Log.d("TVConnectionService", "[LIFECYCLE] onDestroy")
+    }
 
     // ── Intent dispatcher ─────────────────────────────────────────────────
 
@@ -547,6 +649,21 @@ class TVConnectionService : ConnectionService() {
         }
         broadcastManager.sendBroadcast(upgradeIntent)
         android.util.Log.d("TVConnectionService", "[INCOMING-REAL] Sent BROADCAST_REAL_CALL_READY callId=$callId")
+
+        // ── Upgrade ICK placeholder to real call (if placeholder was shown) ──
+        val prevIckCallId = currentIckCallId
+        if (prevIckCallId != null && prevIckCallId != callId) {
+            // Placeholder was shown — update stored config with real vonage callId
+            // and signal ICK's activity to refresh (enables the Accept button).
+            storeIckCallConfig(prevIckCallId, callId, from, isPlaceholder = false)
+            sendIckServiceAction(ICK_ACTION_UPDATE, prevIckCallId)
+            android.util.Log.d("TVConnectionService",
+                "[ICK] Upgraded placeholder ickId=$prevIckCallId → vonageCallId=$callId")
+        } else if (prevIckCallId == null) {
+            // Non-placeholder path: config was already stored in buildIncomingCallNotification()
+            // with the real callId. Just ensure currentIckCallId is set.
+            currentIckCallId = callId
+        }
 
         // ── Notification is already posted by ensureForeground() ────────
         // ensureForeground() runs in onStartCommand BEFORE handleIntent(),
@@ -660,6 +777,13 @@ class TVConnectionService : ConnectionService() {
         // Clear the persisted pending call data — caller cancelled the invite
         clearPendingCallData(this)
         incomingNotificationPosted = false
+
+        // Dismiss ICK's showing activity / notification for this call
+        currentIckCallId?.let { ickId ->
+            sendIckServiceAction(ICK_ACTION_DISMISS, ickId)
+            android.util.Log.d("TVConnectionService", "[ICK] Dismissed ICK: ickId=$ickId (cancel invite callId=$callId)")
+            currentIckCallId = null
+        }
 
         // cancel() internally broadcasts BROADCAST_CALL_INVITE_CANCELLED
         // so we must not broadcast again to avoid duplicate Missed Call events
@@ -1021,6 +1145,134 @@ class TVConnectionService : ConnectionService() {
                 type == AudioDeviceInfo.TYPE_BLE_HEADSET)
     }
 
+    // ── ICK helper methods ────────────────────────────────────────────────
+
+    /**
+     * Stores an ICK-compatible call config in [ICK_PREFS_NAME] SharedPreferences
+     * so that incoming_call_kit's IncomingCallActivity / IncomingCallService can
+     * read it when launched via a fullScreenIntent notification.
+     *
+     * @param ickCallId      The key used by ICK (UUID for placeholder, vonage callId otherwise).
+     * @param vonageCallId   The real vonage callId — stored in `extra.vonageCallId` for mapping
+     *                       back when the user accepts/declines in the ICK UI.
+     * @param from           Caller display name / number.
+     * @param isPlaceholder  True while we don't yet have the real vonage callId.
+     */
+    private fun storeIckCallConfig(
+        ickCallId: String,
+        vonageCallId: String,
+        from: String,
+        isPlaceholder: Boolean
+    ) {
+        try {
+            val androidConfig = org.json.JSONObject().apply {
+                put("backgroundColor", "#0D0D1A")
+                put("backgroundGradient", org.json.JSONObject().apply {
+                    put("colors", org.json.JSONArray().apply {
+                        put("#0D0D1A"); put("#12122B"); put("#0A1A40")
+                    })
+                    put("type", "linear")
+                })
+                put("acceptButtonColor", "#4CAF50")
+                put("declineButtonColor", "#F44336")
+                put("buttonSize", 72)
+                put("avatarBorderColor", "#3D63FF")
+                put("statusText", "Easify Call")
+            }
+            val extra = org.json.JSONObject().apply {
+                put("vonageCallId", vonageCallId)
+            }
+            val config = org.json.JSONObject().apply {
+                put("id", ickCallId)
+                put("callerName", from)
+                put("callerNumber", "")
+                put("type", 0)
+                put("textAccept", "Accept")
+                put("textDecline", "Decline")
+                put("duration", 60000)
+                put("isCallWaiting", false)
+                put("isPlaceholderMode", isPlaceholder)
+                put("android", androidConfig)
+                put("extra", extra)
+            }
+            val prefs = getSharedPreferences(ICK_PREFS_NAME, Context.MODE_PRIVATE)
+            val existingIds = prefs.getStringSet("active_call_ids", emptySet()) ?: emptySet()
+            prefs.edit()
+                .putString("call_$ickCallId", config.toString())
+                .putStringSet("active_call_ids", existingIds.toMutableSet().apply { add(ickCallId) })
+                .apply()
+            android.util.Log.d("TVConnectionService",
+                "[ICK] storeIckCallConfig: ickCallId=$ickCallId, vonageCallId=$vonageCallId, placeholder=$isPlaceholder")
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService", "[ICK] storeIckCallConfig failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Reads the vonage callId stored in `extra.vonageCallId` of ICK's saved
+     * config for [ickCallId]. Returns null if the config is absent or the
+     * vonageCallId field is empty (i.e., placeholder not yet upgraded).
+     */
+    private fun getVonageCallIdFromIck(ickCallId: String): String? {
+        return try {
+            val prefs = getSharedPreferences(ICK_PREFS_NAME, Context.MODE_PRIVATE)
+            val json = prefs.getString("call_$ickCallId", null) ?: return null
+            org.json.JSONObject(json).optJSONObject("extra")
+                ?.optString("vonageCallId")?.ifEmpty { null }
+        } catch (_: Exception) { null }
+    }
+
+    /**
+     * Builds an Intent that starts ICK's IncomingCallActivity.
+     * Uses [Class.forName] so there is no compile-time dependency on ICK.
+     */
+    private fun buildIckActivityIntent(ickCallId: String): Intent {
+        return try {
+            val cls = Class.forName(ICK_ACTIVITY_CLASS)
+            Intent(applicationContext, cls).apply {
+                putExtra(ICK_EXTRA_CALL_ID, ickCallId)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_NO_USER_ACTION or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+            }
+        } catch (_: ClassNotFoundException) {
+            // Fallback — use explicit component name when ICK is not yet loaded
+            Intent().apply {
+                component = android.content.ComponentName(packageName, ICK_ACTIVITY_CLASS)
+                putExtra(ICK_EXTRA_CALL_ID, ickCallId)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_NO_USER_ACTION or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+            }
+        }
+    }
+
+    /**
+     * Sends [action] to ICK's [IncomingCallService] carrying [ickCallId].
+     * Used for dismiss and update signals from vonage_voice to ICK.
+     */
+    private fun sendIckServiceAction(action: String, ickCallId: String) {
+        try {
+            val intent = Intent().apply {
+                component = android.content.ComponentName(packageName, ICK_SERVICE_CLASS)
+                this.action = action
+                putExtra(ICK_EXTRA_CALL_ID, ickCallId)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                applicationContext.startForegroundService(intent)
+            } else {
+                applicationContext.startService(intent)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("TVConnectionService",
+                "[ICK] sendIckServiceAction($action) failed: ${e.message}")
+        }
+    }
+
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
@@ -1256,6 +1508,13 @@ class TVConnectionService : ConnectionService() {
         clearAnsweredCallData(this)
         VonageFirebaseMessagingService.clearPendingFcmData(this)
         incomingNotificationPosted = false
+
+        // Dismiss any ICK UI still showing for this call
+        currentIckCallId?.let { ickId ->
+            sendIckServiceAction(ICK_ACTION_DISMISS, ickId)
+            android.util.Log.d("TVConnectionService", "[ICK] Dismissed ICK on cleanup: ickId=$ickId")
+        }
+        currentIckCallId = null
 
         // Clear the static pendingAnsweredCallData so that MainActivity.onResume()
         // does NOT navigate to a dead-call screen when the user unlocks after a
@@ -1521,8 +1780,14 @@ class TVConnectionService : ConnectionService() {
     private fun buildPlaceholderIncomingNotification(callerDisplay: String): Notification {
         createIncomingCallNotificationChannel()
 
-        // fullScreenIntent → IncomingCallActivity with placeholder callId
-        val fullScreenIntent = IncomingCallActivity.createPlaceholderIntent(applicationContext, callerDisplay)
+        // Generate a placeholder ICK callId (no vonage callId yet) and store the
+        // config in ICK's SharedPreferences so IncomingCallActivity can read it.
+        val ickPlaceholderId = "vonage_ph_${System.currentTimeMillis()}"
+        currentIckCallId = ickPlaceholderId
+        storeIckCallConfig(ickPlaceholderId, "", callerDisplay, isPlaceholder = true)
+
+        // fullScreenIntent → ICK's IncomingCallActivity (placeholder mode)
+        val fullScreenIntent = buildIckActivityIntent(ickPlaceholderId)
         val fullScreenPendingIntent = PendingIntent.getActivity(
             this,
             9999, // fixed request code for placeholder
@@ -1622,8 +1887,15 @@ class TVConnectionService : ConnectionService() {
     private fun buildIncomingCallNotification(callId: String, from: String): Notification {
         createIncomingCallNotificationChannel()
 
-        // ── fullScreenIntent → IncomingCallActivity (native, works without Flutter) ──
-        val fullScreenIntent = IncomingCallActivity.createIntent(applicationContext, callId, from)
+        // Store ICK config so IncomingCallActivity can read it from the fullScreenIntent.
+        // When a placeholder was already shown, currentIckCallId was set there; otherwise
+        // we use the vonage callId directly as the ICK callId.
+        val ickId = currentIckCallId ?: callId
+        currentIckCallId = ickId
+        storeIckCallConfig(ickId, callId, from, isPlaceholder = false)
+
+        // ── fullScreenIntent → ICK's IncomingCallActivity (works without Flutter) ──
+        val fullScreenIntent = buildIckActivityIntent(ickId)
         val fullScreenPendingIntent = PendingIntent.getActivity(
             this,
             (callId.hashCode() and 0x7FFFFFFF) % 10000 + 1000,

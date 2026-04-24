@@ -678,10 +678,15 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         return try {
             val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
                 ?: return false
-            @Suppress("DEPRECATION")
-            val inCall = telecomManager.isInCall
-            android.util.Log.d("VonageFCM", "isDeviceInSystemCall: isInCall=$inCall")
-            inCall
+            // Use isInManagedCall (carrier/cellular only) instead of isInCall.
+            // isInCall returns true for our own CAPABILITY_SELF_MANAGED connections
+            // (TVCallInviteConnection / TVCallConnection), which causes new incoming
+            // VoIP pushes to be silently dropped even when no real call is active.
+            // Our own active Vonage calls are already guarded by the second check:
+            //   TVConnectionService.hasActiveCall() || pendingInvites.isNotEmpty()
+            val inManagedCall = telecomManager.isInManagedCall
+            android.util.Log.d("VonageFCM", "isDeviceInSystemCall: isInManagedCall=$inManagedCall")
+            inManagedCall
         } catch (e: SecurityException) {
             // READ_PHONE_STATE permission may not be granted — assume no call
             android.util.Log.w("VonageFCM", "isDeviceInSystemCall: SecurityException — ${e.message}")
