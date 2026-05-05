@@ -726,6 +726,11 @@ class TVConnectionService : ConnectionService() {
             // Create Telecom connection for this outgoing call
             val connection = TVCallConnection(this, callId, callFrom, callTo)
             activeConnections[callId] = connection
+            // SDK LIMITATION: serverCall() provides no callee-answered callback.
+            // setCallActive() is called here at call-placement ack time, which is
+            // earlier than the true callee-answered moment. This is the only
+            // available transition point in the Vonage SDK's public API surface.
+            // setDialing() is intentionally omitted for the same reason.
             connection.setCallActive()
             requestAudioFocus() 
 
@@ -738,6 +743,17 @@ class TVConnectionService : ConnectionService() {
                 putExtra(Constants.EXTRA_CALL_TO, callTo)
             }
             broadcastManager.sendBroadcast(broadcast)
+
+            // Broadcast connected event to Flutter (outgoing direction)
+            val connectedBroadcast = Intent(Constants.BROADCAST_CALL_CONNECTED).apply {
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+                putExtra(Constants.EXTRA_CALL_FROM, callFrom)
+                putExtra(Constants.EXTRA_CALL_TO, callTo)
+                putExtra(Constants.EXTRA_CALL_DIRECTION, "OUTGOING")
+            }
+            broadcastManager.sendBroadcast(connectedBroadcast)
+            android.util.Log.i("TVConnectionService",
+                "[OUTGOING] CALL_CONNECTED broadcast sent: callId=$callId")
         }
     }
 
