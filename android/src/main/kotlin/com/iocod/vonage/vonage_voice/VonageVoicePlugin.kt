@@ -2104,13 +2104,15 @@ class VonageVoicePlugin :
         }
         val ctx = context ?: return
 
-        // ── Guard: skip invite listeners when a call was already answered natively ──
+        // ── Guard: skip invite listener when a call was already answered natively ──
         // When the app was killed and the user tapped Answer on the notification,
         // TVConnectionService.doAnswer() already answered the call via the VoiceClient
         // created by VonageFirebaseMessagingService. Re-registering setCallInviteListener
         // at this point can interfere with the SDK's internal state for the active call,
-        // causing an unexpected hangup. The cancel listener is also skipped because
-        // the invite has already been consumed.
+        // causing an unexpected hangup.
+        // NOTE: The CANCEL listener is intentionally NOT guarded — it must remain active
+        // even while answering, to handle the race where iOS answers concurrently and the
+        // cancel arrives during Android's answer window.
         val skipInviteListeners = VonageClientHolder.isCallAnsweredNatively
                 || VonageClientHolder.isAnsweringInProgress
 
@@ -2146,18 +2148,24 @@ class VonageVoicePlugin :
                 // execution window may have expired by this point.
                 ContextCompat.startForegroundService(ctx, intent)
             }
+        }
 
-            // ── Incoming invite cancelled by remote ───────────────────────────
-            client.setCallInviteCancelListener { callId, reason ->
-                val intent = Intent(ctx, TVConnectionService::class.java).apply {
-                    action = Constants.ACTION_CANCEL_CALL_INVITE
-                    putExtra(Constants.EXTRA_CALL_ID, callId)
-                }
-                // Service is already in foreground from the invite, so
-                // startService is fine here. But use startForegroundService
-                // as a safety net in case the invite was never delivered.
-                ContextCompat.startForegroundService(ctx, intent)
+        // ── Incoming invite cancelled by remote (ALWAYS registered) ───────────
+        // This listener is registered outside the skipInviteListeners guard so it
+        // remains active even when isCallAnsweredNatively=true or isAnsweringInProgress=true.
+        // Reason: the cancel event can arrive while Android is mid-answer (iOS answered
+        // concurrently), and it must still trigger teardown to dismiss the notification.
+        client.setCallInviteCancelListener { callId, reason ->
+            android.util.Log.d("VonagePlugin",
+                "setCallInviteCancelListener: callId=$callId, reason=$reason")
+            val intent = Intent(ctx, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_CANCEL_CALL_INVITE
+                putExtra(Constants.EXTRA_CALL_ID, callId)
             }
+            // Service is already in foreground from the invite, so
+            // startService is fine here. But use startForegroundService
+            // as a safety net in case the invite was never delivered.
+            ContextCompat.startForegroundService(ctx, intent)
         }
 
         // ── Call hung up ──────────────────────────────────────────────────
@@ -2296,6 +2304,8 @@ class VonageVoicePlugin :
         }
 
         client.setCallInviteCancelListener { callId, reason ->
+            android.util.Log.d("VonagePlugin",
+                "registerInviteListeners/setCallInviteCancelListener: callId=$callId, reason=$reason")
             val intent = Intent(ctx, TVConnectionService::class.java).apply {
                 action = Constants.ACTION_CANCEL_CALL_INVITE
                 putExtra(Constants.EXTRA_CALL_ID, callId)

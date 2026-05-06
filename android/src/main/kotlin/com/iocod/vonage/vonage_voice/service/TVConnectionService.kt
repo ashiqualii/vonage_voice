@@ -299,6 +299,16 @@ class TVConnectionService : ConnectionService() {
         }
     }
 
+    // ── Per-invite auto-cancel timer ──────────────────────────────────────
+    // Fires handleCancelCallInvite() if the SDK cancel/hangup event never arrives
+    // (caused by a WebSocket drop between processPushCallInvite and the remote
+    // answering elsewhere — the reconnect window can be 100ms–2s, during which
+    // the "answered elsewhere" event is permanently lost by the SDK).
+    // The timer is cancelled immediately if answer/hangup/cancel arrives normally,
+    // so it only fires in the stuck-invite failure case.
+    private val inviteTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val inviteTimeoutRunnables = HashMap<String, Runnable>()
+
     // ── Service-level ringtone & vibration ────────────────────────────────
     // Ringing is managed by the service (not IncomingCallActivity) so it
     // works reliably in background and locked states where the activity
@@ -651,6 +661,9 @@ class TVConnectionService : ConnectionService() {
     private fun handleCancelCallInvite(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
+        // Cancel the per-invite timeout so it doesn't double-fire
+        cancelInviteTimeout(callId)
+
         // Stop ringing — call is being cancelled
         stopServiceRinging()
 
@@ -662,8 +675,26 @@ class TVConnectionService : ConnectionService() {
         incomingNotificationPosted = false
 
         // cancel() internally broadcasts BROADCAST_CALL_INVITE_CANCELLED
-        // so we must not broadcast again to avoid duplicate Missed Call events
-        pendingInvites[callId]?.cancel()
+        // Wrap in try-catch: Connection.setDisconnected() can throw
+        // UnsupportedOperationException on double-cancel (rare race between
+        // setCallInviteCancelListener and setOnCallHangupListener firing together).
+        // Without this guard, the exception would skip pendingInvites.remove(),
+        // leaving the map non-empty and blocking all future calls.
+        val invite = pendingInvites[callId]
+        try {
+            invite?.cancel()
+        } catch (e: Exception) {
+            android.util.Log.e("TVConnectionService",
+                "handleCancelCallInvite: cancel() threw for callId=$callId: ${e.message}")
+            // cancel() failed before it could broadcast INVITE_CANCELLED.
+            // Broadcast manually so Flutter still gets the missed-call event.
+            if (invite != null) {
+                val fallback = Intent(Constants.BROADCAST_CALL_INVITE_CANCELLED).apply {
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                broadcastManager.sendBroadcast(fallback)
+            }
+        }
         pendingInvites.remove(callId)
         pendingInviteTimestamps.remove(callId)
 
@@ -1037,8 +1068,49 @@ class TVConnectionService : ConnectionService() {
                 type == AudioDeviceInfo.TYPE_BLE_HEADSET)
     }
 
+    // ── Per-invite timeout helpers ────────────────────────────────────────
+
+    /**
+     * Schedule an auto-cancel for [callId] after [PENDING_INVITE_TIMEOUT_MS].
+     * The timer is cancelled immediately when the call is answered, rejected,
+     * or cancelled normally — it only fires in the stuck-invite failure case
+     * (WebSocket drop during SDK reconnect, etc.).
+     */
+    private fun scheduleInviteTimeout(callId: String) {
+        val runnable = Runnable {
+            if (pendingInvites.containsKey(callId)) {
+                android.util.Log.w("TVConnectionService",
+                    "[INVITE-TIMEOUT] Auto-cancelling stuck invite after ${PENDING_INVITE_TIMEOUT_MS}ms: callId=$callId")
+                handleCancelCallInvite(Intent().apply {
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                })
+            }
+            inviteTimeoutRunnables.remove(callId)
+        }
+        inviteTimeoutRunnables[callId] = runnable
+        inviteTimeoutHandler.postDelayed(runnable, PENDING_INVITE_TIMEOUT_MS)
+        android.util.Log.d("TVConnectionService",
+            "[INVITE-TIMEOUT] Scheduled auto-cancel in ${PENDING_INVITE_TIMEOUT_MS}ms for callId=$callId")
+    }
+
+    /**
+     * Cancel the pending auto-cancel timer for [callId].
+     * Called from handleAnswer(), handleHangup(), and handleCancelCallInvite()
+     * so the timer never double-fires when the call ends normally.
+     */
+    private fun cancelInviteTimeout(callId: String) {
+        inviteTimeoutRunnables.remove(callId)?.let {
+            inviteTimeoutHandler.removeCallbacks(it)
+            android.util.Log.d("TVConnectionService",
+                "[INVITE-TIMEOUT] Cancelled timer for callId=$callId")
+        }
+    }
+
     private fun handleAnswer(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+
+        // Cancel the per-invite timeout — the call is being answered normally
+        cancelInviteTimeout(callId)
 
         // Idempotency guard — prevents double-answering when both
         // IncomingCallActivity and Connection.onAnswer() race to answer.
@@ -1183,6 +1255,9 @@ class TVConnectionService : ConnectionService() {
      */
     private fun handleHangup(intent: Intent) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
+
+        // Cancel the per-invite timeout — the call is being declined/ended normally
+        cancelInviteTimeout(callId)
 
         // Stop ringing — call is being declined/ended
         stopServiceRinging()
