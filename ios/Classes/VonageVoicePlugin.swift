@@ -1829,22 +1829,36 @@ extension VonageVoicePlugin {
             // explicitly so the WebRTC stack releases audio before we drop the
             // provider (didDeactivateAudioSession won't fire after invalidation).
             VGVoiceClient.disableAudio(AVAudioSession.sharedInstance())
-            // CRITICAL: Remove the delegate BEFORE calling invalidate(). Even
-            // after invalidate(), iOS fires providerDidReset and providerDidBegin
-            // on the still-attached delegate, causing the stale Vonage provider
-            // to be re-registered as iOS's "most recently active" CallKit
-            // provider. The next Twilio CXStartCallAction then gets routed to
-            // Vonage's handler (which calls action.fail()) instead of Twilio's,
-            // silently blocking all subsequent Twilio outbound calls.
-            callKitProvider?.setDelegate(nil, queue: nil)
-            isIntentionalProviderReset = true
-            callKitProvider?.invalidate()
-            // providerDidReset won't fire (delegate is nil), so reset the flag
-            // manually to avoid a stale `true` suppressing a future system reset.
-            isIntentionalProviderReset = false
+            // CRITICAL: invalidate() must NOT be called synchronously from inside
+            // a CXProviderDelegate callback (e.g. performEndCallAction). iOS does
+            // not support calling invalidate() while the provider's delegate queue
+            // is mid-dispatch — doing so corrupts the internal CKCallManager /
+            // TUCallCenter registry, causing the next Twilio CXStartCallAction to
+            // be accepted but performStartCallAction to never fire.
+            //
+            // Fix: capture the provider/controller, nil the instance vars
+            // immediately (blocks future callbacks), remove the delegate
+            // synchronously (safe inside a callback), then defer invalidate() to
+            // the next runloop cycle via DispatchQueue.main.async so it runs only
+            // after the current performEndCallAction stack fully unwinds.
+            let providerToInvalidate = callKitProvider
             callKitProvider = nil
             callKitCallController = nil
-            sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider released (delegate nil'd before invalidate)")
+            providerToInvalidate?.setDelegate(nil, queue: nil)
+            isIntentionalProviderReset = true
+            sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider delegate nil'd — deferring invalidate()")
+            DispatchQueue.main.async { [weak self] in
+                providerToInvalidate?.invalidate()
+                self?.isIntentionalProviderReset = false
+                // Deregister the Vonage SDK's internal CallKit binding AFTER the provider
+                // is fully invalidated. When isUsingCallKit remains true after invalidation,
+                // the SDK stays connected to iOS's TUCallCenter internally — receiving
+                // Twilio's CXStartCallAction and never responding (fulfill/fail), which
+                // permanently stalls the transaction and blocks all subsequent Twilio calls.
+                // Setting false here severs that binding cleanly.
+                VGVoiceClient.isUsingCallKit = false
+                self?.sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider invalidated, VGVoiceClient.isUsingCallKit=false")
+            }
         }
         sendPhoneCallEvents(description: "LOG|  after: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
     }
@@ -1963,28 +1977,31 @@ extension VonageVoicePlugin: CXProviderDelegate {
         guard action.callUUID == pendingOutgoingUUID else {
             sendPhoneCallEvents(description: "LOG|provider:performStartCallAction — ignoring UUID \(action.callUUID), not initiated by VonageVoicePlugin (expected \(String(describing: pendingOutgoingUUID)))")
 
-            // UUID not owned by Vonage — NEVER call action.fail() here.
+            // UUID not owned by Vonage — MUST call action.fail() here.
             //
-            // iOS delivers CXStartCallAction to ALL registered CXProvider delegates.
-            // If ANY provider calls action.fail() on an action it doesn't own,
-            // iOS propagates that failure to the originating CXCallController
-            // (error 2 = unknownCallProvider), blocking ALL subsequent calls from
-            // that controller — regardless of whether Vonage has active calls.
+            // iOS dispatches CXStartCallAction to ALL registered CXProvider delegates
+            // in the process (including this Vonage handler for Twilio's UUIDs).
+            // iOS requires EVERY registered provider to respond (fulfill OR fail)
+            // before it delivers the result to the originating CXCallController's
+            // request() completion handler. If any provider returns without
+            // responding, the transaction is permanently stuck — the completion
+            // callback never fires, Twilio's performStartCallAction never gets
+            // dispatched, and the call silently never starts.
             //
-            // The race that triggered this: Pusher/server signals call-end to Dart
-            // before the native Vonage SDK fires didReceiveHangupForCall.  The user
-            // taps Dial-Twilio in that ~200–500 ms window; Vonage's CXProvider is
-            // still registered with activeCalls non-empty, so we previously fell
-            // through to action.fail() — causing error 2 in Twilio.
+            // Calling action.fail() here does NOT cause error 2 (unknownCallProvider)
+            // in Twilio's callKitCallController.request() callback. That error only
+            // fires when NO provider fulfills the action. Since Twilio's own provider
+            // will call action.fulfill(), the transaction succeeds — Vonage's fail()
+            // is simply iOS's mechanism to acknowledge "I don't own this call."
             //
-            // Correct behaviour: return without resolving the action in ALL cases.
-            //   • iOS does NOT require every provider to respond to an action it
-            //     doesn't own — only the owning provider's fulfill/fail matters.
-            //   • Any unresolved actions on this provider are automatically cancelled
-            //     when callKitProvider.invalidate() runs in callDisconnected(), which
-            //     fires ~200–500 ms later when didReceiveHangupForCall arrives.
-            //   • This does NOT affect Twilio's provider or its call controller.
-            sendPhoneCallEvents(description: "LOG|  non-Vonage UUID — returning without action (activeCalls=\(activeCalls.count) invites=\(callInvites.count))")
+            // Historical note: the original action.fail() → error 2 regression was
+            // caused by the CXProvider corruption bug (invalidate() called inside a
+            // CXProviderDelegate callback), which prevented Twilio's provider from
+            // ever receiving or fulfilling the action. That bug is now fixed by the
+            // deferred invalidate() in callDisconnected(). With the corruption
+            // removed, Vonage fail() + Twilio fulfill() = transaction succeeds.
+            sendPhoneCallEvents(description: "LOG|  non-Vonage UUID — calling action.fail() (activeCalls=\(activeCalls.count) invites=\(callInvites.count) pendingUUID=\(String(describing: pendingOutgoingUUID)))")
+            action.fail()
             return
         }
         pendingOutgoingUUID = nil
@@ -2147,8 +2164,35 @@ extension VonageVoicePlugin: CXProviderDelegate {
                     self?.sendPhoneCallEvents(description: "LOG|hangup failed: \(error.localizedDescription)")
                 }
             }
+            // CRITICAL: Report the call as ended to CXCallObserver BEFORE invalidating
+            // the provider. CXCallObserver tracks all active calls system-wide. Without
+            // this report, CXCallObserver keeps hasEnded=false for this UUID until
+            // invalidate() fires (deferred to next runloop). Twilio's
+            // callKitCallController.request(CXStartCallAction) can fire in that window —
+            // iOS sees the Vonage call still "active" in CXCallObserver and silently
+            // drops the transaction (completion never fires, performStartCallAction
+            // never fires). Reporting ended here updates CXCallObserver synchronously
+            // so it shows 0 active calls by the time Twilio submits its transaction.
+            provider.reportCall(with: action.callUUID, endedAt: Date(), reason: .remoteEnded)
+            sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: reported call ended to CXCallObserver")
             callDisconnected(uuid: action.callUUID)
-            sendPhoneCallEvents(description: "Call Ended")
+            // CRITICAL: Defer "Call Ended" to run AFTER Vonage's CXProvider has been fully
+            // invalidated. callDisconnected() defers invalidate() via DispatchQueue.main.async.
+            // Since both blocks are queued on the main queue in FIFO order, this block runs
+            // AFTER invalidate() + VGVoiceClient.isUsingCallKit=false complete.
+            //
+            // Without this deferral, "Call Ended" arrives at Flutter synchronously, Flutter
+            // immediately initiates a Twilio call, and Twilio's CXStartCallAction fires while
+            // Vonage's CXProvider is still registered (with delegate=nil, pending invalidation).
+            // iOS sees a registered provider that cannot respond → error 2
+            // (CXErrorCodeRequestTransactionErrorUnknownCallProvider) and rejects the transaction.
+            //
+            // With this deferral: invalidate() runs first (Vonage's provider fully deregistered),
+            // THEN Flutter receives "Call Ended" and makes the Twilio call → success.
+            DispatchQueue.main.async { [weak self] in
+                self?.sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: sending deferred Call Ended (after invalidate)")
+                self?.sendPhoneCallEvents(description: "Call Ended")
+            }
 
         } else {
             callDisconnected(uuid: action.callUUID)
