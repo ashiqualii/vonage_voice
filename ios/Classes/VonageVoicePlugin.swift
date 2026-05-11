@@ -61,6 +61,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var pendingEvents: [Any] = []
     private static let maxPendingEvents = 50
 
+    /// Broadcast by Vonage when its CXProvider is torn down so Twilio knows its own
+    /// TUCallCenter slot was stolen and must allocate a fresh CXProvider on the next call.
+    static let cxProviderInvalidatedNotification = NSNotification.Name(
+        "com.vonage.voice.CXProviderInvalidated"
+    )
+
     // ─── Vonage SDK ──────────────────────────────────────────────────
     private var voiceClient: VGVoiceClient!
 
@@ -1846,6 +1852,15 @@ extension VonageVoicePlugin {
             callKitCallController = nil
             providerToInvalidate?.setDelegate(nil, queue: nil)
             isIntentionalProviderReset = true
+            // Notify Twilio (same process) that our CXProvider was deregistered from
+            // TUCallCenter. Twilio observes this to set needsProviderReset=true so it
+            // allocates a fresh CXProvider on the next outgoing call — avoiding the
+            // CXErrorCodeRequestTransactionErrorUnknownCallProvider (error 2) that occurs
+            // when Twilio tries to reuse an orphaned provider.
+            NotificationCenter.default.post(
+                name: VonageVoicePlugin.cxProviderInvalidatedNotification,
+                object: nil
+            )
             sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider delegate nil'd — deferring invalidate()")
             DispatchQueue.main.async { [weak self] in
                 providerToInvalidate?.invalidate()
