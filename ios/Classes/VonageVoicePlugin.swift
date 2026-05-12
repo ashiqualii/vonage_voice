@@ -654,31 +654,49 @@ extension VonageVoicePlugin {
     }
 
     private func handleUnregister(arguments: [String: Any], result: @escaping FlutterResult) {
-        // Unregister push token from Vonage.
-        if let deviceId = deviceId {
-            voiceClient.unregisterDeviceTokens(byDeviceId: deviceId) { [weak self] error in
-                if let error = error {
-                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
-                }
-            }
-        }
+        // Capture deviceId BEFORE clearing local state so the SDK call can still use it.
+        let effectiveDeviceId = deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
 
-        // Delete the Vonage session.
-        voiceClient.deleteSession { [weak self] error in
-            if let error = error {
-                self?.sendPhoneCallEvents(description: "LOG|deleteSession failed: \(error.localizedDescription)")
-            } else {
-                self?.sendPhoneCallEvents(description: "LOG|Session deleted successfully")
-            }
-        }
-
-        // Clear all session state.
+        // Clear all local session state immediately.
+        // isSessionReady = false ensures any incoming push received during the
+        // async SDK calls below is ignored.
         accessToken = nil
         deviceId = nil
         isSessionReady = false
         UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
         clearStoredJwt()
-        result(true)
+
+        // Deletes the Vonage session and resolves the Dart future.
+        // Called after unregisterDeviceTokens completes (or is skipped when no deviceId).
+        // IMPORTANT: result() is called here — inside the last callback — so the
+        // Dart `await` only resolves once the SDK network calls have actually finished.
+        let deleteSessionAndResolve = { [weak self] in
+            guard let self = self else { result(true); return }
+            self.voiceClient.deleteSession { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|deleteSession failed: \(error.localizedDescription)")
+                } else {
+                    self?.sendPhoneCallEvents(description: "LOG|Session deleted successfully")
+                }
+                result(true)
+            }
+        }
+
+        if let id = effectiveDeviceId {
+            // De-register this device's push token from Vonage's servers so it stops
+            // routing calls here. Chain deleteSession after — result() fires only once both complete.
+            voiceClient.unregisterDeviceTokens(byDeviceId: id) { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
+                } else {
+                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens succeeded for deviceId: \(id)")
+                }
+                deleteSessionAndResolve()
+            }
+        } else {
+            sendPhoneCallEvents(description: "LOG|handleUnregister: no deviceId in memory or UserDefaults — skipping unregisterDeviceTokens")
+            deleteSessionAndResolve()
+        }
     }
 
     private func handleRefreshSession(arguments: [String: Any], result: @escaping FlutterResult) {
