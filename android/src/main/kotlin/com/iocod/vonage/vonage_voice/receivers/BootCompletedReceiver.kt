@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessaging
+import com.iocod.vonage.vonage_voice.service.TVConnectionService
 import com.iocod.vonage.vonage_voice.service.VonageClientHolder
 
 /**
@@ -47,6 +48,12 @@ class BootCompletedReceiver : BroadcastReceiver() {
         }
 
         Log.i(TAG, "[BOOT-1] ✓ Boot action recognized: ${intent.action}")
+
+        // Clear any stale active-call flag from before the reboot.
+        // Without this, a crash/kill mid-call could leave the flag set permanently,
+        // causing all future incoming calls (Twilio or Vonage) to be suppressed until reinstall.
+        TVConnectionService.setCallActive(context, false)
+        Log.i(TAG, "[BOOT-1] Cleared stale cross-plugin active-call flag")
 
         // Check if a JWT is stored — if not, answering an incoming call after
         // reboot will fail even if the notification appears.

@@ -266,6 +266,34 @@ class TVConnectionService : ConnectionService() {
                 android.util.Log.w("TVConnectionService", "clearAnsweredCallData failed: ${e.message}")
             }
         }
+
+        // ── Cross-plugin active-call flag ─────────────────────────────────────
+        // Written to a shared SharedPreferences file so EasifyFirebaseMessagingService
+        // (the FCM dispatcher) can detect any active call at the FCM-message level
+        // and silently suppress incoming calls from either provider.
+        // Uses synchronous commit() for cross-process safety.
+        const val CROSS_PLUGIN_PREFS    = "easify_active_call_state"
+        const val KEY_CALL_ACTIVE       = "active_call_in_progress"
+        const val KEY_CALL_ACTIVE_TS    = "active_call_timestamp"
+
+        fun setCallActive(context: android.content.Context, active: Boolean) {
+            try {
+                val editor = context.getSharedPreferences(
+                    CROSS_PLUGIN_PREFS, android.content.Context.MODE_PRIVATE
+                ).edit()
+                if (active) {
+                    editor.putBoolean(KEY_CALL_ACTIVE, true)
+                        .putLong(KEY_CALL_ACTIVE_TS, System.currentTimeMillis())
+                } else {
+                    editor.remove(KEY_CALL_ACTIVE)
+                        .remove(KEY_CALL_ACTIVE_TS)
+                }
+                editor.commit()
+                android.util.Log.d("TVConnectionService", "setCallActive: active=$active")
+            } catch (e: Exception) {
+                android.util.Log.w("TVConnectionService", "setCallActive failed: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -763,6 +791,7 @@ class TVConnectionService : ConnectionService() {
             // available transition point in the Vonage SDK's public API surface.
             // setDialing() is intentionally omitted for the same reason.
             connection.setCallActive()
+            setCallActive(this, true)
             requestAudioFocus() 
 
             startCallForegroundService()
@@ -1217,6 +1246,7 @@ class TVConnectionService : ConnectionService() {
             )
             activeConnections[callId] = connection
             connection.setCallActive()
+            setCallActive(this, true)
             requestAudioFocus() 
 
             // ── Switch notification from incoming → active call ───────────────────
@@ -1268,6 +1298,7 @@ class TVConnectionService : ConnectionService() {
         // Clear both the pending invite data and the answered call data
         clearPendingCallData(this)
         clearAnsweredCallData(this)
+        setCallActive(this, false)
         VonageFirebaseMessagingService.clearPendingFcmData(this)
 
         val client = VonageClientHolder.voiceClient ?: run {
@@ -1345,6 +1376,7 @@ class TVConnectionService : ConnectionService() {
         // Clear both the pending invite data and the answered call data
         clearPendingCallData(this)
         clearAnsweredCallData(this)
+        setCallActive(this, false)
         VonageFirebaseMessagingService.clearPendingFcmData(this)
         incomingNotificationPosted = false
 
@@ -2168,6 +2200,7 @@ class TVConnectionService : ConnectionService() {
     private fun broadcastCallEnded(callId: String) {
         // Clear answered call data — the call is fully over
         clearAnsweredCallData(this)
+        setCallActive(this, false)
         val intent = Intent(Constants.BROADCAST_CALL_ENDED).apply {
             putExtra(Constants.EXTRA_CALL_ID, callId)
         }
