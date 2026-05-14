@@ -97,6 +97,13 @@ class MethodChannelVonageVoice extends VonageVoicePlatform {
     });
   }
 
+  /// Returns the Vonage device ID stored natively after [setTokens] completes.
+  /// Returns `null` if registration has not yet succeeded.
+  @override
+  Future<String?> getDeviceId() {
+    return _channel.invokeMethod<String?>('getDeviceId');
+  }
+
   /// Refresh an expiring JWT without destroying the session.
   @override
   Future<bool?> refreshSession({required String accessToken}) {

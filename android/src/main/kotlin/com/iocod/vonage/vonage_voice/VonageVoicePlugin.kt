@@ -514,6 +514,10 @@ class VonageVoicePlugin :
             // ── Call state queries ────────────────────────────────────────
             VNMethodChannels.IS_ON_CALL -> result.success(TVConnectionService.hasActiveCall())
             VNMethodChannels.CALL_SID -> result.success(activeCallId)
+            VNMethodChannels.GET_DEVICE_ID -> {
+                val id = context?.let { VonageClientHolder.getStoredDeviceId(it) }
+                result.success(id)
+            }
 
             // ── Terminated-state recovery (mirrors Twilio's GetActiveCallOnResumeFromTerminatedState) ───
             // Dart bloc calls this on startup to trigger a re-emit of the current call state.

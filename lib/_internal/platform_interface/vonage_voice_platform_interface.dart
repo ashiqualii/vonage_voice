@@ -170,6 +170,16 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// ```
   Future<bool?> unregister({String? accessToken});
 
+  /// Returns the Vonage device ID that was assigned by [setTokens] during
+  /// `registerDevicePushToken` (Android) / `registerVoipToken` (iOS).
+  ///
+  /// Returns `null` if [setTokens] has never completed successfully, or if the
+  /// registration callback has not yet fired (it is asynchronous).
+  ///
+  /// Use this to manage device-ID bookkeeping on the Flutter side — for example,
+  /// passing the ID to your backend so it can target specific devices.
+  Future<String?> getDeviceId();
+
   /// Refreshes the Vonage JWT without tearing down the active session.
   ///
   /// Vonage JWTs have a configurable TTL (typically 24 hours). Call this

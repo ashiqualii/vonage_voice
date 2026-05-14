@@ -429,6 +429,9 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             handleUnregister(arguments: arguments, result: result)
         case "refreshSession":
             handleRefreshSession(arguments: arguments, result: result)
+        case "getDeviceId":
+            let storedId = deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
+            result(storedId)
 
         // ── Calls ────────────────────────────────────────────────────
         case "makeCall":

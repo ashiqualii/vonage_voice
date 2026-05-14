@@ -25,6 +25,9 @@ enum class VNMethodChannels(val methodName: String) {
     /** Refresh an expiring JWT without destroying the session. */
     REFRESH_SESSION("refreshSession"),
 
+    /** Returns the stored Vonage device ID returned by registerDevicePushToken, or null if not yet registered. */
+    GET_DEVICE_ID("getDeviceId"),
+
     // ── Core call controls ────────────────────────────────────────────────
 
     /** Place an outbound call via serverCall(). */
