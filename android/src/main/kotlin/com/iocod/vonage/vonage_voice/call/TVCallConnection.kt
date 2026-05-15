@@ -85,12 +85,30 @@ class TVCallConnection(
     /**
      * Called when the system audio route changes (speaker, earpiece, Bluetooth).
      * We sync our local state and broadcast to Flutter.
+     *
+     * NOTE: On MIUI and some Android 12+ devices CallAudioState.route can be stale.
+     * We validate the Bluetooth flag against the actual communication device /
+     * SCO state before trusting it to prevent phantom Bluetooth UI.
      */
     override fun onCallAudioStateChanged(state: CallAudioState) {
         isMuted = state.isMuted
 
         val newSpeaker = state.route == CallAudioState.ROUTE_SPEAKER
-        val newBluetooth = state.route == CallAudioState.ROUTE_BLUETOOTH
+
+        // Guard against stale CallAudioState on MIUI / Android 12+:
+        // Only report Bluetooth active if the audio framework also confirms it.
+        val newBluetooth = if (state.route == CallAudioState.ROUTE_BLUETOOTH) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val device = audioManager.communicationDevice
+                device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                device?.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn
+            }
+        } else {
+            false
+        }
 
         if (newSpeaker != isSpeakerOn) {
             isSpeakerOn = newSpeaker
@@ -135,7 +153,24 @@ class TVCallConnection(
             broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, false)
         }
         isSpeakerOn = speakerOn
-        audioManager.isSpeakerphoneOn = speakerOn
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // API 31+: isSpeakerphoneOn is deprecated — use setCommunicationDevice
+            val devices = audioManager.availableCommunicationDevices
+            val targetDevice = if (speakerOn) {
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            } else {
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+            }
+            if (targetDevice != null) {
+                audioManager.setCommunicationDevice(targetDevice)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isSpeakerphoneOn = speakerOn
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = speakerOn
+        }
         broadcastStateEvent(Constants.BROADCAST_SPEAKER_STATE, speakerOn)
     }
 
