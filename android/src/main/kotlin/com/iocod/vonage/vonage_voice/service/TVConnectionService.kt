@@ -804,7 +804,12 @@ class TVConnectionService : ConnectionService() {
             // setDialing() is intentionally omitted for the same reason.
             connection.setCallActive()
             setCallActive(this, true)
-            requestAudioFocus() 
+            requestAudioFocus()
+            // Oppo ColorOS (and Realme) reset AudioManager.mode to MODE_NORMAL
+            // when the screen locks, even during an active outgoing call.
+            // The screen receiver re-applies MODE_IN_COMMUNICATION on screen-off/on
+            // so the WebRTC mic capture path is never silenced.
+            registerScreenOnReceiver()
 
             startCallForegroundService()
 
@@ -1133,6 +1138,9 @@ class TVConnectionService : ConnectionService() {
             }
         }
         registerReceiver(screenOnReceiver, IntentFilter().apply {
+            // ACTION_SCREEN_OFF: ColorOS 16 resets MODE_IN_COMMUNICATION at screen-off
+            // time. Re-applying it immediately prevents any gap in mic capture.
+            addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         })
