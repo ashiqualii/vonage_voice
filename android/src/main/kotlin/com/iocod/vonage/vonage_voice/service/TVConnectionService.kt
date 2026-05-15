@@ -78,6 +78,9 @@ class TVConnectionService : ConnectionService() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var scoReceiver: BroadcastReceiver? = null
+    // Receives ACTION_SCREEN_ON / ACTION_USER_PRESENT to re-apply audio mode
+    // on OPPO ColorOS where AUDIOFOCUS_GAIN doesn't reliably fire after screen-on.
+    private var screenOnReceiver: BroadcastReceiver? = null
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
 
     // Guards against firing fullScreenIntent multiple times for the same call.
@@ -116,6 +119,15 @@ class TVConnectionService : ConnectionService() {
                         android.util.Log.d("TVConnectionService",
                             "[AUDIO-FOCUS] Restoring unmuted state after focus gain")
                     }
+                }
+                // Re-apply audio mode in case OEM reset it during screen lock/unlock.
+                // MIUI / Redmi / Poco / Vivo: AUDIOFOCUS_GAIN fires on screen unlock.
+                // Without this, MODE_IN_COMMUNICATION stays reset → bidirectional silence.
+                if (activeConnections.isNotEmpty()) {
+                    android.util.Log.d("TVConnectionService",
+                        "[AUDIO-FOCUS] GAIN — re-applying MODE_IN_COMMUNICATION (OEM lock-screen fix)")
+                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.mode = AudioManager.MODE_IN_COMMUNICATION
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
@@ -929,6 +941,7 @@ class TVConnectionService : ConnectionService() {
 
     private fun releaseAudioFocus() {
         unregisterBluetoothMonitor()
+        unregisterScreenOnReceiver()
         cancelPendingAudioFocusRestore()
         hasAudioFocus = false
         wasAutoMutedByFocusLoss = false
@@ -1091,6 +1104,47 @@ class TVConnectionService : ConnectionService() {
         scoReceiver = null
     }
 
+    // ── OEM lock-screen audio fix ─────────────────────────────────────────
+
+    /**
+     * Registers a broadcast receiver for ACTION_SCREEN_ON and ACTION_USER_PRESENT.
+     *
+     * OPPO ColorOS (and some Realme devices) do not reliably fire AUDIOFOCUS_GAIN
+     * after the screen turns on during an active call. Without this, MODE_IN_COMMUNICATION
+     * stays reset (OEM set it to MODE_NORMAL while screen was off), causing:
+     *   - Local can't hear remote (earpiece not in voice mode)
+     *   - Remote can't hear local (WebRTC ADM mic capture path inactive)
+     *
+     * ACTION_USER_PRESENT fires after PIN/pattern unlock — the safest re-apply point.
+     * Guard: no-op when no active connections (e.g., between calls).
+     */
+    private fun registerScreenOnReceiver() {
+        if (screenOnReceiver != null) return
+        screenOnReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (activeConnections.isEmpty()) return
+                android.util.Log.d("TVConnectionService",
+                    "[SCREEN-ON] ${intent.action} — re-applying audio mode for active call")
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.isMicrophoneMute = false
+                wasAutoMutedByFocusLoss = false
+                requestAudioFocus()
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+            }
+        }
+        registerReceiver(screenOnReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        })
+    }
+
+    private fun unregisterScreenOnReceiver() {
+        screenOnReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        screenOnReceiver = null
+    }
+
     private fun isBluetoothAudioDevice(type: Int): Boolean {
         return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -1247,7 +1301,8 @@ class TVConnectionService : ConnectionService() {
             activeConnections[callId] = connection
             connection.setCallActive()
             setCallActive(this, true)
-            requestAudioFocus() 
+            requestAudioFocus()
+            registerScreenOnReceiver()
 
             // ── Switch notification from incoming → active call ───────────────────
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
