@@ -2536,6 +2536,32 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             return
         }
 
+        // ── ACTIVE CALL GUARD (single-call only) ──────────────────────────
+        // Mirrors Android's TVConnectionService: if a call is already active,
+        // auto-reject the new invite silently so the active call is not
+        // interrupted. The second call arrives via the live WebSocket (not
+        // PushKit) when the app is foreground, so no reportNewIncomingCall
+        // is required by Apple here.
+        //
+        // IMPORTANT: Do NOT emit "Missed Call" here. "Missed Call" maps to
+        // CallEvent.missedCall in the Dart BLoC which sets isCallEnded=true
+        // and dismisses the active call screen for the FIRST (still-live) call.
+        // Mirrors Twilio's pattern: suppress "Missed Call" when other active
+        // calls remain (SwiftTwilioVoicePlugin.swift callInviteCancelled guard).
+        if !activeCalls.isEmpty || activeCallUUID != nil {
+            NSLog("[VonageVoice] Second invite callId=%@ while active call exists — auto-rejecting (suppressing Missed Call event)", callId)
+            sendPhoneCallEvents(description: "LOG|Auto-rejecting second call callId=\(callId) — active call in progress, Missed Call suppressed to protect active call screen")
+            voiceClient.reject(callId) { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|Auto-reject second call failed: \(error.localizedDescription)")
+                }
+            }
+            // Do NOT send "Missed Call" — first call is still active and
+            // "Missed Call" would set isCallEnded=true on the BLoC, dismissing
+            // the active call screen for the first call.
+            return
+        }
+
         // ── NORMAL PATH (foreground / background) ──
         let uuid = UUID()
         let callerDisplay = clients[caller] ?? caller
@@ -2649,10 +2675,18 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         guard let uuid = callIdToUUID[callId] else {
             // Cancel arrived before the invite was delivered (e.g. caller hung up
             // very quickly while app was in foreground). No UUID exists, so there's
-            // nothing to clean up in CallKit — but we still notify Flutter so the
-            // UI can show a missed-call indicator.
-            sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
-            sendPhoneCallEvents(description: "Missed Call")
+            // IMPORTANT: Only emit "Missed Call" when no active call exists.
+            // If an active call is in progress (e.g. this cancel is for the 2nd
+            // call we auto-rejected in didReceiveInviteForCall), emitting "Missed
+            // Call" would set isCallEnded=true in the BLoC and dismiss the first
+            // call's active screen. Mirrors the activeCalls.isEmpty guard used in
+            // all other "Missed Call" emission sites.
+            if activeCalls.isEmpty {
+                sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
+                sendPhoneCallEvents(description: "Missed Call")
+            } else {
+                sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite but active call exists — suppressing Missed Call to protect active call screen")
+            }
             return
         }
 
