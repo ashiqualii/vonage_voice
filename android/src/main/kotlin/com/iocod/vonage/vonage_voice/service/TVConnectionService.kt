@@ -129,14 +129,36 @@ class TVConnectionService : ConnectionService() {
                     // Preserve mic mute state before changing audio mode —
                     // some OEMs reset isMicrophoneMute when AudioManager.mode is set.
                     val muteBeforeRecovery = am.isMicrophoneMute
+                    // Preserve speaker state before changing audio mode.
+                    val speakerBeforeRecovery = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        am.communicationDevice?.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                    } else {
+                        @Suppress("DEPRECATION")
+                        am.isSpeakerphoneOn
+                    }
                     am.mode = AudioManager.MODE_IN_COMMUNICATION
                     // Restore mic mute to what it was before mode change
                     am.isMicrophoneMute = muteBeforeRecovery
+                    // Restore speaker routing to what it was before mode change
+                    if (speakerBeforeRecovery) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            val spkDev = am.availableCommunicationDevices
+                                .firstOrNull { it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                            if (spkDev != null) am.setCommunicationDevice(spkDev)
+                            else {
+                                @Suppress("DEPRECATION")
+                                am.isSpeakerphoneOn = true
+                            }
+                        } else {
+                            @Suppress("DEPRECATION")
+                            am.isSpeakerphoneOn = true
+                        }
+                    }
                     val modeAfter = am.mode
                     android.util.Log.d("TVConnectionService",
                         "[AUDIO-FOCUS] GAIN — re-applied MODE_IN_COMMUNICATION: " +
                         "before=$modeBefore after=$modeAfter stuck=${modeAfter == AudioManager.MODE_IN_COMMUNICATION} | " +
-                        "micMute=${am.isMicrophoneMute}")
+                        "micMute=${am.isMicrophoneMute} speaker=$speakerBeforeRecovery")
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
@@ -867,7 +889,7 @@ class TVConnectionService : ConnectionService() {
      *   EXTRA_CALL_ID — callId of the invite to answer
      */
 
-     private fun requestAudioFocus(preserveMute: Boolean = false) {
+     private fun requestAudioFocus(preserveMute: Boolean = false, preserveSpeaker: Boolean = false) {
                 val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 lastAudioFocusRequestTime = SystemClock.elapsedRealtime()
                 cancelPendingAudioFocusRestore()
@@ -905,7 +927,12 @@ class TVConnectionService : ConnectionService() {
 
                 // Set audio mode to voice call — critical for microphone to work
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-                audioManager.isSpeakerphoneOn = false
+                // preserveSpeaker: when recovering from screen lock, preserve the user's
+                // intentional speaker state. Only reset speaker for new calls (default false).
+                if (!preserveSpeaker) {
+                    @Suppress("DEPRECATION")
+                    audioManager.isSpeakerphoneOn = false
+                }
                 // preserveMute is read by callers BEFORE any OS-level resets can occur.
                 // We use it here rather than re-reading am.isMicrophoneMute (which may
                 // have already been reset by the OS between the caller's read and now).
@@ -916,15 +943,15 @@ class TVConnectionService : ConnectionService() {
                 android.util.Log.d("TVConnectionService",
                     "[REQ-AUDIO-FOCUS] mode set: before=$modeBefore after=$modeAfter " +
                     "stuck=${modeAfter == AudioManager.MODE_IN_COMMUNICATION} | " +
-                    "micMute=${audioManager.isMicrophoneMute} preserveMute=$preserveMute")
+                    "micMute=${audioManager.isMicrophoneMute} preserveMute=$preserveMute preserveSpeaker=$preserveSpeaker")
 
-                // Broadcast speaker=off so Flutter UI starts in the correct state.
+                // Broadcast speaker state: preserve on recovery, off for new calls.
                 // Broadcast the caller-supplied mute state (not always false) to preserve
                 // the user's intentional mute across audio focus recovery events.
-                val speakerOffBroadcast = Intent(Constants.BROADCAST_SPEAKER_STATE).apply {
-                    putExtra("state", false)
+                val speakerBroadcast = Intent(Constants.BROADCAST_SPEAKER_STATE).apply {
+                    putExtra("state", preserveSpeaker)
                 }
-                broadcastManager.sendBroadcast(speakerOffBroadcast)
+                broadcastManager.sendBroadcast(speakerBroadcast)
 
                 val muteBroadcast = Intent(Constants.BROADCAST_MUTE_STATE).apply {
                     putExtra("state", preserveMute)
@@ -932,35 +959,54 @@ class TVConnectionService : ConnectionService() {
                 broadcastManager.sendBroadcast(muteBroadcast)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    // API 31+ — prefer Bluetooth if connected, otherwise earpiece
                     val devices = audioManager.availableCommunicationDevices
-                    val bluetoothDevice = devices.firstOrNull {
-                        it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                        it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
-                    }
-                    val targetDevice = bluetoothDevice
-                        ?: devices.firstOrNull {
-                            it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                    if (preserveSpeaker) {
+                        // Recovery path: route back to speaker
+                        val speakerDevice = devices.firstOrNull {
+                            it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
                         }
-                    targetDevice?.let { audioManager.setCommunicationDevice(it) }
+                        if (speakerDevice != null) {
+                            audioManager.setCommunicationDevice(speakerDevice)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            audioManager.isSpeakerphoneOn = true
+                        }
+                    } else {
+                        // New call or non-speaker recovery: prefer BT if connected, otherwise earpiece
+                        val bluetoothDevice = devices.firstOrNull {
+                            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+                        }
+                        val targetDevice = bluetoothDevice
+                            ?: devices.firstOrNull {
+                                it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                            }
+                        targetDevice?.let { audioManager.setCommunicationDevice(it) }
 
-                    // Broadcast BT state so Flutter UI updates immediately
-                    if (bluetoothDevice != null) {
-                        val btBroadcast = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
-                            putExtra("state", true)
+                        // Broadcast BT state so Flutter UI updates immediately
+                        if (bluetoothDevice != null) {
+                            val btBroadcast = Intent(Constants.BROADCAST_BLUETOOTH_STATE).apply {
+                                putExtra("state", true)
+                            }
+                            broadcastManager.sendBroadcast(btBroadcast)
                         }
-                        broadcastManager.sendBroadcast(btBroadcast)
                     }
                 } else {
-                    // Pre-API 31 — only route to BT if a device is actually connected
-                    val btOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    val hasBtDevice = btOutputs.any {
-                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                    }
-                    if (hasBtDevice && audioManager.isBluetoothScoAvailableOffCall) {
-                        audioManager.startBluetoothSco()
-                        audioManager.isBluetoothScoOn = true
-                        // Actual BT connected state is confirmed via SCO state listener
+                    if (preserveSpeaker) {
+                        // Recovery path: re-apply speaker (pre-API 31)
+                        @Suppress("DEPRECATION")
+                        audioManager.isSpeakerphoneOn = true
+                    } else {
+                        // Pre-API 31 — only route to BT if a device is actually connected
+                        val btOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                        val hasBtDevice = btOutputs.any {
+                            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        }
+                        if (hasBtDevice && audioManager.isBluetoothScoAvailableOffCall) {
+                            audioManager.startBluetoothSco()
+                            audioManager.isBluetoothScoOn = true
+                            // Actual BT connected state is confirmed via SCO state listener
+                        }
                     }
                 }
 
@@ -973,11 +1019,18 @@ class TVConnectionService : ConnectionService() {
             if (activeConnections.isNotEmpty()) {
                 android.util.Log.d("TVConnectionService",
                     "[AUDIO-FOCUS] Restoring audio focus after transient loss")
-                // Preserve mute state across transient audio focus loss/gain cycle.
+                // Preserve mute and speaker state across transient audio focus loss/gain cycle.
                 val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val muteState = am.isMicrophoneMute ||
                     (activeConnections.values.firstOrNull()?.isMuted == true)
-                requestAudioFocus(preserveMute = muteState)
+                val hwSpeaker = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    am.communicationDevice?.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                } else {
+                    @Suppress("DEPRECATION")
+                    am.isSpeakerphoneOn
+                }
+                val speakerState = hwSpeaker || (activeConnections.values.firstOrNull()?.isSpeakerOn == true)
+                requestAudioFocus(preserveMute = muteState, preserveSpeaker = speakerState)
             }
         }
         restoreAudioFocusHandler.postDelayed(pendingAudioFocusRestore!!, AUDIO_FOCUS_RESTORE_DELAY_MS)
@@ -1197,20 +1250,44 @@ class TVConnectionService : ConnectionService() {
                 // SDK callback hasn't fired (race: SDK sets hardware mute synchronously
                 // but TVCallConnection.setMuted runs in an async callback).
                 val muteBeforeRecovery = am.isMicrophoneMute
+                // Read speaker state BEFORE requestAudioFocus (same race-condition logic).
+                // On API 31+, check communication device type for ground truth.
+                val speakerBeforeRecovery = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    am.communicationDevice?.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                } else {
+                    @Suppress("DEPRECATION")
+                    am.isSpeakerphoneOn
+                }
                 wasAutoMutedByFocusLoss = false
-                requestAudioFocus(preserveMute = muteBeforeRecovery)
+                requestAudioFocus(preserveMute = muteBeforeRecovery, preserveSpeaker = speakerBeforeRecovery)
                 am.mode = AudioManager.MODE_IN_COMMUNICATION
                 // Re-apply hardware mute if needed — the OS may have reset
                 // am.isMicrophoneMute during the audio focus request on API 36+.
                 if (muteBeforeRecovery) {
                     am.isMicrophoneMute = true
                 }
+                // Re-apply speaker if needed — some OEMs reset communication device
+                // during requestAudioFocus even when we explicitly set it inside.
+                if (speakerBeforeRecovery) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val spkDev = am.availableCommunicationDevices
+                            .firstOrNull { it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                        if (spkDev != null) am.setCommunicationDevice(spkDev)
+                        else {
+                            @Suppress("DEPRECATION")
+                            am.isSpeakerphoneOn = true
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        am.isSpeakerphoneOn = true
+                    }
+                }
                 // Re-read to verify the mode actually stuck (some OEMs silently reject setMode)
                 val modeAfter = am.mode
                 val muteAfter = am.isMicrophoneMute
                 android.util.Log.d("TVConnectionService",
                     "[SCREEN-RECV] after fix: mode=$modeAfter (stuck=${modeAfter == AudioManager.MODE_IN_COMMUNICATION}) | " +
-                    "micMute=$muteAfter | hasAudioFocus=$hasAudioFocus")
+                    "micMute=$muteAfter | speaker=$speakerBeforeRecovery | hasAudioFocus=$hasAudioFocus")
                 if (modeAfter != AudioManager.MODE_IN_COMMUNICATION) {
                     android.util.Log.e("TVConnectionService",
                         "[SCREEN-RECV] *** MODE DID NOT STICK — OEM rejected setMode! " +
