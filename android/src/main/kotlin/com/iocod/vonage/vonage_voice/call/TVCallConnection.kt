@@ -91,9 +91,16 @@ class TVCallConnection(
      * SCO state before trusting it to prevent phantom Bluetooth UI.
      */
     override fun onCallAudioStateChanged(state: CallAudioState) {
-        isMuted = state.isMuted
-
-        val newSpeaker = state.route == CallAudioState.ROUTE_SPEAKER
+        // For speaker: always query live AudioManager rather than trusting state.route.
+        // state.route can be spuriously set to ROUTE_EARPIECE on screen lock/unlock
+        // on MIUI and some OEM firmwares, even when the speaker is physically active.
+        // This mirrors the stale isMuted issue. AudioManager is the hardware ground truth.
+        val newSpeaker = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn
+        }
 
         // Guard against stale CallAudioState on MIUI / Android 12+:
         // Only report Bluetooth active if the audio framework also confirms it.
@@ -119,8 +126,6 @@ class TVCallConnection(
             isBluetoothOn = newBluetooth
             broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, isBluetoothOn)
         }
-
-        broadcastStateEvent(Constants.BROADCAST_MUTE_STATE, isMuted)
     }
 
     // ── Public control methods (called by TVConnectionService) ────────────
