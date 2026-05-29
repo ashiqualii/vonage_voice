@@ -124,22 +124,37 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
 
-        // ── Active Vonage call guard ──────────────────────────────────────
-        // Vonage is single-call only (no hold/swap/conference). If there is
-        // already an active or pending Vonage call, ignore the 2nd invite
-        // entirely — it will appear as "missed" on the Vonage side.
-        if (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty()) {
-            android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
-            return
-        }
-
-        // Vonage pushes always contain a "nexmo" key.
+        // Vonage pushes always contain a "nexmo" key — check this first so
+        // non-Vonage FCM messages (Twilio, app notifications, etc.) are
+        // discarded immediately without touching any Vonage-specific state.
         val nexmoRaw = data["nexmo"]
         if (nexmoRaw.isNullOrEmpty()) {
             android.util.Log.d("VonageFCM", "[FCM-1] No 'nexmo' key — not a Vonage push, ignored")
             return
         }
         android.util.Log.i("VonageFCM", "[FCM-2] ✓ Vonage push detected")
+
+        // ── Active Vonage call guard ──────────────────────────────────────
+        // Vonage is single-call only (no hold/swap/conference). If there is
+        // already an active or pending Vonage call, ignore a 2nd *invite*
+        // entirely — it will appear as "missed" on the Vonage side.
+        //
+        // CRITICAL: Cancel/hangup pushes MUST bypass this guard.
+        // When A cancels before B answers, Vonage sends a cancel FCM push.
+        // At that moment pendingInvites.isNotEmpty() is true (B is ringing),
+        // so the old blind guard would discard the cancel push — leaving B
+        // ringing indefinitely when the WebSocket is also down.
+        // Invite pushes carry "type":"member:invited"; cancel/hangup pushes
+        // carry a different type and must reach processPushCallInvite() so
+        // the SDK fires setCallInviteCancelListener and stops the ringing.
+        val isInvitePush = try {
+            JSONObject(nexmoRaw).optString("type", "").contains("invited", ignoreCase = true)
+        } catch (e: Exception) { true }  // assume invite on parse failure (safe default)
+
+        if (isInvitePush && (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty())) {
+            android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
+            return
+        }
 
         // Record timestamp so the Dart fallback path (processVonagePush)
         // can detect that a native FCM service is already processing this push
