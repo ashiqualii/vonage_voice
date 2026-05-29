@@ -636,6 +636,12 @@ extension VonageVoicePlugin {
             return
         }
 
+        if pendingPushUUID != nil {
+            sendPhoneCallEvents(description: "LOG|tokens: Session restore in progress via PushKit push — skipping duplicate createSession")
+            result(true)
+            return
+        }
+
         sendPhoneCallEvents(description: "LOG|tokens: Creating session with Vonage")
 
         voiceClient.createSession(jwt) { [weak self] error, sessionId in
@@ -2365,7 +2371,7 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         setupCallKit()
 
         // ── KILLED STATE: No session → restore from stored JWT ───────
-        if accessToken == nil, let storedJwt = getStoredJwt() {
+        if !isSessionReady, let storedJwt = getStoredJwt() {
             handleKilledStatePush(payload: payload, storedJwt: storedJwt, completion: completion)
             return
         }
