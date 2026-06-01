@@ -1986,8 +1986,16 @@ class VonageVoicePlugin :
 
             // ── Call ended ────────────────────────────────────────────────
             Constants.BROADCAST_CALL_ENDED -> {
+                android.util.Log.i("VonagePlugin",
+                    "[HANGUP][BROADCAST] CALL_ENDED broadcast received" +
+                    " — activeCallId=$activeCallId isMuted=$isMuted" +
+                    " (will emit EVENT_CALL_ENDED to Flutter unless guard blocks)")
                 // Guard against duplicate broadcasts (hangup + SDK listener)
-                if (activeCallId == null && !isMuted) return
+                if (activeCallId == null && !isMuted) {
+                    android.util.Log.w("VonagePlugin",
+                        "[HANGUP][BROADCAST] ⚠ guard triggered: activeCallId is null — skipping duplicate")
+                    return
+                }
 
                 // If invite listeners were skipped during registerVoiceClientListeners()
                 // because the call was answered natively, register them now so the
@@ -2006,6 +2014,8 @@ class VonageVoicePlugin :
                 emitEvent(VNNativeCallEvents.EVENT_UNMUTE)
                 emitEvent(VNNativeCallEvents.EVENT_SPEAKER_OFF)
                 emitEvent(VNNativeCallEvents.EVENT_BT_OFF)
+                android.util.Log.i("VonagePlugin",
+                    "[HANGUP][BROADCAST] ✓ emitting EVENT_CALL_ENDED to Flutter")
                 emitEvent(VNNativeCallEvents.EVENT_CALL_ENDED)
 
                 if (needsInviteListenerRegistration) {
@@ -2174,8 +2184,13 @@ class VonageVoicePlugin :
 
         // ── Call hung up ──────────────────────────────────────────────────
         client.setOnCallHangupListener { callId, quality, reason ->
-            android.util.Log.d("VonagePlugin",
-                "setOnCallHangupListener: callId=$callId, reason=$reason")
+            // ★ PATH = WEBSOCKET (SDK listener fired while Flutter plugin is attached)
+            val hasConn   = TVConnectionService.activeConnections.containsKey(callId)
+            val hasInvite = TVConnectionService.pendingInvites.containsKey(callId)
+            android.util.Log.i("VonagePlugin",
+                "[HANGUP][WEBSOCKET] ▶ hangup via active-session / WebSocket path" +
+                " callId=$callId reason=$reason" +
+                " hasConnection=$hasConn hasPendingInvite=$hasInvite")
 
             // Guard against duplicate CALL_ENDED — handleHangup() in
             // TVConnectionService already removes the connection and
@@ -2184,6 +2199,8 @@ class VonageVoicePlugin :
             val pendingInvite = TVConnectionService.pendingInvites[callId]
 
             if (connection != null) {
+                android.util.Log.i("VonagePlugin",
+                    "[HANGUP][WEBSOCKET] ✓ active connection found — disconnecting + broadcasting CALL_ENDED")
                 connection.disconnect()
                 TVConnectionService.activeConnections.remove(callId)
 
@@ -2193,8 +2210,21 @@ class VonageVoicePlugin :
                 LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
             } else if (pendingInvite != null) {
                 // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
+                android.util.Log.i("VonagePlugin",
+                    "[HANGUP][WEBSOCKET] ✓ pending invite found (answered elsewhere) — cancelling invite")
                 pendingInvite.cancel()
                 TVConnectionService.pendingInvites.remove(callId)
+            } else {
+                // Fallback: connection was already removed by a concurrent cleanup path
+                // (race between local handleHangup() and SDK callback). Still broadcast
+                // CALL_ENDED so Flutter is guaranteed to exit the call screen.
+                android.util.Log.w("VonagePlugin",
+                    "[HANGUP][WEBSOCKET] ⚠ no connection/invite found for callId=$callId" +
+                    " — emitting fallback CALL_ENDED (race/double-cleanup)")
+                val fallbackBroadcast = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                LocalBroadcastManager.getInstance(ctx).sendBroadcast(fallbackBroadcast)
             }
 
             // Clear pending answered call data so MainActivity.onResume() does

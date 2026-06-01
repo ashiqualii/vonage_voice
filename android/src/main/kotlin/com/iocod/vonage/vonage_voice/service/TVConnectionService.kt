@@ -337,6 +337,24 @@ class TVConnectionService : ConnectionService() {
                 android.util.Log.w("TVConnectionService", "setCallActive failed: ${e.message}")
             }
         }
+
+        /**
+         * Expire any pending invites older than [PENDING_INVITE_TIMEOUT_MS].
+         * Called from VonageFirebaseMessagingService before the active-call guard
+         * so a stuck/stale invite never permanently blocks future incoming calls.
+         */
+        fun clearStaleInvitesIfAny() {
+            val now = System.currentTimeMillis()
+            val staleIds = pendingInviteTimestamps.filter { (_, timestamp) ->
+                now - timestamp > PENDING_INVITE_TIMEOUT_MS
+            }.keys.toList()
+            for (staleId in staleIds) {
+                android.util.Log.w("TVConnectionService",
+                    "[FCM-GUARD] Clearing stale invite before guard: callId=$staleId")
+                pendingInvites.remove(staleId)
+                pendingInviteTimestamps.remove(staleId)
+            }
+        }
     }
 
     /**
@@ -1536,6 +1554,11 @@ class TVConnectionService : ConnectionService() {
         clearAnsweredCallData(this)
         setCallActive(this, false)
         VonageFirebaseMessagingService.clearPendingFcmData(this)
+        // Reset so the NEXT incoming call's fullScreenIntent fires in ensureForeground().
+        // handleCancelCallInvite() and handleCleanup() also reset this; handleHangup()
+        // covers the receiver-declined path (onReject / user taps Decline on notification).
+        incomingNotificationPosted = false
+
 
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised")

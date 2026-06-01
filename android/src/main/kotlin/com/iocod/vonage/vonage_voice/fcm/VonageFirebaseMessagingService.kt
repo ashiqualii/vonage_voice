@@ -149,7 +149,11 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
         // the SDK fires setCallInviteCancelListener and stops the ringing.
         val isInvitePush = try {
             JSONObject(nexmoRaw).optString("type", "").contains("invited", ignoreCase = true)
-        } catch (e: Exception) { true }  // assume invite on parse failure (safe default)
+        } catch (e: Exception) { false }  // assume NOT an invite on parse failure — cancel/hangup
+        // pushes must always reach processPushCallInvite(); blocking them on bad JSON is worse
+        // than letting a potentially malformed invite through (duplicate guard catches it later).
+
+        TVConnectionService.clearStaleInvitesIfAny()
 
         if (isInvitePush && (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty())) {
             android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
@@ -328,14 +332,22 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             // Since Vonage doesn't integrate with Android Telecom for call lifecycle,
             // we must register the SDK hangup listener at the FCM level.
             client.setOnCallHangupListener { callId, quality, reason ->
-                android.util.Log.d("VonageFCM",
-                    "[FCM-HANGUP] Remote hangup detected (killed-app path): callId=$callId, reason=$reason")
+                // ★ PATH = FCM PUSH (WebSocket was down — app was killed or in background
+                //   with no active plugin session; Vonage delivered hangup via push)
+                val hasConn   = TVConnectionService.activeConnections.containsKey(callId)
+                val hasInvite = TVConnectionService.pendingInvites.containsKey(callId)
+                android.util.Log.i("VonageFCM",
+                    "[HANGUP][FCM] ▶ hangup via FCM push path (WebSocket down / app killed)" +
+                    " callId=$callId reason=$reason" +
+                    " hasConnection=$hasConn hasPendingInvite=$hasInvite")
 
                 // Remove the connection from the active map
                 val connection = TVConnectionService.activeConnections[callId]
                 val pendingInvite = TVConnectionService.pendingInvites[callId]
 
                 if (connection != null) {
+                    android.util.Log.i("VonageFCM",
+                        "[HANGUP][FCM] ✓ active connection found — disconnecting + broadcasting CALL_ENDED")
                     connection.disconnect()
                     TVConnectionService.activeConnections.remove(callId)
 
@@ -346,8 +358,22 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                     LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(broadcastIntent)
                 } else if (pendingInvite != null) {
                     // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
+                    android.util.Log.i("VonageFCM",
+                        "[HANGUP][FCM] ✓ pending invite found (answered elsewhere) — cancelling invite")
                     pendingInvite.cancel()
                     TVConnectionService.pendingInvites.remove(callId)
+                } else {
+                    // Fallback: connection was already removed by a concurrent cleanup path.
+                    // Still broadcast CALL_ENDED so any alive Flutter engine / activity can
+                    // react and dismiss the call screen — prevents a stuck UI after remote
+                    // hangup when the FCM path and plugin path race.
+                    android.util.Log.w("VonageFCM",
+                        "[HANGUP][FCM] ⚠ no connection/invite for callId=$callId" +
+                        " — emitting fallback CALL_ENDED (race/double-cleanup)")
+                    val fallbackBroadcast = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                        putExtra(Constants.EXTRA_CALL_ID, callId)
+                    }
+                    LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(fallbackBroadcast)
                 }
 
                 // Clear stale pending data so unlock doesn't navigate to a dead call
