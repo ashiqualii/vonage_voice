@@ -2209,11 +2209,18 @@ class VonageVoicePlugin :
                 }
                 LocalBroadcastManager.getInstance(ctx).sendBroadcast(broadcastIntent)
             } else if (pendingInvite != null) {
-                // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
+                // "Answered elsewhere" — SDK fires hangup instead of invite-cancel.
+                // Delegate to TVConnectionService via ACTION_CANCEL_CALL_INVITE so the
+                // full teardown runs: ringtone, wake lock, notification, pending-call
+                // prefs, invite timeout, and the exception-guarded cancel() with fallback
+                // broadcast. This mirrors how setCallInviteCancelListener is handled.
                 android.util.Log.i("VonagePlugin",
-                    "[HANGUP][WEBSOCKET] ✓ pending invite found (answered elsewhere) — cancelling invite")
-                pendingInvite.cancel()
-                TVConnectionService.pendingInvites.remove(callId)
+                    "[HANGUP][WEBSOCKET] ✓ pending invite found (answered elsewhere) — delegating to service for full teardown")
+                val cancelIntent = Intent(ctx, TVConnectionService::class.java).apply {
+                    action = Constants.ACTION_CANCEL_CALL_INVITE
+                    putExtra(Constants.EXTRA_CALL_ID, callId)
+                }
+                ContextCompat.startForegroundService(ctx, cancelIntent)
             } else {
                 // Fallback: connection was already removed by a concurrent cleanup path
                 // (race between local handleHangup() and SDK callback). Still broadcast
