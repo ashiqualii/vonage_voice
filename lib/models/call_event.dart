@@ -61,6 +61,9 @@ enum CallEvent {
   /// A diagnostic or informational log event
   log,
 
+  /// Device token registration failed due to exceeding max devices limit
+  deviceLimitExceeded,
+
   /// A runtime permission result received (microphone, phone state etc.)
   permission,
 

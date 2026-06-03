@@ -60,6 +60,14 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// ```
   VonageCallPlatform get call;
 
+  // ── Call session manager ──────────────────────────────────────────────
+
+  /// Manages call session state across events.
+  ///
+  /// Tracks [CallSession] objects for each concurrent call,
+  /// updating status as events flow in from the native layer.
+  CallSessionManager get callSessionManager;
+
   // ── Event stream ──────────────────────────────────────────────────────
 
   /// Stream of typed [CallEvent] values from the native layer.
@@ -161,6 +169,16 @@ abstract class VonageVoicePlatform extends SharedPlatformInterface {
   /// await VonageVoice.instance.unregister();
   /// ```
   Future<bool?> unregister({String? accessToken});
+
+  /// Returns the Vonage device ID that was assigned by [setTokens] during
+  /// `registerDevicePushToken` (Android) / `registerVoipToken` (iOS).
+  ///
+  /// Returns `null` if [setTokens] has never completed successfully, or if the
+  /// registration callback has not yet fired (it is asynchronous).
+  ///
+  /// Use this to manage device-ID bookkeeping on the Flutter side — for example,
+  /// passing the ID to your backend so it can target specific devices.
+  Future<String?> getDeviceId();
 
   /// Refreshes the Vonage JWT without tearing down the active session.
   ///

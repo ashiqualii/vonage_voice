@@ -87,7 +87,7 @@ dependencies {
 
     // ── Vonage Client SDK (Voice) ─────────────────────────────────────────
     // Core SDK: VoiceClient, session, call controls, push processing
-    implementation("com.vonage:client-sdk-voice:1.7.2")
+    implementation("com.vonage:client-sdk-voice:2.3.1")
 
     // ── Firebase (FCM — incoming call push delivery) ──────────────────────
     // BOM pins all Firebase versions consistently

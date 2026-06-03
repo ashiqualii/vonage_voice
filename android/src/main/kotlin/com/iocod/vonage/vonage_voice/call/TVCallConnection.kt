@@ -9,7 +9,9 @@ import android.telecom.Connection
 import android.telecom.DisconnectCause
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import com.iocod.vonage.vonage_voice.constants.Constants
+import com.iocod.vonage.vonage_voice.service.TVConnectionService
 
 /**
  * TVCallConnection — TelecomVoice active call connection.
@@ -55,23 +57,65 @@ class TVCallConnection(
      * Called when the system (or user via headset button) requests a disconnect.
      * We broadcast SYSTEM_DISCONNECT so VonageVoicePlugin can call client.hangup(callId)
      * to properly tear down the server-side call leg.
+     *
+     * We also send ACTION_HANGUP directly to TVConnectionService as a fallback
+     * for the killed-app lock screen case where TVBroadcastReceiver isn't
+     * registered. This ensures the foreground notification is always canceled
+     * and the service is stopped even without the Flutter engine running.
      */
     override fun onDisconnect() {
         audioManager.mode = AudioManager.MODE_NORMAL
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroy()
         broadcastEvent(Constants.BROADCAST_SYSTEM_DISCONNECT)
+
+        // Direct service intent — guaranteed cleanup path
+        try {
+            val intent = Intent(context, TVConnectionService::class.java).apply {
+                action = Constants.ACTION_HANGUP
+                putExtra(Constants.EXTRA_CALL_ID, callId)
+            }
+            ContextCompat.startForegroundService(context, intent)
+        } catch (e: Exception) {
+            android.util.Log.w("TVCallConnection",
+                "onDisconnect: Failed to send hangup intent: ${e.message}")
+        }
     }
 
     /**
      * Called when the system audio route changes (speaker, earpiece, Bluetooth).
      * We sync our local state and broadcast to Flutter.
+     *
+     * NOTE: On MIUI and some Android 12+ devices CallAudioState.route can be stale.
+     * We validate the Bluetooth flag against the actual communication device /
+     * SCO state before trusting it to prevent phantom Bluetooth UI.
      */
     override fun onCallAudioStateChanged(state: CallAudioState) {
-        isMuted = state.isMuted
+        // For speaker: always query live AudioManager rather than trusting state.route.
+        // state.route can be spuriously set to ROUTE_EARPIECE on screen lock/unlock
+        // on MIUI and some OEM firmwares, even when the speaker is physically active.
+        // This mirrors the stale isMuted issue. AudioManager is the hardware ground truth.
+        val newSpeaker = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn
+        }
 
-        val newSpeaker = state.route == CallAudioState.ROUTE_SPEAKER
-        val newBluetooth = state.route == CallAudioState.ROUTE_BLUETOOTH
+        // Guard against stale CallAudioState on MIUI / Android 12+:
+        // Only report Bluetooth active if the audio framework also confirms it.
+        val newBluetooth = if (state.route == CallAudioState.ROUTE_BLUETOOTH) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val device = audioManager.communicationDevice
+                device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                device?.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn
+            }
+        } else {
+            false
+        }
 
         if (newSpeaker != isSpeakerOn) {
             isSpeakerOn = newSpeaker
@@ -82,8 +126,6 @@ class TVCallConnection(
             isBluetoothOn = newBluetooth
             broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, isBluetoothOn)
         }
-
-        broadcastStateEvent(Constants.BROADCAST_MUTE_STATE, isMuted)
     }
 
     // ── Public control methods (called by TVConnectionService) ────────────
@@ -116,7 +158,24 @@ class TVCallConnection(
             broadcastStateEvent(Constants.BROADCAST_BLUETOOTH_STATE, false)
         }
         isSpeakerOn = speakerOn
-        audioManager.isSpeakerphoneOn = speakerOn
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // API 31+: isSpeakerphoneOn is deprecated — use setCommunicationDevice
+            val devices = audioManager.availableCommunicationDevices
+            val targetDevice = if (speakerOn) {
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            } else {
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+            }
+            if (targetDevice != null) {
+                audioManager.setCommunicationDevice(targetDevice)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isSpeakerphoneOn = speakerOn
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = speakerOn
+        }
         broadcastStateEvent(Constants.BROADCAST_SPEAKER_STATE, speakerOn)
     }
 

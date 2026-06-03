@@ -66,6 +66,7 @@ object Constants {
     // ── LocalBroadcast actions: service → VonageVoicePlugin ──────────────
     const val BROADCAST_CALL_RINGING           = "com.iocod.vonage.CALL_RINGING"
     const val BROADCAST_CALL_CONNECTED         = "com.iocod.vonage.CALL_CONNECTED"
+    const val BROADCAST_CALL_ANSWERED          = "com.iocod.vonage.CALL_ANSWERED"
     const val BROADCAST_CALL_ENDED             = "com.iocod.vonage.CALL_ENDED"
     const val BROADCAST_CALL_INVITE            = "com.iocod.vonage.CALL_INVITE"
     const val BROADCAST_CALL_INVITE_CANCELLED  = "com.iocod.vonage.CALL_INVITE_CANCELLED"
@@ -78,6 +79,8 @@ object Constants {
     const val BROADCAST_SYSTEM_DISCONNECT      = "com.iocod.vonage.SYSTEM_DISCONNECT"
     const val BROADCAST_NEW_FCM_TOKEN          = "com.iocod.vonage.NEW_FCM_TOKEN"
     const val BROADCAST_PERMISSION_RESULT      = "com.iocod.vonage.PERMISSION_RESULT"
+    /** Sent by TVConnectionService when the real callId is available after placeholder startup. */
+    const val BROADCAST_REAL_CALL_READY        = "com.iocod.vonage.REAL_CALL_READY"
 
     const val ACTION_NOTIFICATION_ANSWER  = "com.iocod.vonage.NOTIFICATION_ANSWER"
     const val ACTION_NOTIFICATION_DECLINE = "com.iocod.vonage.NOTIFICATION_DECLINE"

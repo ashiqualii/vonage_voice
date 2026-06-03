@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="answer_call">Answer call and...</string>
+    <string name="put_1_222_3">Put caller on hold</string>
+    <string name="end_call_wi">End call with caller</string>
+    <string name="decline_inc">Decline incoming call</string>
+</resources>

@@ -35,6 +35,23 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     // Accessible from AppDelegate to forward PushKit events when needed.
     public static var sharedInstance: VonageVoicePlugin?
 
+    /// When `true`, the AppDelegate owns the PKPushRegistry for `.voIP`
+    /// and forwards pushes/tokens to this plugin. The plugin will NOT
+    /// create its own PKPushRegistry. Set from AppDelegate before
+    /// GeneratedPluginRegistrant.register().
+    public static var pushKitSetupByAppDelegate = false
+
+    /// VoIP push token received by AppDelegate before the plugin was ready.
+    /// Consumed in `register(with:)`.
+    public static var pendingVoipToken: Data?
+
+    /// VoIP push payload received by AppDelegate before the plugin was ready.
+    /// Consumed in `register(with:)`.
+    public static var pendingVoipPushPayload: PKPushPayload?
+
+    /// VoIP push completion handler deferred by AppDelegate.
+    public static var pendingVoipPushCompletion: (() -> Void)?
+
     // ─── Flutter Communication ───────────────────────────────────────
     /// Sends events (call state, audio, errors) to Flutter via EventChannel.
     private var eventSink: FlutterEventSink?
@@ -43,6 +60,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     /// Replayed automatically when the EventChannel reconnects.
     private var pendingEvents: [Any] = []
     private static let maxPendingEvents = 50
+
+    /// Broadcast by Vonage when its CXProvider is torn down so Twilio knows its own
+    /// TUCallCenter slot was stolen and must allocate a fresh CXProvider on the next call.
+    static let cxProviderInvalidatedNotification = NSNotification.Name(
+        "com.vonage.voice.CXProviderInvalidated"
+    )
 
     // ─── Vonage SDK ──────────────────────────────────────────────────
     private var voiceClient: VGVoiceClient!
@@ -58,9 +81,17 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var isSessionReady = false
 
     // ─── CallKit ─────────────────────────────────────────────────────
-    private var callKitProvider: CXProvider!
-    private var callKitCallController: CXCallController!
+    // Lazily initialised via setupCallKit() — only when Vonage tokens
+    // are set or a Vonage VoIP push arrives. Keeping these nil at
+    // startup prevents Vonage's CXProvider from intercepting Twilio's
+    // CXStartCallAction on cold start when no Vonage tokens exist.
+    private var callKitProvider: CXProvider?
+    private var callKitCallController: CXCallController?
     private var callKitCompletionCallback: ((Bool) -> Void)?
+
+    /// Set to true immediately before we call callKitProvider.invalidate() ourselves.
+    /// Suppresses the full state-reset in providerDidReset (Vonage session remains valid).
+    private var isIntentionalProviderReset: Bool = false
 
     // ─── Killed-State Push Coordination ──────────────────────────────
     // When the app is killed and a VoIP push arrives, iOS launches the
@@ -109,6 +140,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     /// The UUID of the currently active (foreground) call.
     private var activeCallUUID: UUID?
 
+    /// True while voiceClient.answer() is in-flight but hasn't completed yet.
+    /// Prevents didReceiveInviteCancelForCall from ending a call that is
+    /// being answered on this device (race between answer callback and
+    /// server-side invite cleanup).
+    private var isAnsweringInProgress = false
+
     /// Outgoing call state — set before the CXStartCallAction fires.
     private var callOutgoing = false
     private var userInitiatedDisconnect = false
@@ -116,6 +153,27 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var identity = ""
     private var callArgs: [String: Any] = [:]
     private var outgoingCallerName = ""
+
+    /// UUID of the outgoing call that THIS plugin initiated via performStartCallAction.
+    /// Guards against iOS broadcasting CXStartCallAction to all CXProvider delegates:
+    /// if the UUID doesn't match, we know this action belongs to Twilio, not Vonage.
+    private var pendingOutgoingUUID: UUID?
+
+    // ─── Invite Keep-Alive ──────────────────────────────────────────
+    // When the device is locked, iOS suspends the app after PushKit
+    // completion — killing the WebSocket. The cancel event from the
+    // server (answered elsewhere / caller hung up) never arrives and
+    // CallKit keeps ringing. A background task keeps the process alive
+    // long enough for the cancel to be delivered. A ringing timeout
+    // acts as a safety net if the background task expires first.
+
+    /// Background task that keeps the app alive while a call invite is pending.
+    private var inviteBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// Safety-net timer: ends the pending invite if it isn't resolved
+    /// within this interval (e.g. cancel push lost, WebSocket dead).
+    private var ringingTimeoutTimer: Timer?
+    private static let ringingTimeoutSeconds: TimeInterval = 60
 
     // ─── Audio State ─────────────────────────────────────────────────
     private var isMuted = false
@@ -162,34 +220,20 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         // PushKit registry — receives VoIP pushes even when app is killed.
         voipRegistry = PKPushRegistry(queue: .main)
 
-        // CallKit provider configuration — tells the system what our calls support.
-        let config = CXProviderConfiguration(localizedName: VonageVoicePlugin.appName)
-        config.maximumCallGroups = 1
-        config.maximumCallsPerCallGroup = 1
-        config.supportedHandleTypes = [.phoneNumber, .generic]
-        config.supportsVideo = false
-
         // Restore persisted caller registry from disk.
         clients = UserDefaults.standard.object(forKey: Keys.clientList) as? [String: String] ?? [:]
 
-        callKitProvider = CXProvider(configuration: config)
-        callKitCallController = CXCallController()
+        // NOTE: callKitProvider and callKitCallController are NOT created here.
+        // They are lazily initialised in setupCallKit() when Vonage tokens are
+        // provided or a Vonage VoIP push arrives. This prevents Vonage's
+        // CXProvider from intercepting Twilio's CXStartCallAction on cold start
+        // when no Vonage tokens exist.
 
         super.init()
 
-        // Set ourselves as the CXProvider delegate (incoming/outgoing call actions).
-        callKitProvider.setDelegate(self, queue: nil)
-
-        // Create the Vonage voice client and tell it CallKit manages audio.
+        // Create the Vonage voice client.
         voiceClient = VGVoiceClient()
         voiceClient.delegate = self
-
-        // Without this, the SDK won't hook into CallKit's audio lifecycle.
-        VGVoiceClient.isUsingCallKit = true
-
-        // Restore the CallKit icon (if one was set previously).
-        let iconName = UserDefaults.standard.string(forKey: Keys.defaultCallKitIcon) ?? Keys.defaultCallKitIcon
-        _ = updateCallKitIcon(icon: iconName)
 
         // Listen for hardware audio-route changes (e.g. headphones plugged in).
         NotificationCenter.default.addObserver(
@@ -201,9 +245,51 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     }
 
     deinit {
-        callKitProvider.invalidate()
+        callKitProvider?.invalidate()
         NotificationCenter.default.removeObserver(self)
     }
+
+    // ═════════════════════════════════════════════════════════════════
+    // MARK: - Lazy CallKit Setup
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Creates the CXProvider and CXCallController on demand.
+    ///
+    /// Called from:
+    ///   - `handleTokens()` — when Flutter provides a valid Vonage JWT
+    ///   - `pushRegistry(_:didReceiveIncomingPushWith:for:completion:)` — when a
+    ///     Vonage VoIP push arrives (killed/background state)
+    ///
+    /// Idempotent: subsequent calls are no-ops.
+    private func setupCallKit() {
+        guard callKitProvider == nil else { return }
+
+        let config = CXProviderConfiguration(localizedName: VonageVoicePlugin.appName)
+        config.maximumCallGroups = 1
+        config.maximumCallsPerCallGroup = 1
+        config.supportedHandleTypes = [.phoneNumber, .generic]
+        config.supportsVideo = false
+
+        callKitProvider = CXProvider(configuration: config)
+        callKitProvider?.setDelegate(self, queue: nil)
+        callKitCallController = CXCallController()
+
+        // Tell the Vonage SDK that CallKit manages audio.
+        // Must be set when CallKit is actually available.
+        VGVoiceClient.isUsingCallKit = true
+
+        // Restore the CallKit icon (if one was set previously).
+        let iconName = UserDefaults.standard.string(forKey: Keys.defaultCallKitIcon) ?? Keys.defaultCallKitIcon
+        _ = updateCallKitIcon(icon: iconName)
+
+        NSLog("[VonageVoice] setupCallKit: CXProvider registered")
+    }
+
+    // NOTE: teardownCallKit() was removed.
+    // Explicitly deactivating AVAudioSession and resetting state mid-session
+    // caused instability. CallKit's own didDeactivateAudioSession is sufficient.
+    // The Dart method channel case "teardownCallKit" is kept as a no-op for
+    // backward compatibility.
 
 
     // ═════════════════════════════════════════════════════════════════
@@ -231,9 +317,38 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
         sharedInstance = instance
 
-        // Start listening for VoIP pushes.
-        instance.voipRegistry.delegate = instance
-        instance.voipRegistry.desiredPushTypes = [.voIP]
+        // ── PushKit ──────────────────────────────────────────────────────
+        // Apple mandates ONE PKPushRegistry per push type. If AppDelegate
+        // already owns .voIP (it does — for Twilio/Vonage routing), we
+        // skip creating our own and rely on AppDelegate to forward events.
+        if VonageVoicePlugin.pushKitSetupByAppDelegate {
+            NSLog("[VonageVoice] PushKit managed by AppDelegate — skipping own PKPushRegistry")
+
+            // Consume VoIP token that arrived before plugin was ready.
+            if let pendingToken = VonageVoicePlugin.pendingVoipToken {
+                VonageVoicePlugin.pendingVoipToken = nil
+                instance.deviceToken = pendingToken
+                let hexToken = pendingToken.map { String(format: "%02x", $0) }.joined()
+                NSLog("[VonageVoice] Consumed pending VoIP token (%d bytes) hex=%@",
+                      pendingToken.count, hexToken)
+            }
+
+            // Consume VoIP push that arrived before plugin was ready.
+            if let pendingPayload = VonageVoicePlugin.pendingVoipPushPayload {
+                let pendingCompletion = VonageVoicePlugin.pendingVoipPushCompletion ?? {}
+                VonageVoicePlugin.pendingVoipPushPayload = nil
+                VonageVoicePlugin.pendingVoipPushCompletion = nil
+                NSLog("[VonageVoice] Processing pending VoIP push from AppDelegate")
+                instance.pushRegistry(PKPushRegistry(queue: .main),
+                                      didReceiveIncomingPushWith: pendingPayload,
+                                      for: .voIP,
+                                      completion: pendingCompletion)
+            }
+        } else {
+            // No AppDelegate PushKit — plugin owns the registry.
+            instance.voipRegistry.delegate = instance
+            instance.voipRegistry.desiredPushTypes = [.voIP]
+        }
     }
 
 
@@ -314,6 +429,9 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             handleUnregister(arguments: arguments, result: result)
         case "refreshSession":
             handleRefreshSession(arguments: arguments, result: result)
+        case "getDeviceId":
+            let storedId = deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
+            result(storedId)
 
         // ── Calls ────────────────────────────────────────────────────
         case "makeCall":
@@ -460,6 +578,11 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         case "getPlatformVersion":
             result("iOS " + UIDevice.current.systemVersion)
 
+        // ── CallKit Lifecycle ─────────────────────────────────────────
+        case "teardownCallKit":
+            // No-op: teardownCallKit() was removed. Kept for Dart backward compat.
+            result(nil)
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -488,6 +611,17 @@ extension VonageVoicePlugin {
             return
         }
 
+        // NOTE: setupCallKit() is intentionally NOT called here.
+        // Registering Vonage's CXProvider at token-fetch time means it is active during
+        // Twilio outgoing calls. iOS then broadcasts CXStartCallAction to Vonage's delegate.
+        // Even with a bare-return guard, CallKit requires every registered CXProviderDelegate
+        // to respond (fulfill/fail) within a timeout — a silent return causes a pending-action
+        // timeout that retries the Twilio transaction and ultimately fails the call.
+        //
+        // setupCallKit() is called lazily at the correct callsites instead:
+        //   • performStartCallAction(uuid:handle:)  — just before a Vonage OUTGOING call
+        //   • pushRegistry(didReceiveIncomingPushWith:) — when a Vonage INCOMING push arrives
+
         accessToken = jwt
         isSandbox = arguments["isSandbox"] as? Bool ?? false
         storeJwt(jwt)
@@ -498,6 +632,12 @@ extension VonageVoicePlugin {
             if let token = deviceToken {
                 registerPushToken(token)
             }
+            result(true)
+            return
+        }
+
+        if pendingPushUUID != nil {
+            sendPhoneCallEvents(description: "LOG|tokens: Session restore in progress via PushKit push — skipping duplicate createSession")
             result(true)
             return
         }
@@ -523,31 +663,67 @@ extension VonageVoicePlugin {
     }
 
     private func handleUnregister(arguments: [String: Any], result: @escaping FlutterResult) {
-        // Unregister push token from Vonage.
-        if let deviceId = deviceId {
-            voiceClient.unregisterDeviceTokens(byDeviceId: deviceId) { [weak self] error in
-                if let error = error {
-                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
-                }
-            }
-        }
+        // Capture deviceId BEFORE clearing local state so the SDK call can still use it.
+        let effectiveDeviceId = deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
 
-        // Delete the Vonage session.
-        voiceClient.deleteSession { [weak self] error in
-            if let error = error {
-                self?.sendPhoneCallEvents(description: "LOG|deleteSession failed: \(error.localizedDescription)")
-            } else {
-                self?.sendPhoneCallEvents(description: "LOG|Session deleted successfully")
-            }
-        }
-
-        // Clear all session state.
+        // Clear all local session state immediately.
+        // isSessionReady = false ensures any incoming push received during the
+        // async SDK calls below is ignored.
         accessToken = nil
         deviceId = nil
         isSessionReady = false
         UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
         clearStoredJwt()
-        result(true)
+
+        // Release the CXProvider when no real Vonage call is active.
+        // Without this, any .incomingCall VoIP push arriving after logout would hit
+        // the "using existing provider" path in reportDummyCallAndEnd (because
+        // callKitProvider is still non-nil), firing providerDidBegin and making the
+        // brief "Unknown" dummy call more prominent. Clearing it here ensures the
+        // temp-provider path is always used for post-logout pushes.
+        if activeCalls.isEmpty && callInvites.isEmpty, callKitProvider != nil {
+            isIntentionalProviderReset = true
+            let providerToInvalidate = callKitProvider
+            callKitProvider = nil
+            callKitCallController = nil
+            providerToInvalidate?.setDelegate(nil, queue: nil)
+            DispatchQueue.main.async {
+                providerToInvalidate?.invalidate()
+                VGVoiceClient.isUsingCallKit = false
+            }
+        }
+
+        // Deletes the Vonage session and resolves the Dart future.
+        // Called after unregisterDeviceTokens completes (or is skipped when no deviceId).
+        // IMPORTANT: result() is called here — inside the last callback — so the
+        // Dart `await` only resolves once the SDK network calls have actually finished.
+        let deleteSessionAndResolve = { [weak self] in
+            guard let self = self else { result(true); return }
+            self.voiceClient.deleteSession { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|deleteSession failed: \(error.localizedDescription)")
+                } else {
+                    self?.sendPhoneCallEvents(description: "LOG|Session deleted successfully")
+                }
+                result(true)
+            }
+        }
+
+        if let id = effectiveDeviceId {
+            // De-register this device's push token from Vonage's servers so it stops
+            // routing calls here. Chain deleteSession after — result() fires only once both complete.
+            voiceClient.unregisterDeviceTokens(byDeviceId: id) { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
+                } else {
+                    self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens succeeded for deviceId: \(id)")
+                }
+                deleteSessionAndResolve()
+            }
+        } else {
+            sendPhoneCallEvents(description: "LOG|handleUnregister: no deviceId in memory or UserDefaults — skipping unregisterDeviceTokens")
+            deleteSessionAndResolve()
+        }
     }
 
     private func handleRefreshSession(arguments: [String: Any], result: @escaping FlutterResult) {
@@ -760,7 +936,7 @@ extension VonageVoicePlugin {
 
             let answerAction = CXAnswerCallAction(call: uuid)
             let transaction = CXTransaction(action: answerAction)
-            callKitCallController.request(transaction) { [weak self] error in
+            callKitCallController?.request(transaction) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|AnswerCallAction failed: \(error.localizedDescription)")
                 }
@@ -1027,7 +1203,75 @@ extension VonageVoicePlugin {
         // Only send audio route events when there are active calls.
         guard !activeCalls.isEmpty else { return }
 
-        sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+        // Extract the change reason for diagnostics and proper handling.
+        let reasonValue = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+            ?? UInt.max
+        let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+
+        switch reason {
+        case .routeConfigurationChange:
+            // Reason 8: Another SDK (e.g. Twilio) or CallKit reconfigured the
+            // shared AVAudioSession's category/mode/options/route. Log full
+            // state so we can diagnose cross-SDK desynchronisation.
+            logFullAudioSessionState(label: "routeConfigurationChange(8)")
+
+            // Re-sync cached state with the ACTUAL system route.
+            // Without this, desiredSpeakerState / desiredBluetoothState can
+            // drift from reality when the other SDK changes the session.
+            let actualSpeaker = isSpeakerOn()
+            let actualBluetooth = isBluetoothOn()
+            if actualSpeaker != desiredSpeakerState {
+                sendPhoneCallEvents(description:
+                    "LOG|routeConfigurationChange: resyncing desiredSpeakerState " +
+                    "\(desiredSpeakerState) → \(actualSpeaker)")
+                desiredSpeakerState = actualSpeaker
+            }
+            if actualBluetooth != desiredBluetoothState {
+                sendPhoneCallEvents(description:
+                    "LOG|routeConfigurationChange: resyncing desiredBluetoothState " +
+                    "\(desiredBluetoothState) → \(actualBluetooth)")
+                desiredBluetoothState = actualBluetooth
+            }
+            // Send the corrected route event to Flutter.
+            sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+
+        case .oldDeviceUnavailable:
+            sendPhoneCallEvents(description: "LOG|handleAudioRouteChange reason=oldDeviceUnavailable")
+            // A device was disconnected — update BT/speaker state.
+            desiredBluetoothState = isBluetoothOn()
+            sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+
+        case .newDeviceAvailable:
+            sendPhoneCallEvents(description: "LOG|handleAudioRouteChange reason=newDeviceAvailable")
+            sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+
+        default:
+            sendPhoneCallEvents(description: "LOG|handleAudioRouteChange reason=\(reasonValue)")
+            sendPhoneCallEvents(description: "AudioRoute|\(getAudioRoute())|bluetoothAvailable=\(isBluetoothAvailable())")
+        }
+    }
+
+    // ─── Audio Session Diagnostics ───────────────────────────────
+
+    /// Logs the complete AVAudioSession state for cross-SDK diagnostics.
+    /// Call this before/after critical audio lifecycle transitions to
+    /// verify the session is in the expected state.
+    private func logFullAudioSessionState(label: String) {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }
+        let inputs  = session.currentRoute.inputs.map  { $0.portType.rawValue }
+        let availInputs = session.availableInputs?.map { $0.portType.rawValue } ?? []
+        sendPhoneCallEvents(description:
+            "LOG|[\(label)] " +
+            "category=\(session.category.rawValue) " +
+            "mode=\(session.mode.rawValue) " +
+            "options=\(session.categoryOptions.rawValue) " +
+            "outputs=\(outputs) inputs=\(inputs) " +
+            "availableInputs=\(availInputs) " +
+            "preferredInput=\(session.preferredInput?.portType.rawValue ?? "nil") " +
+            "isOtherAudioPlaying=\(session.isOtherAudioPlaying) " +
+            "secondaryAudioHint=\(session.secondaryAudioShouldBeSilencedHint) " +
+            "desiredSpeaker=\(desiredSpeakerState) desiredBT=\(desiredBluetoothState)")
     }
 
     // ─── Audio Input Helpers ─────────────────────────────────────────
@@ -1321,9 +1565,10 @@ extension VonageVoicePlugin {
 
     private func updateCallKitIcon(icon: String) -> Bool {
         guard let newIcon = UIImage(named: icon) else { return false }
-        let configuration = callKitProvider.configuration
+        guard let provider = callKitProvider else { return false }
+        let configuration = provider.configuration
         configuration.iconTemplateImageData = newIcon.pngData()
-        callKitProvider.configuration = configuration
+        provider.configuration = configuration
         UserDefaults.standard.set(icon, forKey: Keys.defaultCallKitIcon)
         return true
     }
@@ -1360,6 +1605,107 @@ extension VonageVoicePlugin {
 
 extension VonageVoicePlugin {
 
+    // ─── Invite Keep-Alive Helpers ───────────────────────────────────
+
+    /// Starts a background task that keeps the app alive while a call
+    /// invite is pending. Without this, iOS suspends the app when the
+    /// device is locked and the WebSocket cancel event never arrives —
+    /// causing CallKit to ring indefinitely.
+    private func beginInviteBackgroundTask() {
+        guard inviteBackgroundTask == .invalid else {
+            sendPhoneCallEvents(description: "LOG|beginInviteBackgroundTask — already active, skipping")
+            return
+        }
+        sendPhoneCallEvents(description: "LOG|beginInviteBackgroundTask — starting")
+        inviteBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VonageVoiceInvitePending") { [weak self] in
+            // iOS is about to suspend us. End any pending invite so the
+            // user doesn't see a ghost call on the lock screen forever.
+            self?.handleInviteBackgroundTaskExpired()
+        }
+    }
+
+    /// Ends the background task if one is active. Safe to call multiple times.
+    private func endInviteBackgroundTask() {
+        guard inviteBackgroundTask != .invalid else { return }
+        sendPhoneCallEvents(description: "LOG|endInviteBackgroundTask — ending")
+        UIApplication.shared.endBackgroundTask(inviteBackgroundTask)
+        inviteBackgroundTask = .invalid
+    }
+
+    /// Called when iOS is about to kill the background task.
+    /// Ends all pending invites as missed calls so CallKit stops ringing.
+    private func handleInviteBackgroundTaskExpired() {
+        sendPhoneCallEvents(description: "LOG|Background task expired — ending pending invites")
+
+        // End all pending invites (there should be at most one).
+        let pendingUUIDs = callInvites.keys.filter { activeCalls[$0] == nil }
+        for uuid in pendingUUIDs {
+            let invite = callInvites[uuid]
+            callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+            if let invite = invite {
+                callIdToUUID.removeValue(forKey: invite.callId)
+            }
+            callInvites.removeValue(forKey: uuid)
+            callDisconnected(uuid: uuid)
+        }
+        if !pendingUUIDs.isEmpty {
+            sendPhoneCallEvents(description: "Missed Call")
+        }
+
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
+    }
+
+    /// Starts a safety-net timer. If the call invite isn't resolved within
+    /// the timeout (e.g. WebSocket cancel was lost), end it as a missed call.
+    private func startRingingTimeout() {
+        // Timer must be scheduled on the main run loop so it actually fires.
+        // SDK callbacks (e.g. createSession completion) may run on background
+        // threads whose run loops are not active.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.startRingingTimeout() }
+            return
+        }
+        cancelRingingTimeout()
+        sendPhoneCallEvents(description: "LOG|startRingingTimeout — \(VonageVoicePlugin.ringingTimeoutSeconds)s")
+        ringingTimeoutTimer = Timer.scheduledTimer(withTimeInterval: VonageVoicePlugin.ringingTimeoutSeconds, repeats: false) { [weak self] _ in
+            self?.handleRingingTimeout()
+        }
+    }
+
+    /// Called when the ringing timeout fires.
+    private func handleRingingTimeout() {
+        sendPhoneCallEvents(description: "LOG|Ringing timeout fired — ending pending invites")
+        ringingTimeoutTimer = nil
+
+        let pendingUUIDs = callInvites.keys.filter { activeCalls[$0] == nil }
+        for uuid in pendingUUIDs {
+            let invite = callInvites[uuid]
+            callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+            if let invite = invite {
+                callIdToUUID.removeValue(forKey: invite.callId)
+            }
+            callInvites.removeValue(forKey: uuid)
+            callDisconnected(uuid: uuid)
+        }
+        if !pendingUUIDs.isEmpty {
+            sendPhoneCallEvents(description: "Missed Call")
+        }
+
+        endInviteBackgroundTask()
+    }
+
+    /// Cancels the ringing timeout if active.
+    private func cancelRingingTimeout() {
+        // Must invalidate on the same thread where the timer was scheduled (main).
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.cancelRingingTimeout() }
+            return
+        }
+        ringingTimeoutTimer?.invalidate()
+        ringingTimeoutTimer = nil
+    }
+
     /// Cleans up all pending push coordination state.
     private func cleanupPushState() {
         pushCompletionTimer?.invalidate()
@@ -1368,6 +1714,8 @@ extension VonageVoicePlugin {
         pendingPushUUID = nil
         pendingAnswerAction = nil
         pendingEndAction = nil
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
     }
 
     /// Ends the pre-reported call when something goes wrong (timeout or session restore failure).
@@ -1375,10 +1723,12 @@ extension VonageVoicePlugin {
     private func endPreReportedCall(reason: String) {
         guard let uuid = pendingPushUUID else { return }
         sendPhoneCallEvents(description: "LOG|\(reason)")
-        callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+        callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .failed)
         callDisconnected(uuid: uuid)
         sendPhoneCallEvents(description: "Missed Call")
         pendingPushCompletion?()
+        cancelRingingTimeout()
+        endInviteBackgroundTask()
         cleanupPushState()
     }
 }
@@ -1396,12 +1746,24 @@ extension VonageVoicePlugin {
 
     /// Requests CallKit to start an outgoing call.
     private func performStartCallAction(uuid: UUID, handle: String) {
+        // Ensure Vonage's CXProvider is registered before submitting the CXTransaction.
+        // setupCallKit() is idempotent (guarded by `callKitProvider == nil`), so this
+        // is safe whether or not an incoming push already called it.
+        // This is the correct callsite — registering at token-fetch time would keep
+        // Vonage's CXProvider active during Twilio calls, causing CXStartCallAction
+        // broadcast interference that silently fails Twilio outgoing calls.
+        setupCallKit()
+
+        // Mark this UUID as ours BEFORE submitting the CXTransaction.
+        // iOS broadcasts CXStartCallAction to every CXProvider in the process,
+        // including Twilio's. We use this to ignore actions we didn't initiate.
+        pendingOutgoingUUID = uuid
         sendPhoneCallEvents(description: "LOG|performStartCallAction uuid=\(uuid) handle=\(handle)")
         let callHandle = CXHandle(type: .generic, value: handle)
         let startCallAction = CXStartCallAction(call: uuid, handle: callHandle)
         let transaction = CXTransaction(action: startCallAction)
 
-        callKitCallController.request(transaction) { [weak self] error in
+        callKitCallController?.request(transaction) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
                 self.sendPhoneCallEvents(description: "LOG|StartCallAction failed: \(error.localizedDescription)")
@@ -1420,12 +1782,16 @@ extension VonageVoicePlugin {
             callUpdate.supportsUngrouping = false
             callUpdate.hasVideo = false
 
-            self.callKitProvider.reportCall(with: uuid, updated: callUpdate)
+            self.callKitProvider?.reportCall(with: uuid, updated: callUpdate)
         }
     }
 
     /// Reports a new incoming call to CallKit.
     private func reportIncomingCall(from: String, uuid: UUID, completion: ((Error?) -> Void)? = nil) {
+        // Ensure provider is ready — it may have been invalidated after the last call
+        // ended (in didDeactivateAudioSession). setupCallKit() is idempotent.
+        setupCallKit()
+
         let callHandle = CXHandle(type: .generic, value: from)
 
         let callUpdate = CXCallUpdate()
@@ -1437,7 +1803,7 @@ extension VonageVoicePlugin {
         callUpdate.supportsUngrouping = false
         callUpdate.hasVideo = false
 
-        callKitProvider.reportNewIncomingCall(with: uuid, update: callUpdate) { [weak self] error in
+        callKitProvider?.reportNewIncomingCall(with: uuid, update: callUpdate) { [weak self] error in
             if let error = error {
                 self?.sendPhoneCallEvents(description: "LOG|reportNewIncomingCall failed: \(error.localizedDescription)")
             } else {
@@ -1452,7 +1818,7 @@ extension VonageVoicePlugin {
         let endCallAction = CXEndCallAction(call: uuid)
         let transaction = CXTransaction(action: endCallAction)
 
-        callKitCallController.request(transaction) { [weak self] error in
+        callKitCallController?.request(transaction) { [weak self] error in
             if let error = error {
                 self?.sendPhoneCallEvents(description: "LOG|EndCallAction failed: \(error.localizedDescription)")
             }
@@ -1483,11 +1849,76 @@ extension VonageVoicePlugin {
             desiredSpeakerState = false
             desiredBluetoothState = false
             userExplicitlyChangedAudioRoute = false
+            // Clear outgoing call destination — prevents stale callTo/identity from a
+            // completed Vonage call being used if CXStartCallAction fires for a Twilio call.
+            callTo = ""
+            identity = ""
+            callArgs = [:]
+            pendingOutgoingUUID = nil
             // Notify Flutter that speaker/bluetooth are off so the next call
             // starts with a clean UI — prevents the brief speaker flash.
             sendPhoneCallEvents(description: "Speaker Off")
             sendPhoneCallEvents(description: "Bluetooth Off")
             sendPhoneCallEvents(description: "LOG|  all per-call state reset (no remaining calls)")
+
+            // No pending invites or active calls — release the background task
+            // and cancel the ringing timeout.
+            cancelRingingTimeout()
+            endInviteBackgroundTask()
+
+            // ── Synchronously release the CXProvider ──────────────────────────
+            // iOS broadcasts CXStartCallAction to EVERY registered CXProvider in
+            // the process. With Vonage's provider still alive after a call, it
+            // receives Twilio's outgoing CXStartCallAction and calls action.fail()
+            // — which propagates as CXErrorCodeRequestTransactionErrorCodeUnknownCallProvider
+            // (error 2) to Twilio's callKitCallController.request() callback,
+            // blocking ALL subsequent Twilio outgoing calls until the timing window
+            // closes (pattern: Twilio✓ → Vonage✓ → Twilio✗).
+            //
+            // Tearing down here — not in didDeactivateAudioSession — eliminates
+            // the async timing window. VGVoiceClient.disableAudio is called
+            // explicitly so the WebRTC stack releases audio before we drop the
+            // provider (didDeactivateAudioSession won't fire after invalidation).
+            VGVoiceClient.disableAudio(AVAudioSession.sharedInstance())
+            // CRITICAL: invalidate() must NOT be called synchronously from inside
+            // a CXProviderDelegate callback (e.g. performEndCallAction). iOS does
+            // not support calling invalidate() while the provider's delegate queue
+            // is mid-dispatch — doing so corrupts the internal CKCallManager /
+            // TUCallCenter registry, causing the next Twilio CXStartCallAction to
+            // be accepted but performStartCallAction to never fire.
+            //
+            // Fix: capture the provider/controller, nil the instance vars
+            // immediately (blocks future callbacks), remove the delegate
+            // synchronously (safe inside a callback), then defer invalidate() to
+            // the next runloop cycle via DispatchQueue.main.async so it runs only
+            // after the current performEndCallAction stack fully unwinds.
+            let providerToInvalidate = callKitProvider
+            callKitProvider = nil
+            callKitCallController = nil
+            providerToInvalidate?.setDelegate(nil, queue: nil)
+            isIntentionalProviderReset = true
+            // Notify Twilio (same process) that our CXProvider was deregistered from
+            // TUCallCenter. Twilio observes this to set needsProviderReset=true so it
+            // allocates a fresh CXProvider on the next outgoing call — avoiding the
+            // CXErrorCodeRequestTransactionErrorUnknownCallProvider (error 2) that occurs
+            // when Twilio tries to reuse an orphaned provider.
+            NotificationCenter.default.post(
+                name: VonageVoicePlugin.cxProviderInvalidatedNotification,
+                object: nil
+            )
+            sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider delegate nil'd — deferring invalidate()")
+            DispatchQueue.main.async { [weak self] in
+                providerToInvalidate?.invalidate()
+                self?.isIntentionalProviderReset = false
+                // Deregister the Vonage SDK's internal CallKit binding AFTER the provider
+                // is fully invalidated. When isUsingCallKit remains true after invalidation,
+                // the SDK stays connected to iOS's TUCallCenter internally — receiving
+                // Twilio's CXStartCallAction and never responding (fulfill/fail), which
+                // permanently stalls the transaction and blocks all subsequent Twilio calls.
+                // Setting false here severs that binding cleanly.
+                VGVoiceClient.isUsingCallKit = false
+                self?.sendPhoneCallEvents(description: "LOG|callDisconnected: CXProvider invalidated, VGVoiceClient.isUsingCallKit=false")
+            }
         }
         sendPhoneCallEvents(description: "LOG|  after: activeCalls=\(activeCalls.count) callInvites=\(callInvites.count) activeCallUUID=\(String(describing: activeCallUUID))")
     }
@@ -1504,14 +1935,26 @@ extension VonageVoicePlugin {
 
 extension VonageVoicePlugin: CXProviderDelegate {
 
-    /// Called when CallKit resets (e.g. all calls dropped).
+    /// Called when CallKit resets (e.g. all calls dropped by the system).
     public func providerDidReset(_ provider: CXProvider) {
-        sendPhoneCallEvents(description: "LOG|providerDidReset")
+        sendPhoneCallEvents(description: "LOG|providerDidReset (intentional=\(isIntentionalProviderReset))")
+
+        if isIntentionalProviderReset {
+            // Triggered by our own callDisconnected() teardown — state was already
+            // cleaned up there. The Vonage voiceClient session is still valid;
+            // resetting isSessionReady here would cause a spurious session restore
+            // on the next Vonage call.
+            isIntentionalProviderReset = false
+            return
+        }
+
+        // iOS-initiated reset (e.g. process handoff, all calls dropped by system).
         activeCalls.removeAll()
         callInvites.removeAll()
         callIdToUUID.removeAll()
         activeCallUUID = nil
         isSessionReady = false
+        pendingOutgoingUUID = nil
         cleanupPushState()
     }
 
@@ -1559,11 +2002,24 @@ extension VonageVoicePlugin: CXProviderDelegate {
         sendPhoneCallEvents(description: "LOG|didActivateAudioSession complete, route=\(audioSession.currentRoute.outputs.map { $0.portType.rawValue })")
     }
 
-    /// CallKit deactivated the audio session — unhook Vonage.
+    /// CallKit deactivated the audio session — belt-and-suspenders fallback.
+    /// The primary teardown now happens synchronously in callDisconnected().
+    /// This method is only reached if the provider was NOT yet invalidated there
+    /// (e.g. a mid-session audio deactivation for an edge-case path).
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         sendPhoneCallEvents(description: "LOG|provider:didDeactivateAudioSession")
-        // Tell the Vonage SDK to stop audio when CallKit deactivates the session.
+        // disableAudio is safe to call twice; second call is a no-op.
         VGVoiceClient.disableAudio(audioSession)
+        logFullAudioSessionState(label: "post-didDeactivateAudioSession")
+
+        // Fallback: release provider if callDisconnected didn't already do it.
+        if activeCalls.isEmpty && callInvites.isEmpty, callKitProvider != nil {
+            sendPhoneCallEvents(description: "LOG|didDeactivateAudioSession: fallback CXProvider release")
+            isIntentionalProviderReset = true
+            callKitProvider?.invalidate()
+            callKitProvider = nil
+            callKitCallController = nil
+        }
     }
 
     /// An action timed out. We do NOT fulfil it here — the actual async
@@ -1575,6 +2031,41 @@ extension VonageVoicePlugin: CXProviderDelegate {
     // ─── Start Call (Outgoing) ───────────────────────────────────────
 
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        // iOS delivers CXStartCallAction to ALL registered CXProvider delegates in the
+        // process — including Twilio's CXProvider firing into this Vonage handler.
+        // Guard: only handle UUIDs that THIS plugin created in performStartCallAction.
+        guard action.callUUID == pendingOutgoingUUID else {
+            sendPhoneCallEvents(description: "LOG|provider:performStartCallAction — ignoring UUID \(action.callUUID), not initiated by VonageVoicePlugin (expected \(String(describing: pendingOutgoingUUID)))")
+
+            // UUID not owned by Vonage — MUST call action.fail() here.
+            //
+            // iOS dispatches CXStartCallAction to ALL registered CXProvider delegates
+            // in the process (including this Vonage handler for Twilio's UUIDs).
+            // iOS requires EVERY registered provider to respond (fulfill OR fail)
+            // before it delivers the result to the originating CXCallController's
+            // request() completion handler. If any provider returns without
+            // responding, the transaction is permanently stuck — the completion
+            // callback never fires, Twilio's performStartCallAction never gets
+            // dispatched, and the call silently never starts.
+            //
+            // Calling action.fail() here does NOT cause error 2 (unknownCallProvider)
+            // in Twilio's callKitCallController.request() callback. That error only
+            // fires when NO provider fulfills the action. Since Twilio's own provider
+            // will call action.fulfill(), the transaction succeeds — Vonage's fail()
+            // is simply iOS's mechanism to acknowledge "I don't own this call."
+            //
+            // Historical note: the original action.fail() → error 2 regression was
+            // caused by the CXProvider corruption bug (invalidate() called inside a
+            // CXProviderDelegate callback), which prevented Twilio's provider from
+            // ever receiving or fulfilling the action. That bug is now fixed by the
+            // deferred invalidate() in callDisconnected(). With the corruption
+            // removed, Vonage fail() + Twilio fulfill() = transaction succeeds.
+            sendPhoneCallEvents(description: "LOG|  non-Vonage UUID — calling action.fail() (activeCalls=\(activeCalls.count) invites=\(callInvites.count) pendingUUID=\(String(describing: pendingOutgoingUUID)))")
+            action.fail()
+            return
+        }
+        pendingOutgoingUUID = nil
+
         let from = identity.isEmpty ? (callArgs["from"] as? String ?? "") : identity
         let to = callTo.isEmpty ? (callArgs["to"] as? String ?? "") : callTo
 
@@ -1645,7 +2136,10 @@ extension VonageVoicePlugin: CXProviderDelegate {
         sendPhoneCallEvents(description: "LOG|provider:performAnswerCallAction uuid=\(action.callUUID)")
 
         guard let invite = callInvites[action.callUUID] else {
-            sendPhoneCallEvents(description: "LOG|No call invite found for uuid=\(action.callUUID)")
+            // UUID not owned by Vonage — fail immediately so iOS resolves the action.
+            // Each CXProvider receives its own action dispatch; failing here does NOT
+            // prevent Twilio's provider from fulfilling the same UUID independently.
+            sendPhoneCallEvents(description: "LOG|provider:performAnswerCallAction — ignoring UUID \(action.callUUID), not a Vonage call")
             action.fail()
             return
         }
@@ -1659,8 +2153,10 @@ extension VonageVoicePlugin: CXProviderDelegate {
         }
 
         // Normal path — answer immediately.
+        isAnsweringInProgress = true
         voiceClient.answer(invite.callId) { [weak self] error in
             guard let self = self else { return }
+            self.isAnsweringInProgress = false
             if let error = error {
                 self.sendPhoneCallEvents(description: "LOG|answer failed: \(error.localizedDescription)")
                 action.fail()
@@ -1691,6 +2187,15 @@ extension VonageVoicePlugin: CXProviderDelegate {
     public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
         sendPhoneCallEvents(description: "LOG|provider:performEndCallAction uuid=\(action.callUUID)")
 
+        // Guard: only handle UUIDs this plugin owns.
+        // Each CXProvider receives its own action dispatch — failing here does NOT
+        // prevent Twilio's provider from handling the same UUID independently.
+        guard callInvites[action.callUUID] != nil || activeCalls[action.callUUID] != nil else {
+            sendPhoneCallEvents(description: "LOG|provider:performEndCallAction — ignoring UUID \(action.callUUID), not a Vonage call")
+            action.fail()
+            return
+        }
+
         if let invite = callInvites[action.callUUID] {
             // Pending invite — reject it.
             if invite.callId.isEmpty {
@@ -1719,8 +2224,35 @@ extension VonageVoicePlugin: CXProviderDelegate {
                     self?.sendPhoneCallEvents(description: "LOG|hangup failed: \(error.localizedDescription)")
                 }
             }
+            // CRITICAL: Report the call as ended to CXCallObserver BEFORE invalidating
+            // the provider. CXCallObserver tracks all active calls system-wide. Without
+            // this report, CXCallObserver keeps hasEnded=false for this UUID until
+            // invalidate() fires (deferred to next runloop). Twilio's
+            // callKitCallController.request(CXStartCallAction) can fire in that window —
+            // iOS sees the Vonage call still "active" in CXCallObserver and silently
+            // drops the transaction (completion never fires, performStartCallAction
+            // never fires). Reporting ended here updates CXCallObserver synchronously
+            // so it shows 0 active calls by the time Twilio submits its transaction.
+            provider.reportCall(with: action.callUUID, endedAt: Date(), reason: .remoteEnded)
+            sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: reported call ended to CXCallObserver")
             callDisconnected(uuid: action.callUUID)
-            sendPhoneCallEvents(description: "Call Ended")
+            // CRITICAL: Defer "Call Ended" to run AFTER Vonage's CXProvider has been fully
+            // invalidated. callDisconnected() defers invalidate() via DispatchQueue.main.async.
+            // Since both blocks are queued on the main queue in FIFO order, this block runs
+            // AFTER invalidate() + VGVoiceClient.isUsingCallKit=false complete.
+            //
+            // Without this deferral, "Call Ended" arrives at Flutter synchronously, Flutter
+            // immediately initiates a Twilio call, and Twilio's CXStartCallAction fires while
+            // Vonage's CXProvider is still registered (with delegate=nil, pending invalidation).
+            // iOS sees a registered provider that cannot respond → error 2
+            // (CXErrorCodeRequestTransactionErrorUnknownCallProvider) and rejects the transaction.
+            //
+            // With this deferral: invalidate() runs first (Vonage's provider fully deregistered),
+            // THEN Flutter receives "Call Ended" and makes the Twilio call → success.
+            DispatchQueue.main.async { [weak self] in
+                self?.sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: sending deferred Call Ended (after invalidate)")
+                self?.sendPhoneCallEvents(description: "Call Ended")
+            }
 
         } else {
             callDisconnected(uuid: action.callUUID)
@@ -1745,6 +2277,10 @@ extension VonageVoicePlugin: CXProviderDelegate {
             sendPhoneCallEvents(description: action.isMuted ? "Mute" : "Unmute")
             action.fulfill()
         } else {
+            // UUID not owned by Vonage — fail so iOS resolves the action.
+            // Each CXProvider receives its own action dispatch; failing here does NOT
+            // affect Twilio's handling of the same UUID.
+            sendPhoneCallEvents(description: "LOG|provider:performSetMutedAction — ignoring UUID \(action.callUUID), not a Vonage call")
             action.fail()
         }
     }
@@ -1819,19 +2355,64 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         let pushType = VGBaseClient.vonagePushType(payload.dictionaryPayload)
         NSLog("[VonageVoice-Push] Vonage push type: %@", String(describing: pushType))
 
-        // ── Not a Vonage call push → report dummy and end ────────────
+        // ── Not a Vonage call push ────────────────────────────────────
+        // Must still report a dummy call to satisfy Apple's requirement.
+        // BUT: also forward to the SDK — Vonage may send a cancel push
+        // (e.g. call answered elsewhere) that the SDK needs to process.
+        // This is critical when the device is locked: the WebSocket is
+        // frozen so the cancel can only arrive via a second VoIP push.
+        //
+        // IMPORTANT: Do NOT call setupCallKit() for non-incomingCall pushes.
+        // Cancel/hangup-confirmation pushes arrive after a call has ended; calling
+        // setupCallKit() here would re-create Vonage's CXProvider with no real call
+        // in progress. iOS then dispatches Twilio's CXStartCallAction to Vonage's
+        // provider; Vonage calls action.fail(), blocking every subsequent Twilio call
+        // (pattern: Twilio✓ → Vonage✓ → Twilio✗).
+        //
+        // reportDummyCallAndEnd handles provider creation internally:
+        //  • If callKitProvider != nil (real Vonage call active): uses the existing provider.
+        //  • If callKitProvider == nil (no real call): creates a LOCAL, non-stored provider
+        //    that is never referenced by self.callKitProvider — so self.callKitProvider
+        //    stays nil throughout, eliminating any timing window.
         guard pushType == .incomingCall else {
+            if !callInvites.isEmpty {
+                sendPhoneCallEvents(description: "LOG|Non-incomingCall push while invite pending — forwarding to SDK")
+                voiceClient.processCallInvitePushData(payload.dictionaryPayload)
+            }
+            sendPhoneCallEvents(description: "LOG|Non-incomingCall push — reportDummyCallAndEnd (callKitProvider=\(callKitProvider != nil))")
             reportDummyCallAndEnd(completion: completion)
             return
         }
 
         // ── KILLED STATE: No session → restore from stored JWT ───────
-        if accessToken == nil, let storedJwt = getStoredJwt() {
+        // Guard: pendingPushUUID == nil prevents re-entering handleKilledStatePush
+        // for a second push that arrives while the first push's createSession is still
+        // in-flight. Without it, the second push would overwrite pendingPushUUID and
+        // pendingPushCompletion, breaking the first push's coordination (Apple kills
+        // the app if completion() is never called) and firing a duplicate createSession.
+        // Note: accessToken is set synchronously inside handleKilledStatePush before
+        // createSession, so the LOGGED OUT guard below naturally catches any subsequent
+        // push once the first handleKilledStatePush has started.
+        if !isSessionReady, pendingPushUUID == nil, let storedJwt = getStoredJwt() {
+            // Real call: create the CXProvider before handing off to handleKilledStatePush.
+            setupCallKit()
             handleKilledStatePush(payload: payload, storedJwt: storedJwt, completion: completion)
             return
         }
 
         // ── LOGGED OUT: No session, no JWT ───────────────────────────
+        // IMPORTANT: Do NOT call setupCallKit() here.
+        // setupCallKit() creates a persistent CXProvider and sets VGVoiceClient.isUsingCallKit=true.
+        // In the logged-out state we cannot process this call — calling setupCallKit() would:
+        //   1. Fire providerDidBegin (activating the provider for no real call)
+        //   2. Make reportDummyCallAndEnd use the "existing provider" path instead of
+        //      a local temp provider, causing the "Unknown" ringing call to appear
+        //      prominently via the persistent system-registered provider.
+        //   3. Leave VGVoiceClient.isUsingCallKit=true after the dummy call ends
+        //      (reportDummyCallAndEnd does not reset it), which can interfere with
+        //      subsequent Twilio calls.
+        // Using the temp-provider path in reportDummyCallAndEnd is correct here:
+        // it satisfies Apple's reportNewIncomingCall mandate without any persistent state.
         if accessToken == nil {
             sendPhoneCallEvents(description: "LOG|No session and no stored JWT — cannot process push")
             reportDummyCallAndEnd(completion: completion)
@@ -1839,8 +2420,10 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         }
 
         // ── FOREGROUND / BACKGROUND: Session exists ──────────────────
+        // Real call: create the CXProvider before processing the invite.
         // processCallInvitePushData triggers didReceiveInviteForCall synchronously,
         // which calls reportNewIncomingCall before we reach completion().
+        setupCallKit()
         voiceClient.processCallInvitePushData(payload.dictionaryPayload)
         completion()
     }
@@ -1886,6 +2469,11 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         // Report to CallKit immediately so Apple doesn't kill us.
         reportIncomingCall(from: defaultCaller, uuid: uuid)
 
+        // Start the background task NOW — before the async session restore.
+        // Without this, iOS suspends the app after PushKit completion and
+        // the WebSocket dies before .answeredElsewhere can arrive.
+        beginInviteBackgroundTask()
+
         // Safety timeout: end the call if didReceiveInviteForCall never fires.
         pushCompletionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
             self?.endPreReportedCall(reason: "Push completion timeout — ending pre-reported call")
@@ -1902,6 +2490,15 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
             }
             self.isSessionReady = true
             self.sendPhoneCallEvents(description: "LOG|Session restored successfully, processing push")
+            // Re-register the VoIP push token now that the session is live.
+            // handleTokens() may have been called while createSession was still
+            // in flight (pendingPushUUID != nil + isSessionReady == false), so
+            // it skipped token registration. Do it here to ensure Vonage always
+            // has a current device registration — mirrors the isSessionReady path
+            // in handleTokens().
+            if let token = self.deviceToken {
+                self.registerPushToken(token)
+            }
             self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
             // completion() is called from didReceiveInviteForCall via pendingPushCompletion.
         }
@@ -1909,11 +2506,56 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
 
     /// Reports a dummy incoming call and immediately ends it.
     /// Required by Apple: every VoIP push MUST result in reportNewIncomingCall.
+    ///
+    /// When a real Vonage call is active (`callKitProvider != nil`), uses the existing
+    /// persistent provider. Otherwise, creates a LOCAL, non-stored `CXProvider` that
+    /// is NEVER assigned to `self.callKitProvider`. This ensures there is zero timing
+    /// window where a lingering Vonage provider can intercept Twilio's CXStartCallAction.
     private func reportDummyCallAndEnd(completion: @escaping () -> Void) {
         let uuid = UUID()
-        reportIncomingCall(from: "Unknown", uuid: uuid) { [weak self] _ in
-            self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
-            completion()
+        let callUpdate = CXCallUpdate()
+        callUpdate.remoteHandle = CXHandle(type: .generic, value: "Unknown")
+        callUpdate.localizedCallerName = "Unknown"
+
+        // Use .answeredElsewhere instead of .failed as the end reason.
+        // .failed records the call in the system recents as a "failed" entry, which
+        // iOS may present as a missed-call notification. .answeredElsewhere tells iOS
+        // the call was handled on another device/context — it does not generate a
+        // missed-call notification and does not appear prominently in recents.
+        let endReason = CXCallEndedReason.answeredElsewhere
+
+        if let existingProvider = callKitProvider {
+            // Real Vonage call is active — use the persistent provider.
+            sendPhoneCallEvents(description: "LOG|reportDummyCallAndEnd: using existing provider")
+            existingProvider.reportNewIncomingCall(with: uuid, update: callUpdate) { [weak self] _ in
+                existingProvider.reportCall(with: uuid, endedAt: Date(), reason: endReason)
+                if let self = self, self.activeCalls.isEmpty && self.callInvites.isEmpty {
+                    self.sendPhoneCallEvents(description: "LOG|reportDummyCallAndEnd: releasing CXProvider (no active calls)")
+                    self.isIntentionalProviderReset = true
+                    self.callKitProvider?.invalidate()
+                    self.callKitProvider = nil
+                    self.callKitCallController = nil
+                }
+                completion()
+            }
+        } else {
+            // No real Vonage call — use a LOCAL temporary provider.
+            // self.callKitProvider stays nil throughout, so iOS will not route any
+            // other plugin's CXStartCallAction (e.g. Twilio's) to this provider.
+            sendPhoneCallEvents(description: "LOG|reportDummyCallAndEnd: using temp local provider (callKitProvider is nil)")
+            let config = CXProviderConfiguration(localizedName: VonageVoicePlugin.appName)
+            config.maximumCallGroups = 1
+            config.maximumCallsPerCallGroup = 1
+            config.supportedHandleTypes = [.phoneNumber, .generic]
+            config.supportsVideo = false
+            // tempProvider is captured by the closure and released after the report.
+            // No setDelegate — we only report, we don't need to handle CXActions.
+            let tempProvider = CXProvider(configuration: config)
+            tempProvider.reportNewIncomingCall(with: uuid, update: callUpdate) { _ in
+                tempProvider.reportCall(with: uuid, endedAt: Date(), reason: endReason)
+                tempProvider.invalidate()
+                completion()
+            }
         }
     }
 }
@@ -1954,6 +2596,32 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             return
         }
 
+        // ── ACTIVE CALL GUARD (single-call only) ──────────────────────────
+        // Mirrors Android's TVConnectionService: if a call is already active,
+        // auto-reject the new invite silently so the active call is not
+        // interrupted. The second call arrives via the live WebSocket (not
+        // PushKit) when the app is foreground, so no reportNewIncomingCall
+        // is required by Apple here.
+        //
+        // IMPORTANT: Do NOT emit "Missed Call" here. "Missed Call" maps to
+        // CallEvent.missedCall in the Dart BLoC which sets isCallEnded=true
+        // and dismisses the active call screen for the FIRST (still-live) call.
+        // Mirrors Twilio's pattern: suppress "Missed Call" when other active
+        // calls remain (SwiftTwilioVoicePlugin.swift callInviteCancelled guard).
+        if !activeCalls.isEmpty || activeCallUUID != nil {
+            NSLog("[VonageVoice] Second invite callId=%@ while active call exists — auto-rejecting (suppressing Missed Call event)", callId)
+            sendPhoneCallEvents(description: "LOG|Auto-rejecting second call callId=\(callId) — active call in progress, Missed Call suppressed to protect active call screen")
+            voiceClient.reject(callId) { [weak self] error in
+                if let error = error {
+                    self?.sendPhoneCallEvents(description: "LOG|Auto-reject second call failed: \(error.localizedDescription)")
+                }
+            }
+            // Do NOT send "Missed Call" — first call is still active and
+            // "Missed Call" would set isCallEnded=true on the BLoC, dismissing
+            // the active call screen for the first call.
+            return
+        }
+
         // ── NORMAL PATH (foreground / background) ──
         let uuid = UUID()
         let callerDisplay = clients[caller] ?? caller
@@ -1963,6 +2631,12 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
 
         sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
         reportIncomingCall(from: callerDisplay, uuid: uuid)
+
+        // Keep the app alive while the invite is pending so the WebSocket
+        // can deliver a cancel event (answered elsewhere / caller hung up)
+        // even when the device is locked and iOS would otherwise suspend us.
+        beginInviteBackgroundTask()
+        startRingingTimeout()
     }
 
     /// Handles didReceiveInviteForCall when the app was launched from killed state.
@@ -1971,6 +2645,10 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
     private func handleKilledStateInvite(callId: String, caller: String, pushUUID: UUID) {
         pushCompletionTimer?.invalidate()
         pushCompletionTimer = nil
+
+        // Keep the app alive while the invite is pending (locked-device fix).
+        beginInviteBackgroundTask()
+        startRingingTimeout()
 
         let callerDisplay = clients[caller] ?? caller
 
@@ -1983,15 +2661,17 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         let callUpdate = CXCallUpdate()
         callUpdate.localizedCallerName = callerDisplay
         callUpdate.remoteHandle = CXHandle(type: .generic, value: callerDisplay)
-        callKitProvider.reportCall(with: pushUUID, updated: callUpdate)
+        callKitProvider?.reportCall(with: pushUUID, updated: callUpdate)
 
         sendPhoneCallEvents(description: "Incoming|\(caller)|\(identity)|Incoming")
 
         // Fulfil any queued answer action (user tapped Answer before callId was available).
         if let answerAction = pendingAnswerAction {
             pendingAnswerAction = nil
+            isAnsweringInProgress = true
             voiceClient.answer(callId) { [weak self] error in
                 guard let self = self else { return }
+                self.isAnsweringInProgress = false
                 if let error = error {
                     self.sendPhoneCallEvents(description: "LOG|Deferred answer failed: \(error.localizedDescription)")
                     answerAction.fail()
@@ -2043,7 +2723,7 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             pushCompletionTimer = nil
             pendingAnswerAction?.fail()
             pendingEndAction?.fulfill()
-            callKitProvider.reportCall(with: pushUUID, endedAt: Date(), reason: .remoteEnded)
+            callKitProvider?.reportCall(with: pushUUID, endedAt: Date(), reason: .remoteEnded)
             callDisconnected(uuid: pushUUID)
             sendPhoneCallEvents(description: "Missed Call")
             pendingPushCompletion?()
@@ -2055,19 +2735,36 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         guard let uuid = callIdToUUID[callId] else {
             // Cancel arrived before the invite was delivered (e.g. caller hung up
             // very quickly while app was in foreground). No UUID exists, so there's
-            // nothing to clean up in CallKit — but we still notify Flutter so the
-            // UI can show a missed-call indicator.
-            sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
-            sendPhoneCallEvents(description: "Missed Call")
+            // IMPORTANT: Only emit "Missed Call" when no active call exists.
+            // If an active call is in progress (e.g. this cancel is for the 2nd
+            // call we auto-rejected in didReceiveInviteForCall), emitting "Missed
+            // Call" would set isCallEnded=true in the BLoC and dismiss the first
+            // call's active screen. Mirrors the activeCalls.isEmpty guard used in
+            // all other "Missed Call" emission sites.
+            //
+            // Also suppress during session teardown (unregister/user-switch): the SDK
+            // fires cancel callbacks as cleanup when deleteSession() runs. At that point
+            // isSessionReady is already false, and any "Missed Call" emission would
+            // create a phantom "Unknown" missed-call record in the app's call log.
+            if activeCalls.isEmpty {
+                guard isSessionReady else {
+                    sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite during teardown (isSessionReady=false) — suppressed to prevent phantom missed call")
+                    return
+                }
+                sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
+                sendPhoneCallEvents(description: "Missed Call")
+            } else {
+                sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite but active call exists — suppressing Missed Call to protect active call screen")
+            }
             return
         }
 
-        // GUARD: If the call was already answered and moved to activeCalls,
-        // do NOT process the cancel — the SDK may fire cancel as cleanup
-        // after the invite was consumed by answer. Ending an active call
-        // here would cause the "auto-hangup after answer" bug.
-        if activeCalls[uuid] != nil {
-            sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for already-answered call callId=\(callId)")
+        // GUARD: If the call was already answered (or is being answered right
+        // now), do NOT process the cancel — the SDK fires cancel as cleanup
+        // after the invite was consumed by answer. Ending an active/answering
+        // call here would cause the "auto-hangup after answer" bug.
+        if activeCalls[uuid] != nil || isAnsweringInProgress {
+            sendPhoneCallEvents(description: "LOG|Ignoring invite cancel for answered/answering call callId=\(callId)")
             return
         }
 
@@ -2078,7 +2775,7 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
         // performEndCallAction goes through CXCallController (user-initiated end)
         // which can race with reportNewIncomingCall. reportCall is the correct
         // API for server-initiated cancellation.
-        callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+        callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
         callDisconnected(uuid: uuid)
 
         if activeCalls.isEmpty {
@@ -2108,15 +2805,23 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
 
         if let uuid = callIdToUUID[callId] {
             if !userInitiatedDisconnect {
-                callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+                callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
                 sendPhoneCallEvents(description: "LOG|  reported remoteEnded to CallKit")
             } else {
                 sendPhoneCallEvents(description: "LOG|  userInitiatedDisconnect=true, skipping CallKit report")
             }
+
+            // If this was a pending invite (answered on another device),
+            // treat it like a cancel — clean up invite and emit Missed Call.
+            let wasInvite = callInvites[uuid] != nil
+            if wasInvite {
+                callInvites.removeValue(forKey: uuid)
+                callIdToUUID.removeValue(forKey: callId)
+            }
             callDisconnected(uuid: uuid)
 
             if activeCalls.isEmpty {
-                sendPhoneCallEvents(description: "Call Ended")
+                sendPhoneCallEvents(description: wasInvite ? "Missed Call" : "Call Ended")
             }
         } else {
             sendPhoneCallEvents(description: "LOG|  WARNING: No UUID found for callId=\(callId) — orphan hangup")

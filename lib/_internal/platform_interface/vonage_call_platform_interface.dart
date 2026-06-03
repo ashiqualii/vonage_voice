@@ -157,6 +157,19 @@ abstract class VonageCallPlatform extends SharedPlatformInterface {
   /// **Platform:** Android & iOS.
   Future<bool> isOnCall();
 
+  /// Triggers native re-emission of the current call state after a terminated
+  /// process restart. Mirrors Twilio's `getActiveCallOnResumeFromTerminatedState`.
+  ///
+  /// Asks the native layer to emit a `Connected` or `Incoming` event to the
+  /// Flutter event stream if there is an active or pending call. This unblocks
+  /// the BLoC after an app restart caused by tapping an incoming call
+  /// notification from a killed state.
+  ///
+  /// Returns `true` if the native side has an active call.
+  ///
+  /// **Platform:** Android only (no-op stub on iOS).
+  Future<bool> getActiveCallOnResumeFromTerminatedState();
+
   /// Returns the Vonage call ID (session ID) of the active call.
   ///
   /// Returns `null` until the first [CallEvent.ringing] event fires,
