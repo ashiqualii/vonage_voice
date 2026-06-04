@@ -204,6 +204,12 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         static let cachedJwt         = "VonageCachedJwt"
         static let cachedDeviceId    = "VonageCachedDeviceId"
         static let defaultCallKitIcon = "callkit_icon"
+        /// The exact VoIP token that the cached `cachedDeviceId` was registered with.
+        /// Used to make registration idempotent: re-registering the same token would
+        /// create a brand-new deviceId in Vonage's registry (registerVoipToken always
+        /// returns a new id), orphaning the previous registration so it keeps routing
+        /// VoIP pushes even after logout/unregister.
+        static let registeredVoipToken = "VonageRegisteredVoipToken"
     }
 
     // ─── App Name ────────────────────────────────────────────────────
@@ -673,6 +679,7 @@ extension VonageVoicePlugin {
         deviceId = nil
         isSessionReady = false
         UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
+        UserDefaults.standard.removeObject(forKey: Keys.registeredVoipToken)
         clearStoredJwt()
 
         // Release the CXProvider when no real Vonage call is active.
@@ -748,12 +755,36 @@ extension VonageVoicePlugin {
 
     // ─── Push Token Registration ─────────────────────────────────────
 
-    /// Unregisters any old deviceId first (to free a device slot),
-    /// then registers the current token.
+    /// Registers `token` with Vonage, guaranteeing at most ONE live device
+    /// registration for this install.
+    ///
+    /// Vonage's `registerVoipToken` returns a brand-new `deviceId` on every
+    /// call — it never reuses an existing one. So calling it repeatedly (token
+    /// rotation, repeated `setTokens`, PushKit credential refresh) silently
+    /// accumulates orphaned registrations that keep routing VoIP pushes to this
+    /// device. Logout only unregisters the single tracked `deviceId`, leaving
+    /// the orphans alive → the device keeps receiving calls after unregister.
+    ///
+    /// To prevent that:
+    ///   1. If this exact token is already registered, do nothing (idempotent).
+    ///   2. Otherwise unregister whatever device is currently cached BEFORE
+    ///      registering the new token, so no orphan is ever left behind.
     private func registerPushToken(_ token: Data) {
         let storedId = UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
-        if let oldId = storedId, oldId != deviceId {
-            sendPhoneCallEvents(description: "LOG|Unregistering old deviceId before re-registering: \(oldId)")
+        let registeredToken = UserDefaults.standard.data(forKey: Keys.registeredVoipToken)
+
+        // 1. Already registered with this exact token → no-op.
+        // Re-registering would orphan `storedId` and leave a stale device
+        // in Vonage's registry. Just make sure the in-memory id is in sync.
+        if let storedId = storedId, let registeredToken = registeredToken, registeredToken == token {
+            deviceId = storedId
+            sendPhoneCallEvents(description: "LOG|VoIP token already registered (deviceId=\(storedId)) — skipping re-registration to avoid orphan")
+            return
+        }
+
+        // 2. New / changed token → unregister the cached device first.
+        if let oldId = storedId {
+            sendPhoneCallEvents(description: "LOG|Unregistering stale deviceId before re-registering: \(oldId)")
             voiceClient.unregisterDeviceTokens(byDeviceId: oldId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|Old device unregister failed (non-fatal): \(error.localizedDescription)")
@@ -799,10 +830,13 @@ extension VonageVoicePlugin {
                 return
             }
 
-            // Success — persist the new deviceId.
+            // Success — persist the new deviceId and the token it was registered with.
+            // Storing the token lets registerPushToken() short-circuit redundant
+            // re-registrations that would otherwise orphan this deviceId.
             self.deviceId = newDeviceId
             if let id = newDeviceId {
                 UserDefaults.standard.set(id, forKey: Keys.cachedDeviceId)
+                UserDefaults.standard.set(token, forKey: Keys.registeredVoipToken)
             }
             self.sendPhoneCallEvents(description: "LOG|VoIP push token registered. deviceId=\(newDeviceId ?? "nil")")
         }
@@ -2329,13 +2363,23 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
 
         guard type == .voIP else { return }
 
-        if let deviceId = deviceId {
-            voiceClient.unregisterDeviceTokens(byDeviceId: deviceId) { [weak self] error in
+        // The APNS token is dead, so its Vonage device registration can never
+        // receive a push again. Unregister it so it doesn't linger as an orphan.
+        // Fall back to the cached id because `deviceId` may be nil in memory
+        // (e.g. invalidation fired before Flutter set the JWT this launch).
+        let staleId = deviceId ?? UserDefaults.standard.string(forKey: Keys.cachedDeviceId)
+        if let staleId = staleId {
+            voiceClient.unregisterDeviceTokens(byDeviceId: staleId) { [weak self] error in
                 if let error = error {
                     self?.sendPhoneCallEvents(description: "LOG|unregisterDeviceTokens failed: \(error.localizedDescription)")
                 }
             }
         }
+
+        // Drop the cached registration so the next valid token registers cleanly.
+        deviceId = nil
+        UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
+        UserDefaults.standard.removeObject(forKey: Keys.registeredVoipToken)
     }
 
     // ─── Incoming VoIP Push (iOS 13+) ────────────────────────────────
