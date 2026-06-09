@@ -879,6 +879,7 @@ class TVConnectionService : ConnectionService() {
         // Get VoiceClient instance held by the plugin
         val client = VonageClientHolder.voiceClient ?: run {
             broadcastError("VoiceClient not initialised — call tokens() first")
+            stopOutgoingForegroundOnFailure()
             return
         }
 
@@ -886,11 +887,13 @@ class TVConnectionService : ConnectionService() {
         client.serverCall(callContext) { error, callId ->
             if (error != null) {
                 broadcastError("serverCall failed: ${error.message}")
+                stopOutgoingForegroundOnFailure()
                 return@serverCall
             }
 
             if (callId.isNullOrEmpty()) {
                 broadcastError("serverCall returned null callId")
+                stopOutgoingForegroundOnFailure()
                 return@serverCall
             }
 
@@ -931,6 +934,35 @@ class TVConnectionService : ConnectionService() {
             broadcastManager.sendBroadcast(connectedBroadcast)
             android.util.Log.i("TVConnectionService",
                 "[OUTGOING] CALL_CONNECTED broadcast sent: callId=$callId")
+        }
+    }
+
+    /**
+     * Tears down the foreground service + ongoing notification that
+     * onStartCommand() promoted BEFORE serverCall() ran, when an outgoing
+     * call fails to be placed (VoiceClient missing, serverCall error, or
+     * null callId). Without this, the "ongoing call" notification is
+     * orphaned because no active connection is ever registered — tapping it
+     * only relaunches the app while the dead notification lingers.
+     *
+     * Only stops the service when there is no other live call in progress,
+     * so a concurrent incoming/active call is never interrupted.
+     */
+    private fun stopOutgoingForegroundOnFailure() {
+        if (activeConnections.isNotEmpty() || pendingInvites.isNotEmpty()) return
+        try {
+            releaseAudioFocus()
+            setCallActive(this, false)
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+            notificationManager.cancel(Constants.NOTIFICATION_ID)
+            stopForeground(true)
+            stopSelf()
+            android.util.Log.i("TVConnectionService",
+                "[OUTGOING] failure cleanup: notification cancelled, foreground stopped")
+        } catch (e: Exception) {
+            android.util.Log.w("TVConnectionService",
+                "stopOutgoingForegroundOnFailure failed: ${e.message}")
         }
     }
 
